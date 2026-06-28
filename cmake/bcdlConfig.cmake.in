@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+# bcdl's exported targets reference the hobot SDK imported targets (hobot::dnn,
+# hobot::media), so consumers must re-find them via the bundled FindHobot.cmake,
+# plus Threads and the optional OpenMP / OpenCV deps that were enabled at build.
+include(CMakeFindDependencyMacro)
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+
+find_dependency(Hobot)
+find_dependency(Threads)
+@BCDL_PACKAGE_OPTIONAL_DEPS@
+
+include("${CMAKE_CURRENT_LIST_DIR}/bcdlTargets.cmake")
+
+check_required_components(bcdl)

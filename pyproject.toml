@@ -1,0 +1,40 @@
+# Build the nanobind Python module as a pip-installable wheel via scikit-build-core.
+# NOTE: building requires the D-Robotics hobot SDK and runs on the RDK S100/S100P
+# board only (the CMake build guards on aarch64 + find_package(Hobot)). So
+# `pip install .` is a board-side operation. Keep `version` in sync with the
+# project() VERSION in CMakeLists.txt (the C++/`__version__` source of truth).
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "bcdl"
+version = "0.1.0"
+description = "BPU inference & media library for D-Robotics RDK S100/S100P (BPU Nash), with Python bindings"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "BCDL contributors" }]
+keywords = ["RDK", "S100", "BPU", "D-Robotics", "inference", "OCR", "YOLO", "nanobind"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+opencv = ["opencv-python"]
+test = ["pytest"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.18"
+# Only the library + Python module are needed in the wheel — skip the C++ examples.
+cmake.args = ["-DBCDL_BUILD_EXAMPLES=OFF"]
+build-dir = "build/skbuild"
+# Ship the pure-Python wrapper package (python/bcdl/) alongside the compiled
+# bcdl_py module (CMake installs the latter at the wheel root under SKBUILD).
+wheel.packages = ["python/bcdl"]

@@ -1,0 +1,13 @@
+#pragma once
+// Generated from the CMake project() version by configure_file — do not edit.
+// Single source of truth: the VERSION in the top-level CMakeLists.txt.
+
+#define BCDL_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define BCDL_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define BCDL_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define BCDL_VERSION_STRING "@PROJECT_VERSION@"
+
+// Numeric form for comparisons, e.g. BCDL_VERSION >= BCDL_VERSION_CHECK(0, 2, 0).
+#define BCDL_VERSION_CHECK(major, minor, patch) ((major) * 10000 + (minor) * 100 + (patch))
+#define BCDL_VERSION \
+  BCDL_VERSION_CHECK(BCDL_VERSION_MAJOR, BCDL_VERSION_MINOR, BCDL_VERSION_PATCH)

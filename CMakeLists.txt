@@ -1,0 +1,326 @@
+cmake_minimum_required(VERSION 3.18)
+project(bcdl LANGUAGES CXX VERSION 0.1.0)
+
+# --- Guard: this project only builds on the aarch64 RDK board ----------------
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  message(FATAL_ERROR
+    "BCDL builds on the RDK S100 board (aarch64) only. Edit on Mac, then "
+    "scripts/sync.sh + scripts/board_build.sh. Current arch: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(GNUInstallDirs)
+
+option(BCDL_BUILD_PYTHON "Build the nanobind Python module" ON)
+option(BCDL_BUILD_EXAMPLES "Build example executables" ON)
+option(BCDL_INSTALL "Generate install + find_package(bcdl) export rules" ON)
+
+find_package(Hobot REQUIRED)
+find_package(Threads REQUIRED)  # std::thread in the async pipeline
+# OpenMP parallelizes the CPU preproc (letterbox / BGR->NV12 already have
+# #pragma omp parallel for). Optional: without it those loops run serially.
+find_package(OpenMP)
+
+# OpenCV (libopencv installed via mamba into the board's bcdl conda env). Lets
+# the task layer use cv::resize / findContours / minAreaRect /
+# rotatedRectangleIntersection instead of hand-written approximations. Optional:
+# code guards on BCDL_HAVE_OPENCV. Hint the conda prefix so find_package locates
+# the OpenCV 5 CMake config (lib/cmake/opencv5).
+if(DEFINED ENV{CONDA_PREFIX})
+  list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
+  set(BCDL_CONDA_LIB "$ENV{CONDA_PREFIX}/lib")
+endif()
+find_package(OpenCV CONFIG QUIET)
+if(OpenCV_FOUND)
+  message(STATUS "OpenCV ${OpenCV_VERSION} found at ${OpenCV_DIR}")
+else()
+  message(STATUS "OpenCV not found — task layer uses hand-written image ops")
+endif()
+
+# Runtime rpath for every target: the hobot lib dir we linked from PLUS
+# /usr/hobot/lib (the device platform libs the SDK transitively needs) — both
+# come from HOBOT_RUNTIME_LIB_DIRS. When OpenCV is used, also the conda lib dir
+# that holds opencv's .so AND the newer libstdc++ it needs.
+set(BCDL_RPATH ${HOBOT_RUNTIME_LIB_DIRS})
+if(OpenCV_FOUND)
+  list(APPEND BCDL_RPATH "${BCDL_CONDA_LIB}")
+  # conda's OpenCV is built with a newer gcc and needs conda's libstdc++
+  # (CXXABI_1.3.15, absent from the board's system gcc 11.4). Put conda lib on
+  # the link search path globally, and emit DT_RPATH (not RUNPATH) so the rpath
+  # also applies to transitive deps — otherwise opencv's libstdc++ falls back to
+  # the system one and fails to load.
+  link_directories("${BCDL_CONDA_LIB}")
+  add_link_options("-Wl,--disable-new-dtags")
+endif()
+
+# --- core library ------------------------------------------------------------
+# Shared so consumers (the Python module, examples, downstream C++) link one
+# libbcdl.so rather than baking a static archive into each — smaller artifacts
+# and a single copy of the code in the conda package.
+add_library(bcdl SHARED
+  src/core/status.cc
+  src/core/sys_mem.cc
+  src/core/task.cc
+  src/core/mem_pool.cc
+  src/backend/engine.cc
+  src/backend/output_reader.cc
+  src/preproc/vp_image.cc
+  src/preproc/letterbox.cc
+  src/preproc/letterbox_cpu.cc
+  src/media/jpeg_codec.cc
+  src/media/video_codec.cc
+  src/tasks/detection.cc
+  src/tasks/classification.cc
+  src/tasks/pose.cc
+  src/tasks/instance_seg.cc
+  src/tasks/obb.cc
+  src/tasks/ocr.cc
+  src/tasks/depth.cc
+  src/tasks/segmentation.cc
+  src/pipeline/detection_pipeline.cc
+  src/pipeline/async_detection_pipeline.cc
+  src/pipeline/stereo_pipeline.cc
+  src/tracks/byte_tracker.cc)
+add_library(bcdl::bcdl ALIAS bcdl)
+
+# Version header generated from the project() version (single source of truth).
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.h.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/include/bcdl/version.h" @ONLY)
+
+target_include_directories(bcdl PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+# hobot::dnn = BPU runtime; hobot::media = hb_vp preproc (resize/warp/cvtcolor).
+target_link_libraries(bcdl PUBLIC hobot::dnn Threads::Threads)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(bcdl PUBLIC OpenMP::OpenMP_CXX)
+else()
+  message(WARNING "OpenMP not found — CPU preproc (letterbox/BGR->NV12) runs "
+                  "single-threaded; streaming throughput will be preproc-bound.")
+endif()
+if(TARGET hobot::media)
+  target_link_libraries(bcdl PUBLIC hobot::media)
+else()
+  message(WARNING "hobot::media (libffmedia/libgdcbin) not found — VP preproc "
+                  "ops (letterbox/cvtColor/resize) will fail to link. Detection "
+                  "decode/NMS still work. Set HOBOT_LIB_DIR if the libs exist.")
+endif()
+# OpenCV: the task layer uses cv::resize / findContours / minAreaRect /
+# rotatedRectangleIntersection. PUBLIC so consumers (examples, bcdl_py) inherit
+# the include dirs and link; BCDL_HAVE_OPENCV guards the OpenCV code paths.
+if(OpenCV_FOUND)
+  target_link_libraries(bcdl PUBLIC ${OpenCV_LIBS})
+  target_compile_definitions(bcdl PUBLIC BCDL_HAVE_OPENCV=1)
+endif()
+target_compile_options(bcdl PRIVATE -Wall -Wextra)
+# PIC so the static lib can be linked into the Python shared module;
+# keep the hobot lib dir + /usr/hobot/lib on the runtime search path.
+set_target_properties(bcdl PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+  BUILD_RPATH "${HOBOT_RUNTIME_LIB_DIRS}" INSTALL_RPATH "${HOBOT_RUNTIME_LIB_DIRS}")
+
+# --- examples ----------------------------------------------------------------
+if(BCDL_BUILD_EXAMPLES)
+  add_executable(det_infer examples/det_infer.cc)
+  target_link_libraries(det_infer PRIVATE bcdl::bcdl)
+  set_target_properties(det_infer PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(det_demo examples/det_demo.cc)
+  target_link_libraries(det_demo PRIVATE bcdl::bcdl)
+  set_target_properties(det_demo PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(jpeg_roundtrip examples/jpeg_roundtrip.cc)
+  target_link_libraries(jpeg_roundtrip PRIVATE bcdl::bcdl)
+  set_target_properties(jpeg_roundtrip PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(video_roundtrip examples/video_roundtrip.cc)
+  target_link_libraries(video_roundtrip PRIVATE bcdl::bcdl)
+  set_target_properties(video_roundtrip PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(video_decode examples/video_decode.cc)
+  target_link_libraries(video_decode PRIVATE bcdl::bcdl)
+  set_target_properties(video_decode PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(depth_demo examples/depth_demo.cc)
+  target_link_libraries(depth_demo PRIVATE bcdl::bcdl)
+  set_target_properties(depth_demo PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(mempool_demo examples/mempool_demo.cc)
+  target_link_libraries(mempool_demo PRIVATE bcdl::bcdl)
+  set_target_properties(mempool_demo PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(pipeline_bench examples/pipeline_bench.cc)
+  target_link_libraries(pipeline_bench PRIVATE bcdl::bcdl)
+  set_target_properties(pipeline_bench PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(async_bench examples/async_bench.cc)
+  target_link_libraries(async_bench PRIVATE bcdl::bcdl)
+  set_target_properties(async_bench PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(async_check examples/async_check.cc)
+  target_link_libraries(async_check PRIVATE bcdl::bcdl)
+  set_target_properties(async_check PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(tracks_ocr_check examples/tracks_ocr_check.cc)
+  target_link_libraries(tracks_ocr_check PRIVATE bcdl::bcdl)
+  set_target_properties(tracks_ocr_check PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  if(OpenCV_FOUND)
+    # -L conda lib / DT_RPATH / --disable-new-dtags are applied globally above.
+    add_executable(opencv_check examples/opencv_check.cc)
+    target_link_libraries(opencv_check PRIVATE ${OpenCV_LIBS})
+    set_target_properties(opencv_check PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+    # End-to-end PP-OCRv3 demo: reads/crops/resizes with OpenCV, runs det+rec
+    # through bcdl on the board's pre-installed .hbm models.
+    add_executable(ocr_demo examples/ocr_demo.cc)
+    target_link_libraries(ocr_demo PRIVATE bcdl::bcdl ${OpenCV_LIBS})
+    set_target_properties(ocr_demo PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+    # Detect-and-track demo: TrackingPipeline (DetectionPipeline + ByteTracker)
+    # on a real YOLO NV12 .hbm, fed a panned still image as a moving sequence.
+    add_executable(track_demo examples/track_demo.cc)
+    target_link_libraries(track_demo PRIVATE bcdl::bcdl ${OpenCV_LIBS})
+    set_target_properties(track_demo PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+    # End-to-end: video file -> VPU hardware decode -> DetectionPipeline (BPU).
+    # The decode half of the future live-camera path.
+    add_executable(video_det_demo examples/video_det_demo.cc)
+    target_link_libraries(video_det_demo PRIVATE bcdl::bcdl ${OpenCV_LIBS})
+    set_target_properties(video_det_demo PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+    # Stereo depth: a side-by-side stereo pair -> StereoPipeline (LAS2 .hbm) ->
+    # disparity / depth, written as a side-by-side visualization.
+    add_executable(stereo_demo examples/stereo_demo.cc)
+    target_link_libraries(stereo_demo PRIVATE bcdl::bcdl ${OpenCV_LIBS})
+    set_target_properties(stereo_demo PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+  endif()
+endif()
+
+# --- python module -----------------------------------------------------------
+if(BCDL_BUILD_PYTHON)
+  find_package(Python 3.8 COMPONENTS Interpreter Development.Module REQUIRED)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT
+    RESULT_VARIABLE _nb_rc)
+  if(NOT _nb_rc EQUAL 0)
+    message(FATAL_ERROR "nanobind not found in this env: pip/conda install nanobind "
+                        "(or configure with -DBCDL_BUILD_PYTHON=OFF)")
+  endif()
+  find_package(nanobind CONFIG REQUIRED)
+  nanobind_add_module(bcdl_py src/python/bcdl_py.cc)
+  target_link_libraries(bcdl_py PRIVATE bcdl::bcdl)
+  # bcdl_py.so dynamically links libbcdl.so. The install/export rules put the
+  # shared lib one level down (lib/), while bcdl_py.so sits at the package root
+  # (wheel) — so add $ORIGIN/lib alongside the hobot runtime dirs.
+  set_target_properties(bcdl_py PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}"
+    INSTALL_RPATH "$ORIGIN/lib;${BCDL_RPATH}")
+
+  # When built as a pip wheel (scikit-build-core sets SKBUILD), install the
+  # compiled module at the wheel root so `import bcdl_py` resolves; the pure
+  # `bcdl` package is added via [tool.scikit-build] wheel.packages in pyproject.
+  if(DEFINED SKBUILD)
+    install(TARGETS bcdl_py LIBRARY DESTINATION ".")
+    # Ship the committed type stub at the wheel root, next to bcdl_py.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/python/bcdl_py.pyi")
+      install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/python/bcdl_py.pyi" DESTINATION ".")
+    endif()
+  else()
+    # Plain cmake --install (e.g. the conda libbcdl/bcdl split): the compiled
+    # module, its stub, and the pure-Python wrapper package go to this
+    # interpreter's site-packages under CMAKE_INSTALL_PREFIX, while libbcdl.so /
+    # headers / cmake config land in lib/ + include/ via the BCDL_INSTALL rules.
+    set(BCDL_SITE_DIR
+      "${CMAKE_INSTALL_LIBDIR}/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
+    install(TARGETS bcdl_py LIBRARY DESTINATION "${BCDL_SITE_DIR}")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/python/bcdl_py.pyi")
+      install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/python/bcdl_py.pyi" DESTINATION "${BCDL_SITE_DIR}")
+    endif()
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/bcdl" DESTINATION "${BCDL_SITE_DIR}")
+  endif()
+
+  # Optional: (re)generate the bcdl_py.pyi type stub. Needs to import the module,
+  # so the hobot runtime libs must be present — board-only. Off by default; the
+  # generated stub is committed (python/bcdl_py.pyi) and shipped in the wheel.
+  option(BCDL_BUILD_STUBS "Regenerate the bcdl_py.pyi type stub (imports the module)" OFF)
+  if(BCDL_BUILD_STUBS)
+    nanobind_add_stub(bcdl_py_stub
+      MODULE bcdl_py
+      OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/python/bcdl_py.pyi"
+      PYTHON_PATH $<TARGET_FILE_DIR:bcdl_py>
+      DEPENDS bcdl_py)
+  endif()
+endif()
+
+# --- install / export: find_package(bcdl) for downstream consumers -----------
+if(BCDL_INSTALL)
+  include(CMakePackageConfigHelpers)
+
+  install(TARGETS bcdl EXPORT bcdlTargets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+
+  # Public headers (hand-written tree + generated version.h).
+  install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/bcdl"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/include/bcdl/version.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/bcdl")
+
+  # The exported targets reference hobot::dnn/media, so ship FindHobot.cmake and
+  # re-find it from the package config.
+  set(BCDL_PACKAGE_OPTIONAL_DEPS "")
+  if(OpenMP_CXX_FOUND)
+    string(APPEND BCDL_PACKAGE_OPTIONAL_DEPS "find_dependency(OpenMP)\n")
+  endif()
+  if(OpenCV_FOUND)
+    string(APPEND BCDL_PACKAGE_OPTIONAL_DEPS "find_dependency(OpenCV)\n")
+  endif()
+
+  set(BCDL_CMAKE_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/bcdl")
+  install(EXPORT bcdlTargets
+    NAMESPACE bcdl::
+    FILE bcdlTargets.cmake
+    DESTINATION "${BCDL_CMAKE_DIR}")
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindHobot.cmake"
+    DESTINATION "${BCDL_CMAKE_DIR}")
+
+  configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/bcdlConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/bcdlConfig.cmake"
+    INSTALL_DESTINATION "${BCDL_CMAKE_DIR}")
+  write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/bcdlConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}" COMPATIBILITY SameMajorVersion)
+  install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/bcdlConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/bcdlConfigVersion.cmake"
+    DESTINATION "${BCDL_CMAKE_DIR}")
+endif()

@@ -1,0 +1,25 @@
+# build artifacts
+build/
+*.so
+*.o
+*.a
+compile_commands.json
+
+# python
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# SDK mirror (pulled from board, for IntelliSense only — do not commit)
+third_party/
+
+# models / data — model binaries live in models/ on the board (populated by
+# scripts/fetch_models.sh); too large for git (266 MB, incl. a 116 MB depth model)
+*.hbm
+*.bin
+*.onnx
+tests/data/
+
+# editor
+.vscode/
+.cache/
