@@ -1,5 +1,5 @@
 // OCR end-to-end demo on the LATEST PP-OCRv5 .hbm models (converted offline from
-// ccdl ONNX; see docs/PLAN.md finding #6). Three-stage PaddleOCR pipeline routed
+// ccdl ONNX). Three-stage PaddleOCR pipeline routed
 // through bcdl's task layer, so this runs the real models AND validates
 // bcdl::DbTextDetector / TextAngleClassifier / TextRecognizer end-to-end:
 //

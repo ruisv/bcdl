@@ -19,6 +19,7 @@
 #include "bcdl/tasks/depth.h"
 #include "bcdl/tasks/detection.h"
 #include "bcdl/tasks/instance_seg.h"
+#include "bcdl/tasks/mono3d.h"
 #include "bcdl/tasks/obb.h"
 #include "bcdl/tasks/ocr.h"
 #include "bcdl/tasks/pose.h"

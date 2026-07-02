@@ -84,8 +84,8 @@ class HeadDecoder {
 ///
 /// Construct once with an Engine, then call process() per frame. ALL scratch
 /// buffers are allocated up front and reused, so steady-state process() does no
-/// per-frame heap allocation for image buffers — this is the M4 value (see
-/// docs/PLAN.md: "camera stream ~90% of single-frame FPS"). Held buffers:
+/// per-frame heap allocation for image buffers — this is the M4 value (a held
+/// camera stream runs at ~90% of single-frame FPS). Held buffers:
 ///   - `src_`    : a BGR wrapper sized to the *incoming* frame. Re-allocated
 ///                 only when the caller's (width,height) changes; otherwise the
 ///                 caller's rows are memcpy'd into the existing buffer.

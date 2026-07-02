@@ -95,8 +95,8 @@ def model_path(name):
     return name if os.path.isabs(name) else os.path.join(YOLO26_DIR, name)
 
 
-# OCR uses the LATEST PP-OCRv5 stack (converted offline from ccdl ONNX in
-# rdk-build-dev, deployed to the board), all single-input F32 RGB NCHW featuremap
+# OCR uses the LATEST PP-OCRv5 stack (converted offline from ccdl ONNX and
+# deployed to the board), all single-input F32 RGB NCHW featuremap
 # (normalisation done in preproc, not fused), env-overridable:
 #   det: PP-OCRv5_server_det   [1,3,960,960] -> prob map [1,1,960,960]
 #   rec: PP-OCRv5_server_rec   [1,3,48,320]  -> [1,T,18385] softmax (CTC)

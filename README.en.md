@@ -62,7 +62,8 @@ post-processing (CUDA kernels rewritten as CPU/NEON).
     v5 / v11), per-class NMS.
   - **Classification, Pose** (17-keypoint), **Instance segmentation** (proto ×
     mask-coef), **Oriented boxes** (OBB, rotated-IoU NMS), **Semantic
-    segmentation**, **Monocular depth**, **Stereo depth** (two-image disparity).
+    segmentation**, **Monocular depth**, **Stereo depth** (two-image disparity),
+    **Monocular 3D detection** (SMOKE — 3D box + orientation from a single image).
   - **OCR** — full 3-stage **PP-OCRv5** pipeline: DBNet detect → PP-LCNet
     direction classifier (0°/180°) → CRNN/CTC recognize (18385-class dict).
   - **Multi-object tracking** — ByteTrack (Kalman + two-stage association).
@@ -77,16 +78,14 @@ post-processing (CUDA kernels rewritten as CPU/NEON).
 
 ```
 python/    nanobind bindings (NumPy <-> tensors), GIL-released infer
-tasks/     det · cls · pose · seg · obb · semseg · depth · ocr
+tasks/     det · cls · pose · seg · obb · semseg · depth · mono3d · ocr
 tracks/    ByteTrack multi-object tracker
 pipeline/  sync / async detection · tracking · stereo  (JPU -> VP -> BPU -> CPU/VPU)
 media/     JpegCodec (JPU) · VideoCodec H.264/H.265 (VPU)
 backend/   Engine, output readers          (libdnn  -> hbDNN*)
-preproc/   CPU letterbox + BGR->NV12 (OpenCV/OpenMP); VP units (hb_vp)
+preproc/   CPU letterbox + BGR->NV12 (OpenCV/OpenMP); GDC HW letterbox (VPS); VP (hb_vp)
 core/      SysMem · Task · Status · MemPool (libhbucp -> hbUCP*)
 ```
-
-See [`docs/PLAN.md`](docs/PLAN.md) for the per-layer status and roadmap.
 
 ## Requirements
 
@@ -254,7 +253,6 @@ BCDL.
 |----------|----------------|
 | [`docs/API.md`](docs/API.md) | **Python API reference** — every class, config, and `decode_*` function, with a usage snippet per task. |
 | [`docs/CPP_API.md`](docs/CPP_API.md) | **C++ API reference** — the same surface in `namespace bcdl`, keyed to the headers. |
-| [`docs/PLAN.md`](docs/PLAN.md) | Roadmap and per-layer status (the verified hobot API mapping). |
 | [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) | Full on-board benchmark numbers + the annotated check images in the [Gallery](#gallery). |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to set up, build (on the board), test, and submit changes. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes (Keep a Changelog / SemVer). |

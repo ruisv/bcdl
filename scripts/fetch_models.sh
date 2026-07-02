@@ -35,7 +35,7 @@ copy() {
 }
 
 echo ">> fetching models into ${DEST}"
-# OCR — PP-OCRv5 (converted offline in rdk-build-dev, see docs/PLAN.md finding #6)
+# OCR — PP-OCRv5 (converted offline from ccdl ONNX)
 copy "${DEPLOY}/ppocrv5_server_det_960x960.hbm"
 copy "${DEPLOY}/ppocrv5_server_rec_48x320.hbm"
 copy "${DEPLOY}/ppocrv5_lcnet_cls_80x160.hbm"

@@ -27,5 +27,5 @@ workflow excludes `*.hbm` from sync so these survive an `rsync --delete`.
 | `yolov8_640x640_nv12.hbm`         | det (DFL head) | board-shipped |
 | `deeplabv3plus_dilation1248_1024x2048_nv12.hbm` | semantic seg | board-shipped |
 
-Model conversion (ONNX → `.hbm`) is offline on the x86 host — see `docs/PLAN.md`;
+Model conversion (ONNX → `.hbm`) is offline on the x86 host;
 this repo only consumes the finished binaries.

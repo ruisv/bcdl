@@ -51,11 +51,8 @@ examples/      standalone C++ programs
 tests/         pytest suite (NumPy decode + on-board end-to-end)
 benchmarks/    board benchmark driver + results
 scripts/       sync / build / bootstrap / fetch-models / bench
-docs/          PLAN.md (roadmap + per-layer status)
+docs/          API.md, CPP_API.md (Python + C++ API reference)
 ```
-
-See [`docs/PLAN.md`](docs/PLAN.md) for the roadmap and the verified per-layer API
-mapping and status.
 
 ## Getting set up
 

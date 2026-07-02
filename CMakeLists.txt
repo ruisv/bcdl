@@ -80,6 +80,7 @@ add_library(bcdl SHARED
   src/tasks/pose.cc
   src/tasks/instance_seg.cc
   src/tasks/obb.cc
+  src/tasks/mono3d.cc
   src/tasks/ocr.cc
   src/tasks/depth.cc
   src/tasks/segmentation.cc
@@ -113,6 +114,27 @@ else()
                   "ops (letterbox/cvtColor/resize) will fail to link. Detection "
                   "decode/NMS still work. Set HOBOT_LIB_DIR if the libs exist.")
 endif()
+# --- VPS GDC hardware letterbox (bcdl::GdcLetterbox) --------------------------
+# The GDC / hbn-VPF headers live in /usr/hobot/include (NOT /usr/include/hobot),
+# and the engine is driven by libvpf/libvio/libcam/libhbmem on /usr/hobot/lib.
+# GDC runs on /dev/gdc (VPS), bypassing the root-locked/offline vDSP that
+# hb_vp_warp_affine (bcdl::letterbox) uses. Optional: only wired when present.
+find_path(HOBOT_GDC_INCLUDE_DIR NAMES gdc_cfg.h PATHS /usr/hobot/include)
+find_library(HB_VPF_LIB  NAMES vpf   PATHS /usr/hobot/lib)
+find_library(HB_VIO_LIB  NAMES vio   PATHS /usr/hobot/lib)
+find_library(HB_CAM_LIB  NAMES cam   PATHS /usr/hobot/lib)
+find_library(HB_MEM_LIB  NAMES hbmem PATHS /usr/hobot/lib)
+if(HOBOT_GDC_INCLUDE_DIR AND HB_VPF_LIB AND HB_VIO_LIB AND HB_CAM_LIB AND HB_MEM_LIB)
+  set(BCDL_HAVE_GDC ON)
+  target_sources(bcdl PRIVATE src/preproc/gdc_letterbox.cc)
+  target_include_directories(bcdl PRIVATE ${HOBOT_GDC_INCLUDE_DIR})
+  target_link_libraries(bcdl PUBLIC ${HB_VPF_LIB} ${HB_VIO_LIB} ${HB_CAM_LIB} ${HB_MEM_LIB})
+  target_compile_definitions(bcdl PUBLIC BCDL_HAVE_GDC=1)
+  message(STATUS "GDC hardware letterbox: enabled (${HOBOT_GDC_INCLUDE_DIR})")
+else()
+  message(STATUS "GDC hardware letterbox: disabled (headers/libs not found)")
+endif()
+
 # OpenCV: the task layer uses cv::resize / findContours / minAreaRect /
 # rotatedRectangleIntersection. PUBLIC so consumers (examples, bcdl_py) inherit
 # the include dirs and link; BCDL_HAVE_OPENCV guards the OpenCV code paths.
@@ -138,6 +160,18 @@ if(BCDL_BUILD_EXAMPLES)
   target_link_libraries(det_demo PRIVATE bcdl::bcdl)
   set_target_properties(det_demo PROPERTIES
     BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  add_executable(vp_probe examples/vp_probe.cc)
+  target_link_libraries(vp_probe PRIVATE bcdl::bcdl)
+  set_target_properties(vp_probe PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+  if(BCDL_HAVE_GDC)
+    add_executable(gdc_letterbox_bench examples/gdc_letterbox_bench.cc)
+    target_link_libraries(gdc_letterbox_bench PRIVATE bcdl::bcdl)
+    set_target_properties(gdc_letterbox_bench PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+  endif()
 
   add_executable(jpeg_roundtrip examples/jpeg_roundtrip.cc)
   target_link_libraries(jpeg_roundtrip PRIVATE bcdl::bcdl)
@@ -235,6 +269,11 @@ if(BCDL_BUILD_PYTHON)
   find_package(nanobind CONFIG REQUIRED)
   nanobind_add_module(bcdl_py src/python/bcdl_py.cc)
   target_link_libraries(bcdl_py PRIVATE bcdl::bcdl)
+  # bcdl::bcdl is imported from the build tree; its INTERFACE compile defs don't
+  # always reach the module compile, so set the GDC guard explicitly.
+  if(BCDL_HAVE_GDC)
+    target_compile_definitions(bcdl_py PRIVATE BCDL_HAVE_GDC=1)
+  endif()
   # bcdl_py.so dynamically links libbcdl.so. The install/export rules put the
   # shared lib one level down (lib/), while bcdl_py.so sits at the package root
   # (wheel) — so add $ORIGIN/lib alongside the hobot runtime dirs.

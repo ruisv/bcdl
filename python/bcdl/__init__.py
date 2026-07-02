@@ -167,6 +167,8 @@ vp_image_from_bgr = bcdl_py.vp_image_from_bgr
 vp_image_from_nv12 = bcdl_py.vp_image_from_nv12
 JpegEncoder = bcdl_py.JpegEncoder
 JpegDecoder = bcdl_py.JpegDecoder
+# GDC hardware letterbox — only present when built with BCDL_HAVE_GDC (board).
+GdcLetterbox = getattr(bcdl_py, "GdcLetterbox", None)
 VideoEncConfig = bcdl_py.VideoEncConfig
 VideoDecConfig = bcdl_py.VideoDecConfig
 VideoEncoder = bcdl_py.VideoEncoder
@@ -193,14 +195,46 @@ def bgr_to_nv12(bgr: np.ndarray) -> np.ndarray:
     return nv12
 
 
-def jpeg_encode(bgr: np.ndarray, quality: int = 50) -> bytes:
-    """One-shot JPEG encode of an HxWx3 uint8 BGR image via the JPU. Converts to
-    NV12 (needs OpenCV + even dims; the JPU also wants width%16==0, height%8==0)
-    and returns the JPEG byte stream."""
+def jpeg_encode(image, quality: int = 50) -> bytes:
+    """One-shot hardware (JPU) JPEG encode. `image` is either an HxWx3 uint8 BGR
+    ndarray, or an NV12 ``VpImage`` (e.g. straight from ``jpeg_decode`` /
+    ``GdcLetterbox`` — no BGR round-trip). Returns the JPEG byte stream.
+
+    The JPU requires width%16==0 and height%8==0. A misaligned BGR image is padded
+    with a black bottom/right border to the aligned size (the padded dims are what
+    get encoded); a misaligned NV12 VpImage is rejected (pad it before wrapping)."""
+    # NV12 VpImage fast path — encode the device buffer directly, no CPU convert.
+    if isinstance(image, VpImage):
+        if image.format != ImageFormat.NV12:
+            raise ValueError("jpeg_encode(VpImage) requires an NV12 image")
+        w, h = image.width, image.height
+        if (w & 15) or (h & 7):
+            raise ValueError(
+                f"jpeg_encode: NV12 VpImage {w}x{h} is not JPU-aligned (need w%16, h%8)")
+        return JpegEncoder(w, h, quality, ImageFormat.NV12).encode(image)
+
+    # BGR ndarray path.
+    bgr = image
     h, w = bgr.shape[:2]
+    aw, ah = (w + 15) & ~15, (h + 7) & ~7
+    if aw != w or ah != h:
+        import cv2
+
+        bgr = cv2.copyMakeBorder(bgr, 0, ah - h, 0, aw - w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        h, w = ah, aw
     nv12 = bgr_to_nv12(bgr)
     enc = JpegEncoder(w, h, quality, ImageFormat.NV12)
     return enc.encode(vp_image_from_nv12(np.ascontiguousarray(nv12), w, h))
+
+
+def jpeg_save(image, path: str, quality: int = 90) -> int:
+    """Hardware (JPU) JPEG-encode `image` (BGR ndarray or NV12 ``VpImage``) and
+    write it to `path`. Returns the number of bytes written. This is the JPU
+    counterpart to ``cv2.imwrite`` — the encode runs on the JPU, not libjpeg."""
+    data = jpeg_encode(image, quality)
+    with open(path, "wb") as f:
+        f.write(data)
+    return len(data)
 
 
 def jpeg_decode(data) -> "VpImage":
@@ -336,6 +370,13 @@ ObbConfig = bcdl_py.ObbConfig
 rotated_iou = bcdl_py.rotated_iou
 # OBB numpy path: per-scale [H,W,nc]/[H,W,4]/[H,W,1] float tensors -> ObbDetections.
 decode_obb = bcdl_py.decode_obb
+CameraIntrinsics = bcdl_py.CameraIntrinsics
+Mono3dBox = bcdl_py.Mono3dBox
+Mono3dConfig = bcdl_py.Mono3dConfig
+compute_mono3d_feature_xform = bcdl_py.compute_mono3d_feature_xform
+# Mono3d (SMOKE) numpy path: channel-first cls[nc,H,W]/reg[8,H,W] raw logits +
+# feature affine + camera K -> Mono3dBoxes (no Engine; mirrors Mono3dDetector).
+decode_mono3d = bcdl_py.decode_mono3d
 
 
 class Classifier:
@@ -416,6 +457,26 @@ class ObbDetector:
 
     def postprocess(self, lb):
         return self._d.postprocess(lb)
+
+
+class Mono3dDetector:
+    """SMOKE monocular-3D detector. Single F32 NCHW RGB input [1,3,384,1280]
+    (ImageNet-normalized); postprocess takes the ORIGINAL image (W,H) and its
+    camera intrinsics K to lift heatmap peaks to 3D boxes."""
+
+    def __init__(self, engine: "Engine", config: "Mono3dConfig | None" = None,
+                 output_base: int = 0):
+        self.engine = engine
+        self.config = config if config is not None else Mono3dConfig()
+        self._d = bcdl_py.Mono3dDetector(engine._e, self.config, output_base)
+
+    def detect(self, image, orig_w, orig_h, K, timeout_ms: int = 0):
+        self.engine._e.set_input(0, np.ascontiguousarray(image))
+        self.engine._e.infer(timeout_ms)
+        return self._d.postprocess(orig_w, orig_h, K)
+
+    def postprocess(self, orig_w, orig_h, K):
+        return self._d.postprocess(orig_w, orig_h, K)
 
 
 # --- multi-object tracking (ByteTrack) -------------------------------------
@@ -572,7 +633,9 @@ __all__ = [
     "VideoDecoder",
     "bgr_to_nv12",
     "jpeg_encode",
+    "jpeg_save",
     "jpeg_decode",
+    "GdcLetterbox",
     # depth
     "DepthConfig",
     "DepthMap",
@@ -619,6 +682,13 @@ __all__ = [
     "decode_obb",
     "ObbDetector",
     "rotated_iou",
+    # monocular 3D detection (SMOKE)
+    "CameraIntrinsics",
+    "Mono3dBox",
+    "Mono3dConfig",
+    "compute_mono3d_feature_xform",
+    "decode_mono3d",
+    "Mono3dDetector",
     # multi-object tracking
     "Track",
     "ByteTrackConfig",

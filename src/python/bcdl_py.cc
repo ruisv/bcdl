@@ -7,6 +7,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
@@ -25,10 +26,14 @@
 #include "bcdl/media/video_codec.h"
 #include "bcdl/preproc/geometry.h"
 #include "bcdl/preproc/vp_image.h"
+#ifdef BCDL_HAVE_GDC
+#include "bcdl/preproc/gdc_letterbox.h"
+#endif
 #include "bcdl/tasks/classification.h"
 #include "bcdl/tasks/depth.h"
 #include "bcdl/tasks/detection.h"
 #include "bcdl/tasks/instance_seg.h"
+#include "bcdl/tasks/mono3d.h"
 #include "bcdl/tasks/obb.h"
 #include "bcdl/tasks/ocr.h"
 #include "bcdl/tasks/pose.h"
@@ -361,6 +366,27 @@ NB_MODULE(bcdl_py, m) {
           },
           "data"_a, "Decode JPEG bytes into an owned NV12 VpImage.")
       .def_prop_ro("out_format", &bcdl::JpegDecoder::outFormat);
+
+#ifdef BCDL_HAVE_GDC
+  // --- GDC hardware letterbox (VPS /dev/gdc, bypasses the offline vDSP) -------
+  nb::class_<bcdl::GdcLetterbox>(m, "GdcLetterbox")
+      .def(nb::init<const std::string&, int, int, int, int, uint8_t>(), "bin_path"_a,
+           "in_w"_a, "in_h"_a, "out_w"_a, "out_h"_a, "pad"_a = 114,
+           "Persistent GDC vnode + pre-generated warp-LUT bin for a fixed "
+           "(in_w,in_h)->(out_w,out_h) letterbox. Generate the bin offline (SDK "
+           "generate_bin) for the SAME geometry.")
+      .def(
+          "run",
+          [](bcdl::GdcLetterbox& g, const bcdl::VpImage& src) {
+            bcdl::VpImage dst(g.outputWidth(), g.outputHeight(), HB_VP_IMAGE_FORMAT_NV12);
+            g.run(src, dst);
+            return dst;
+          },
+          "src"_a, "GDC-letterbox an NV12 VpImage into a new out_w x out_h NV12 VpImage.")
+      .def_prop_ro("info", &bcdl::GdcLetterbox::info)
+      .def_prop_ro("output_width", &bcdl::GdcLetterbox::outputWidth)
+      .def_prop_ro("output_height", &bcdl::GdcLetterbox::outputHeight);
+#endif
 
   // --- H.264 / H.265 (VPU) ---------------------------------------------------
   nb::enum_<hbVPVideoType>(m, "VideoType")
@@ -956,6 +982,97 @@ NB_MODULE(bcdl_py, m) {
       "a_cx"_a, "a_cy"_a, "a_w"_a, "a_h"_a, "a_angle"_a, "b_cx"_a, "b_cy"_a,
       "b_w"_a, "b_h"_a, "b_angle"_a,
       "Rotated-rect IoU of two boxes (cx,cy,w,h,angle[rad]).");
+
+  // ===========================================================================
+  // Monocular 3D detection: SMOKE head
+  // ===========================================================================
+  nb::class_<bcdl::CameraIntrinsics>(m, "CameraIntrinsics")
+      .def(nb::init<>())
+      .def("__init__",
+           [](bcdl::CameraIntrinsics* self, float fx, float fy, float cx, float cy) {
+             new (self) bcdl::CameraIntrinsics{fx, fy, cx, cy};
+           },
+           "fx"_a, "fy"_a, "cx"_a, "cy"_a)
+      .def_rw("fx", &bcdl::CameraIntrinsics::fx)
+      .def_rw("fy", &bcdl::CameraIntrinsics::fy)
+      .def_rw("cx", &bcdl::CameraIntrinsics::cx)
+      .def_rw("cy", &bcdl::CameraIntrinsics::cy);
+
+  nb::class_<bcdl::Mono3dBox>(m, "Mono3dBox")
+      .def_ro("class_id", &bcdl::Mono3dBox::class_id)
+      .def_ro("score", &bcdl::Mono3dBox::score)
+      .def_ro("x", &bcdl::Mono3dBox::x)
+      .def_ro("y", &bcdl::Mono3dBox::y)
+      .def_ro("z", &bcdl::Mono3dBox::z)
+      .def_ro("h", &bcdl::Mono3dBox::h)
+      .def_ro("w", &bcdl::Mono3dBox::w)
+      .def_ro("l", &bcdl::Mono3dBox::l)
+      .def_ro("yaw", &bcdl::Mono3dBox::yaw)
+      .def_ro("alpha", &bcdl::Mono3dBox::alpha)
+      .def_ro("box2d", &bcdl::Mono3dBox::box2d)
+      .def("__repr__", [](const bcdl::Mono3dBox& b) {
+        char s[160];
+        std::snprintf(s, sizeof(s),
+                      "Mono3dBox(cls=%d score=%.2f xyz=[%.2f,%.2f,%.2f] hwl=[%.2f,%.2f,%.2f] "
+                      "yaw=%.2f)",
+                      b.class_id, b.score, b.x, b.y, b.z, b.h, b.w, b.l, b.yaw);
+        return std::string(s);
+      });
+
+  nb::class_<bcdl::Mono3dConfig>(m, "Mono3dConfig")
+      .def(nb::init<>())
+      .def_rw("num_classes", &bcdl::Mono3dConfig::num_classes)
+      .def_rw("conf_thresh", &bcdl::Mono3dConfig::conf_thresh)
+      .def_rw("max_dets", &bcdl::Mono3dConfig::max_dets)
+      .def_rw("nms_kernel", &bcdl::Mono3dConfig::nms_kernel)
+      .def_rw("pred_2d", &bcdl::Mono3dConfig::pred_2d)
+      .def_rw("depth_ref", &bcdl::Mono3dConfig::depth_ref)
+      .def_rw("dim_ref", &bcdl::Mono3dConfig::dim_ref);
+
+  m.def("compute_mono3d_feature_xform", &bcdl::computeMono3dFeatureXform, "orig_w"_a,
+        "orig_h"_a, "feat_w"_a, "feat_h"_a,
+        "Build the original<->feature affine (scale-to-width, center-height) for SMOKE decode.");
+
+  // decode_mono3d(): numpy Python path — channel-first cls [nc,H,W] and reg
+  // [8,H,W] c-contiguous float arrays (raw logits). Returns Mono3dBoxes.
+  m.def(
+      "decode_mono3d",
+      [](nb::ndarray<const float, nb::c_contig> cls,
+         nb::ndarray<const float, nb::c_contig> reg, bcdl::Mono3dConfig cfg,
+         const bcdl::LetterboxInfo& feat_xform, const bcdl::CameraIntrinsics& K) {
+        // Accept [nc,H,W] / [1,nc,H,W] (cls) and [8,H,W] / [1,8,H,W] (reg).
+        auto squeeze = [](const nb::ndarray<const float, nb::c_contig>& a, int& C, int& H,
+                          int& W) -> void {
+          if (a.ndim() == 4 && a.shape(0) == 1) {
+            C = static_cast<int>(a.shape(1));
+            H = static_cast<int>(a.shape(2));
+            W = static_cast<int>(a.shape(3));
+          } else if (a.ndim() == 3) {
+            C = static_cast<int>(a.shape(0));
+            H = static_cast<int>(a.shape(1));
+            W = static_cast<int>(a.shape(2));
+          } else {
+            throw std::runtime_error("decode_mono3d: expected [C,H,W] or [1,C,H,W]");
+          }
+        };
+        int cC = 0, cH = 0, cW = 0, rC = 0, rH = 0, rW = 0;
+        squeeze(cls, cC, cH, cW);
+        squeeze(reg, rC, rH, rW);
+        if (rH != cH || rW != cW) {
+          throw std::runtime_error("decode_mono3d: cls and reg grids must match");
+        }
+        if (rC < 8) throw std::runtime_error("decode_mono3d: reg needs >=8 channels");
+        cfg.num_classes = cC;  // authoritative from the tensor
+        return bcdl::decodeMono3d(cls.data(), reg.data(), cH, cW, cfg, feat_xform, K);
+      },
+      "cls"_a, "reg"_a, "config"_a, "feat_xform"_a, "K"_a,
+      "Decode channel-first cls[nc,H,W]/reg[8,H,W] SMOKE logits -> Mono3dBoxes.");
+
+  nb::class_<bcdl::Mono3dDetector>(m, "Mono3dDetector")
+      .def(nb::init<bcdl::Engine&, bcdl::Mono3dConfig, int>(), "engine"_a,
+           "config"_a = bcdl::Mono3dConfig{}, "output_base"_a = 0, nb::keep_alive<1, 2>())
+      .def("postprocess", &bcdl::Mono3dDetector::postprocess, "orig_w"_a, "orig_h"_a, "K"_a)
+      .def_prop_ro("config", &bcdl::Mono3dDetector::config);
 
   // ===========================================================================
   // Multi-object tracking: ByteTrack
