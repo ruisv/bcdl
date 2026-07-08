@@ -350,7 +350,7 @@ this project.
 
 > WeChat group QR codes expire — if it no longer works, please open an
 > [Issue](../../issues) and we'll refresh it. You're also welcome to reach us via
-> [Issues](../../issues) and [Discussions](../../discussions).
+> [Issues](../../issues).
 
 ## Contributing
 

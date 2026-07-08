@@ -336,7 +336,7 @@ PYTHONPATH=build:python pytest tests/
 <img src="docs/assets/bcdl-group-qr.jpg" alt="BCDL 交流群二维码" width="240">
 
 > 微信群二维码有有效期，若已过期请在 [Issues](../../issues) 留言，我们会更新；
-> 也欢迎直接在 [Issues](../../issues) 与 [Discussions](../../discussions) 交流。
+> 也欢迎直接在 [Issues](../../issues) 交流。
 
 ## 参与贡献
 
