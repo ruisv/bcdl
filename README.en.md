@@ -343,14 +343,14 @@ explicit `--hbm`).
 
 ## Community
 
-Join the chat group to discuss RDK / BPU deployment and using this project. You
-can also participate via [Issues](../../issues) and
-[Discussions](../../discussions).
+Join the **BCDL (BPU) tech chat group** to discuss RDK / BPU deployment and using
+this project.
 
-<!-- Drop the group QR image at docs/assets/bcdl-group-qr.png, then uncomment the line below: -->
-<!-- <img src="docs/assets/bcdl-group-qr.png" alt="BCDL chat group QR" width="220"> -->
+<img src="docs/assets/bcdl-group-qr.jpg" alt="BCDL chat group QR" width="240">
 
-> The chat-group QR code is coming soon.
+> WeChat group QR codes expire — if it no longer works, please open an
+> [Issue](../../issues) and we'll refresh it. You're also welcome to reach us via
+> [Issues](../../issues) and [Discussions](../../discussions).
 
 ## Contributing
 

@@ -331,13 +331,12 @@ PYTHONPATH=build:python pytest tests/
 
 ## 社区交流
 
-欢迎加入交流群，一起讨论 RDK / BPU 部署与本项目的使用。也可通过
-[Issues](../../issues) 与 [Discussions](../../discussions) 参与讨论。
+欢迎加入 **BCDL (BPU) 技术交流群**，一起讨论 RDK / BPU 部署与本项目的使用。
 
-<!-- 把群二维码图片放到 docs/assets/bcdl-group-qr.png，然后取消下面一行注释： -->
-<!-- <img src="docs/assets/bcdl-group-qr.png" alt="BCDL 交流群二维码" width="220"> -->
+<img src="docs/assets/bcdl-group-qr.jpg" alt="BCDL 交流群二维码" width="240">
 
-> 交流群二维码即将上线。
+> 微信群二维码有有效期，若已过期请在 [Issues](../../issues) 留言，我们会更新；
+> 也欢迎直接在 [Issues](../../issues) 与 [Discussions](../../discussions) 交流。
 
 ## 参与贡献
 
