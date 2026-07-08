@@ -65,6 +65,7 @@ COCO_NAMES = [
     "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
     "hair drier", "toothbrush",
 ]
+
 DOTA_NAMES = [
     "plane", "ship", "storage-tank", "baseball-diamond", "tennis-court",
     "basketball-court", "ground-track-field", "harbor", "bridge",
@@ -126,6 +127,9 @@ TASKS = {
     "obb":  dict(model="yolo26n_obb_nashm_640x640_nv12.hbm",    image=OBB_IMAGE,         wh=(640, 640),  kind="nv12",  names=DOTA_NAMES),
     "semseg": dict(model=SEMSEG_MODEL, image="segmentation.png", wh=(2048, 1024), kind="nv12", names=None),
     "depth":  dict(model=DEPTH_MODEL,  image="bus.jpg",          wh=(686, 518),   kind="depth", names=None),
+    # --- SOTA additions (2026-07): open-vocab det/seg, transformer det ---------
+    "yoloe_det": dict(model="yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm", image="bus.jpg", wh=(640, 640), kind="nv12", names=COCO_NAMES),
+    "yoloe_seg": dict(model="yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm", image="bus.jpg", wh=(640, 640), kind="nv12", names=COCO_NAMES),
 }
 
 
@@ -297,7 +301,7 @@ class Task:
         self.orig_h, self.orig_w = self.img.shape[:2]
         self.engine = bcdl.Engine(self.model_file)
         self.lb = None
-        if self.kind == "depth":                          # single F32 NCHW RGB input
+        if self.kind == "depth":                          # single F32 NCHW RGB input (ImageNet norm)
             self.x = preprocess_depth_f32(self.img, self.in_w, self.in_h)
         else:                                             # 2-input NV12
             self.y, self.uv, self.lb = preprocess_nv12(bcdl, self.img, self.in_w, self.in_h)
@@ -306,7 +310,7 @@ class Task:
     def _build_decoder(self):
         b = self.bcdl
         k = self.key
-        if k in ("det", "det_dfl"):       # det_dfl: YoloLtrbDetector auto-detects DFL box=64
+        if k in ("det", "det_dfl", "yoloe_det"):  # YoloLtrbDetector auto-detects LTRB vs DFL box=64
             cfg = b.YoloLtrbConfig(); cfg.num_classes = 80; cfg.conf_thresh = 0.25
             cfg.strides = [8, 16, 32]
             self.dec = b.YoloLtrbDetector(self.engine, cfg)
@@ -314,7 +318,7 @@ class Task:
             cfg = b.PoseConfig(); cfg.num_keypoints = 17; cfg.conf_thresh = 0.25
             cfg.strides = [8, 16, 32]
             self.dec = b.PoseEstimator(self.engine, cfg)
-        elif k == "seg":
+        elif k in ("seg", "yoloe_seg"):   # InstanceSegmenter auto-detects LTRB vs DFL box
             cfg = b.InstanceSegConfig(); cfg.conf_thresh = 0.25; cfg.strides = [8, 16, 32]
             self.dec = b.InstanceSegmenter(self.engine, cfg)
         elif k == "obb":
@@ -345,9 +349,9 @@ class Task:
     def decode(self):
         """Run the full path (feed + infer + postprocess) and return results."""
         k = self.key
-        if k in ("det", "det_dfl", "pose", "obb"):
+        if k in ("det", "det_dfl", "yoloe_det", "pose", "obb"):
             return self.dec.detect([self.y, self.uv], self.lb)
-        if k == "seg":
+        if k in ("seg", "yoloe_seg"):
             return self.dec.detect([self.y, self.uv], self.lb, self.orig_w, self.orig_h)
         if k == "cls":
             return self.dec.classify([self.y, self.uv])
@@ -363,7 +367,7 @@ class Task:
     def postprocess(self):
         """Decode the engine's current output (after feed()+infer())."""
         k = self.key
-        if k == "seg":
+        if k in ("seg", "yoloe_seg"):
             return self.dec.postprocess(self.lb, self.orig_w, self.orig_h)
         if k in ("cls", "semseg", "depth"):
             return self.dec.postprocess()
@@ -376,7 +380,7 @@ class Task:
             return ", ".join(f"{r.class_id}:{r.score:.2f}" for r in results[:3])
         if k == "pose":
             return f"{len(results)} pose(s)"
-        if k == "seg":
+        if k in ("seg", "yoloe_seg"):
             return f"{len(results)} instance(s)"
         if k == "obb":
             return f"{len(results)} rotated box(es)"
@@ -411,7 +415,7 @@ class Task:
                 put_label(vis, self._name(d.class_id), box[:, 0].min(),
                           box[:, 1].min(), c, fh=16)
             return vis
-        if k == "seg":
+        if k in ("seg", "yoloe_seg"):
             overlay = vis.copy()
             for d in results:                          # masks first, boxes/labels on top
                 c = palette(d.class_id)

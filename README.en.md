@@ -21,7 +21,7 @@ zero-copy across the media and compute units by default.
 - [Install](#install) · [Quickstart](#quickstart) · [Build from source](#build-from-source)
 - [Documentation](#documentation)
 - [Benchmarks](#benchmarks) · [Tests](#tests)
-- [Contributing](#contributing) · [Acknowledgments](#acknowledgments) · [License](#license)
+- [Community](#community) · [Contributing](#contributing) · [Acknowledgments](#acknowledgments) · [License](#license)
 
 ## Gallery
 
@@ -66,7 +66,20 @@ post-processing (CUDA kernels rewritten as CPU/NEON).
     **Monocular 3D detection** (SMOKE — 3D box + orientation from a single image).
   - **OCR** — full 3-stage **PP-OCRv5** pipeline: DBNet detect → PP-LCNet
     direction classifier (0°/180°) → CRNN/CTC recognize (18385-class dict).
-  - **Multi-object tracking** — ByteTrack (Kalman + two-stage association).
+  - **Open-vocabulary detection / segmentation** — **YOLOE** (prompt-free, ships a
+    COCO-80 label table `LabelMap`, reuses the LTRB / DFL decode — name classes
+    without retraining).
+  - **Promptable segmentation** — **EdgeSAM** interactive segmentation (point / box
+    prompts; RepViT image encoder → cached embedding → prompt decoder two-stage,
+    `SamSession`).
+  - **Multi-object tracking** — ByteTrack (Kalman + two-stage association); ReID
+    appearance embeddings with L2-normalize + cosine similarity (BoT-SORT
+    association primitives).
+  - Detection heads take both **PTQ (NV12 two-plane) and QAT-exported float-input**
+    models (`detect_float` / `letterbox_chw_float`).
+- **Hardware preprocessing** — fixed geometric transforms on the VPS GDC engine:
+  hardware letterbox and arbitrary dense remap `GdcRemap` (cv2.remap semantics, for
+  stereo rectification; 2448×2048 ≈ 6.3 ms, CPU mostly idle).
 - **Media** — hardware **JPEG** (JPU) and **H.264 / H.265** (VPU) encode/decode.
 - **Pipelines** — synchronous buffer-reuse `DetectionPipeline`, threaded
   `AsyncDetectionPipeline` (preproc ‖ infer overlap), `TrackingPipeline`,
@@ -78,12 +91,12 @@ post-processing (CUDA kernels rewritten as CPU/NEON).
 
 ```
 python/    nanobind bindings (NumPy <-> tensors), GIL-released infer
-tasks/     det · cls · pose · seg · obb · semseg · depth · mono3d · ocr
-tracks/    ByteTrack multi-object tracker
+tasks/     det · cls · pose · seg · obb · semseg · depth · mono3d · ocr · open-vocab · sam
+tracks/    ByteTrack multi-object tracker · ReID appearance embeddings
 pipeline/  sync / async detection · tracking · stereo  (JPU -> VP -> BPU -> CPU/VPU)
 media/     JpegCodec (JPU) · VideoCodec H.264/H.265 (VPU)
 backend/   Engine, output readers          (libdnn  -> hbDNN*)
-preproc/   CPU letterbox + BGR->NV12 (OpenCV/OpenMP); GDC HW letterbox (VPS); VP (hb_vp)
+preproc/   CPU letterbox + BGR->NV12 (OpenCV/OpenMP); GDC HW letterbox + dense remap (VPS); VP (hb_vp)
 core/      SysMem · Task · Status · MemPool (libhbucp -> hbUCP*)
 ```
 
@@ -327,6 +340,17 @@ explicit `--hbm`).
 | Stereo depth (real LAS2 `.hbm`) | `test_stereo_board_py` | 3 | yes |
 | Media codecs (VPImage · JPEG/JPU · H.264/H.265/VPU) | `test_codec_py`, `test_video_decode_py` | 11 | yes |
 | Pipelines (ByteTrack, async detection) | `test_tracking_py`, `test_async_detection_py` | 5 | yes |
+
+## Community
+
+Join the chat group to discuss RDK / BPU deployment and using this project. You
+can also participate via [Issues](../../issues) and
+[Discussions](../../discussions).
+
+<!-- Drop the group QR image at docs/assets/bcdl-group-qr.png, then uncomment the line below: -->
+<!-- <img src="docs/assets/bcdl-group-qr.png" alt="BCDL chat group QR" width="220"> -->
+
+> The chat-group QR code is coming soon.
 
 ## Contributing
 

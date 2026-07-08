@@ -28,6 +28,7 @@
 #include "bcdl/preproc/vp_image.h"
 #ifdef BCDL_HAVE_GDC
 #include "bcdl/preproc/gdc_letterbox.h"
+#include "bcdl/preproc/gdc_remap.h"
 #endif
 #include "bcdl/tasks/classification.h"
 #include "bcdl/tasks/depth.h"
@@ -36,8 +37,11 @@
 #include "bcdl/tasks/mono3d.h"
 #include "bcdl/tasks/obb.h"
 #include "bcdl/tasks/ocr.h"
+#include "bcdl/tasks/open_vocab.h"
 #include "bcdl/tasks/pose.h"
+#include "bcdl/tasks/promptable_seg.h"
 #include "bcdl/tasks/segmentation.h"
+#include "bcdl/tracks/reid.h"
 #include "bcdl/pipeline/async_detection_pipeline.h"
 #include "bcdl/pipeline/detection_pipeline.h"
 #include "bcdl/pipeline/stereo_pipeline.h"
@@ -218,6 +222,15 @@ NB_MODULE(bcdl_py, m) {
       .def("postprocess", &bcdl::YoloLtrbDetector::postprocess, "letterbox"_a)
       .def_prop_ro("config", &bcdl::YoloLtrbDetector::config);
 
+  // --- open-vocabulary label table (YOLOE prompt-free) -----------------------
+  nb::class_<bcdl::LabelMap>(m, "LabelMap")
+      .def(nb::init<>())
+      .def_static("from_file", &bcdl::LabelMap::fromFile, "path"_a)
+      .def_static("from_list", &bcdl::LabelMap::fromList, "names"_a)
+      .def_rw("names", &bcdl::LabelMap::names)
+      .def("__len__", [](const bcdl::LabelMap& m) { return m.size(); })
+      .def("name", &bcdl::LabelMap::name, "class_id"_a);
+
   // ===========================================================================
   // Media: the unified VpImage + JPU/VPU codecs
   // ===========================================================================
@@ -386,6 +399,45 @@ NB_MODULE(bcdl_py, m) {
       .def_prop_ro("info", &bcdl::GdcLetterbox::info)
       .def_prop_ro("output_width", &bcdl::GdcLetterbox::outputWidth)
       .def_prop_ro("output_height", &bcdl::GdcLetterbox::outputHeight);
+
+  // --- GDC hardware dense remap (fixed warp, e.g. stereo rectification) -------
+  nb::class_<bcdl::GdcRemap>(m, "GdcRemap")
+      .def(
+          "__init__",
+          [](bcdl::GdcRemap* self, nb::ndarray<float, nb::c_contig> map_x,
+             nb::ndarray<float, nb::c_contig> map_y, int in_w, int in_h,
+             int grid_step) {
+            if (map_x.ndim() != 2 || map_y.ndim() != 2 ||
+                map_x.shape(0) != map_y.shape(0) || map_x.shape(1) != map_y.shape(1))
+              throw std::runtime_error(
+                  "GdcRemap expects two (out_h, out_w) float32 maps of equal shape");
+            const int out_h = static_cast<int>(map_x.shape(0));
+            const int out_w = static_cast<int>(map_x.shape(1));
+            new (self) bcdl::GdcRemap(static_cast<const float*>(map_x.data()),
+                                      static_cast<const float*>(map_y.data()),
+                                      in_w, in_h, out_w, out_h, grid_step);
+          },
+          "map_x"_a, "map_y"_a, "in_w"_a, "in_h"_a, "grid_step"_a = 16,
+          "Persistent GDC vnode for a FIXED dense warp with cv2.remap semantics "
+          "(out(x,y) = in(map_x[y,x], map_y[y,x])). The (out_h, out_w) float32 "
+          "maps are sampled every grid_step px into a CUSTOM warp grid whose "
+          "LUT is generated at construction (hbn_gen_gdc_cfg) — no bin file.")
+      .def(
+          "run",
+          [](bcdl::GdcRemap& g, const bcdl::VpImage& src) {
+            // GIL released: the copies + hardware wait are pure C++, and two
+            // GdcRemap instances (e.g. stereo top/bottom) can then overlap
+            // their CPU work with each other's GDC op from Python threads.
+            nb::gil_scoped_release rel;
+            bcdl::VpImage dst(g.outputWidth(), g.outputHeight(), HB_VP_IMAGE_FORMAT_NV12);
+            g.run(src, dst);
+            return dst;
+          },
+          "src"_a, "Warp an NV12 VpImage into a new out_w x out_h NV12 VpImage.")
+      .def_prop_ro("input_width", &bcdl::GdcRemap::inputWidth)
+      .def_prop_ro("input_height", &bcdl::GdcRemap::inputHeight)
+      .def_prop_ro("output_width", &bcdl::GdcRemap::outputWidth)
+      .def_prop_ro("output_height", &bcdl::GdcRemap::outputHeight);
 #endif
 
   // --- H.264 / H.265 (VPU) ---------------------------------------------------
@@ -792,6 +844,73 @@ NB_MODULE(bcdl_py, m) {
       "Decode per-scale [H,W,1]/[H,W,4]/[H,W,K*3] float tensors -> PoseDetections.");
 
   // ===========================================================================
+  // ReID appearance embeddings (BoT-SORT association primitives)
+  // ===========================================================================
+  m.def(
+      "normalize_embedding",
+      [](nb::ndarray<const float, nb::c_contig> emb) {
+        if (emb.ndim() != 1) {
+          throw std::runtime_error("normalize_embedding: expected a 1-D [D] vector");
+        }
+        return bcdl::normalizeEmbedding(emb.data(), static_cast<int>(emb.shape(0)));
+      },
+      "embedding"_a, "L2-normalize a 1-D appearance embedding -> list[float].");
+  m.def("cosine_similarity", &bcdl::cosineSimilarity, "a"_a, "b"_a,
+        "Cosine similarity of two equal-length embeddings in [-1,1].");
+
+  // ===========================================================================
+  // Promptable segmentation (EdgeSAM / SAM mask decoder tail)
+  // ===========================================================================
+  nb::class_<bcdl::SamConfig>(m, "SamConfig")
+      .def(nb::init<>())
+      .def_rw("mask_threshold", &bcdl::SamConfig::mask_threshold)
+      .def_rw("multimask", &bcdl::SamConfig::multimask);
+
+  nb::class_<bcdl::SamMask>(m, "SamMask")
+      .def_ro("index", &bcdl::SamMask::index)
+      .def_ro("iou", &bcdl::SamMask::iou)
+      .def_ro("mask_w", &bcdl::SamMask::mask_w)
+      .def_ro("mask_h", &bcdl::SamMask::mask_h)
+      .def_prop_ro(
+          "mask",
+          [](const bcdl::SamMask& sm) {
+            if (sm.mask.empty()) return toNumpy(std::vector<uint8_t>{}, {0, 0});
+            return toNumpy(std::vector<uint8_t>(sm.mask),
+                           {static_cast<size_t>(sm.mask_h),
+                            static_cast<size_t>(sm.mask_w)});
+          },
+          nb::rv_policy::reference,
+          "Selected low-res binary mask as a uint8 (H, W) numpy array (0/1).");
+
+  nb::class_<bcdl::SamMaskDecoder>(m, "SamMaskDecoder")
+      .def(nb::init<bcdl::Engine&, bcdl::SamConfig, int, int>(), "engine"_a,
+           "config"_a = bcdl::SamConfig{}, "masks_index"_a = 0, "iou_index"_a = 1,
+           nb::keep_alive<1, 2>())
+      .def("postprocess", &bcdl::SamMaskDecoder::postprocess)
+      .def_prop_ro("config", &bcdl::SamMaskDecoder::config);
+
+  // decode_sam_masks(): numpy path — low_res_logits [Nmask,Hm,Wm] + iou_pred
+  // [Nmask]. Returns the best (argmax-IoU) low-res binary SamMask.
+  m.def(
+      "decode_sam_masks",
+      [](nb::ndarray<const float, nb::c_contig> logits,
+         nb::ndarray<const float, nb::c_contig> iou_pred, const bcdl::SamConfig& cfg) {
+        if (logits.ndim() != 3) {
+          throw std::runtime_error("decode_sam_masks: logits must be [Nmask,Hm,Wm]");
+        }
+        const int n = static_cast<int>(logits.shape(0));
+        const int h = static_cast<int>(logits.shape(1));
+        const int w = static_cast<int>(logits.shape(2));
+        const float* ip = nullptr;
+        if (iou_pred.ndim() == 1 && static_cast<int>(iou_pred.shape(0)) == n) {
+          ip = iou_pred.data();
+        }
+        return bcdl::decodeSamMasks(logits.data(), n, h, w, ip, cfg);
+      },
+      "low_res_logits"_a, "iou_pred"_a, "config"_a,
+      "Select+binarize the best SAM mask from [Nmask,Hm,Wm] logits + [Nmask] iou.");
+
+  // ===========================================================================
   // Instance segmentation
   // ===========================================================================
   nb::class_<bcdl::InstanceSegConfig>(m, "InstanceSegConfig")
@@ -801,7 +920,8 @@ NB_MODULE(bcdl_py, m) {
       .def_rw("max_dets", &bcdl::InstanceSegConfig::max_dets)
       .def_rw("strides", &bcdl::InstanceSegConfig::strides)
       .def_rw("proto_index", &bcdl::InstanceSegConfig::proto_index)
-      .def_rw("compute_masks", &bcdl::InstanceSegConfig::compute_masks);
+      .def_rw("compute_masks", &bcdl::InstanceSegConfig::compute_masks)
+      .def_rw("reg_max", &bcdl::InstanceSegConfig::reg_max);
 
   nb::class_<bcdl::InstanceMask>(m, "InstanceMask")
       .def_ro("x1", &bcdl::InstanceMask::x1)
@@ -890,12 +1010,24 @@ NB_MODULE(bcdl_py, m) {
           throw std::runtime_error(
               "decode_instance_seg: proto must be [mH,mW,np] or [1,mH,mW,np]");
         }
+        // Auto-detect box head format from channel count (4 => LTRB,
+        // 4*reg_max => DFL) so the numpy path matches InstanceSegmenter.
+        bcdl::InstanceSegConfig eff = cfg;
+        const int box_ch = static_cast<int>(box[0].shape(2));
+        if (box_ch == 4) {
+          eff.reg_max = 0;
+        } else if (box_ch % 4 == 0) {
+          eff.reg_max = box_ch / 4;
+        } else {
+          throw std::runtime_error(
+              "decode_instance_seg: box channels neither 4 nor 4*reg_max");
+        }
         return bcdl::decodeInstanceSeg(cp, bp, mp, grid, nc, np, proto.data(), mH, mW,
-                                       pC, cfg, lb, orig_w, orig_h);
+                                       pC, eff, lb, orig_w, orig_h);
       },
       "cls"_a, "box"_a, "mc"_a, "proto"_a, "config"_a, "letterbox"_a, "orig_w"_a,
       "orig_h"_a,
-      "Decode per-scale [H,W,nc]/[H,W,4]/[H,W,np] + proto [mH,mW,np] -> InstanceMasks.");
+      "Decode per-scale [H,W,nc]/[H,W,4|4*reg_max]/[H,W,np] + proto [mH,mW,np] -> InstanceMasks.");
 
   // ===========================================================================
   // Oriented bounding box (OBB)

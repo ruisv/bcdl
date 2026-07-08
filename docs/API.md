@@ -136,6 +136,31 @@ nv12 = bcdl.bgr_to_nv12(bgr)         # (H*3//2, W) uint8; even dims; needs OpenC
 - **`bgr_to_nv12(bgr) -> np.ndarray`** — packed NV12, feeds `vp_image_from_nv12`
   and the JPU encoder. Also see [Images & codecs](#images--codecs).
 
+## GDC hardware ops (board-only)
+
+Fixed geometric transforms on the VPS GDC engine — NV12 in/out, CPU idle
+during the op. `None` off-board / without GDC support. Full semantics + the
+reverse-engineered CUSTOM-grid notes: [docs/GDC.md](GDC.md).
+
+```python
+# hardware letterbox (pre-generated warp-LUT bin, fixed geometry)
+g = bcdl.GdcLetterbox(bin_path, in_w, in_h, out_w, out_h, pad=114)
+dst = g.run(src_vpimage)                    # NV12 VpImage -> NV12 VpImage
+
+# hardware dense remap (cv2.remap semantics; LUT generated at runtime)
+g = bcdl.GdcRemap(map_x, map_y, in_w, in_h, grid_step=16)   # (out_h,out_w) f32 maps
+dst = g.run(src_vpimage)
+```
+
+- **`GdcRemap(map_x, map_y, in_w, in_h, grid_step=16)`** — arbitrary FIXED
+  warp, `out(x,y) = in(map_x[y,x], map_y[y,x])`; built for stereo
+  rectification. `grid_step` must divide both output dims. 2448×2048: 6.3 ms
+  wall / ~1 ms CPU vs 14.7 ms all-cores `cv2.remap`; matches cv2 to p99 ≤ 2
+  grey-levels. `BCDL_GDC_TIMING=1` prints copy/op breakdown.
+- **`GdcLetterbox(bin_path, in_w, in_h, out_w, out_h, pad=114)`** — letterbox
+  on GDC from an offline-generated AFFINE bin; `.info` returns the
+  `LetterboxInfo`.
+
 ---
 
 ## Detection

@@ -196,6 +196,21 @@ verify against your model's calibrated range.
 **hbVP path** (`bcdl/preproc/letterbox.h`, DSP required): `letterbox(dst, src,
 padValue, interp)`, `cvtColor(dst, src)`, `resizeExact(dst, src, interp)`.
 
+**GDC hardware path** (`bcdl/preproc/gdc_letterbox.h`, `gdc_remap.h`; only
+when built with `BCDL_HAVE_GDC`) — fixed transforms on the VPS GDC engine,
+NV12 in/out, CPU idle during the op. Semantics + reverse-engineered
+CUSTOM-grid notes: [docs/GDC.md](GDC.md).
+
+```cpp
+// letterbox from an offline-generated AFFINE warp bin
+bcdl::GdcLetterbox lbg(binPath, inW, inH, outW, outH, /*pad=*/114);
+lbg.run(srcNv12, dstNv12);
+
+// arbitrary fixed dense remap (cv2.remap semantics), LUT generated at runtime
+bcdl::GdcRemap remap(mapX, mapY, inW, inH, outW, outH, /*gridStep=*/16);
+remap.run(srcNv12, dstNv12);   // 2448x2048: ~6.3 ms wall, ~1 ms CPU
+```
+
 ## VpImage
 
 `bcdl/preproc/vp_image.h` — RAII image backed by a cached `SysMem`; the unified

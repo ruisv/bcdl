@@ -29,7 +29,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "tests"))
 import board_models as bm  # noqa: E402
 
-TASK_ORDER = ["cls", "det", "det_dfl", "pose", "seg", "obb", "semseg", "depth", "stereo", "ocr"]
+TASK_ORDER = ["cls", "det", "det_dfl", "pose", "seg", "obb", "semseg", "depth", "stereo", "ocr",
+              "yoloe_det", "yoloe_seg"]
 
 
 def read_rss_mb():
@@ -294,6 +295,60 @@ def track_figure(figdir):
     return True
 
 
+def edgesam_bench(figdir):
+    """EdgeSAM interactive segmentation — two-stage (RepViT encoder -> cached
+    embedding -> point/box prompt decoder). Times the encoder (per image) and the
+    decoder (per prompt), draws a point-mask + box-mask overlay -> figures/edgesam.jpg,
+    and returns a benchmark row. Norm is fused into the encoder hbm (raw RGB in)."""
+    import bcdl
+    import cv2
+    import numpy as np
+
+    enc_p = os.path.join(bm.MODELS, "edge_sam_encoder_nashm.hbm")
+    dec_p = os.path.join(bm.MODELS, "edge_sam_decoder_sp1_nashm.hbm")
+    box_p = os.path.join(bm.MODELS, "edge_sam_decoder_bp2_nashm.hbm")
+    img = cv2.imread(bm.find_image("bus.jpg"), cv2.IMREAD_COLOR)
+    if not all(os.path.exists(p) for p in (enc_p, dec_p, box_p)) or img is None:
+        print("  (skip edgesam: models or bus.jpg missing)")
+        return None
+
+    rss0 = read_rss_mb()
+    enc, dec, box = bcdl.Engine(enc_p), bcdl.Engine(dec_p), bcdl.Engine(box_p)
+    rss1 = read_rss_mb()
+    sam = bcdl.SamSession(enc, dec, box_decoder=box)
+
+    n = 20
+    t0 = time.perf_counter()
+    for _ in range(n):
+        sam.set_image(img)                              # encoder (per image)
+    enc_ms = (time.perf_counter() - t0) / n * 1000.0
+    t0 = time.perf_counter()
+    for _ in range(n):
+        sam.predict(148, 650)                           # point decoder (per prompt)
+    dec_ms = (time.perf_counter() - t0) / n * 1000.0
+
+    mask_pt, _ = sam.predict(148, 650)                  # a person (point)
+    mask_box, _ = sam.predict_box(19, 234, 801, 736)    # the bus (box)
+    ov = img.copy()
+    ov[mask_box.astype(bool)] = (230, 140, 0)           # box mask (blue)
+    ov[mask_pt.astype(bool)] = (0, 220, 0)              # point mask (green)
+    vis = cv2.addWeighted(ov, 0.45, img, 0.55, 0)
+    cv2.rectangle(vis, (19, 234), (801, 736), (230, 140, 0), 2)
+    cv2.circle(vis, (148, 650), 9, (0, 0, 255), -1)
+    os.makedirs(figdir, exist_ok=True)
+    cv2.imwrite(os.path.join(figdir, "edgesam.jpg"), vis)
+
+    model_mb = round(sum(os.path.getsize(p) for p in (enc_p, dec_p, box_p)) / 1e6, 2)
+    print(f"edgesam: encoder {enc_ms:.1f}ms + decoder {dec_ms:.1f}ms/prompt "
+          f"-> figures/edgesam.jpg")
+    return dict(task="edgesam", model="edge_sam encoder + point/box decoder",
+                image="bus.jpg", input="1024x1024", outputs=2, model_mb=model_mb,
+                mem_mb=round(rss1 - rss0, 1), infer_ms=round(enc_ms, 3),
+                infer_fps=round(1000.0 / enc_ms, 1), e2e_ms=round(enc_ms + dec_ms, 3),
+                e2e_fps=round(1000.0 / (enc_ms + dec_ms), 1), n_results=2,
+                summary=f"pt+box masks; enc {enc_ms:.1f}ms/img + dec {dec_ms:.1f}ms/prompt")
+
+
 def write_decode_md(rows):
     if not rows:
         return []
@@ -380,6 +435,7 @@ def main():
     ap.add_argument("--task", help="bench a single task in-process (internal)")
     ap.add_argument("--decode", action="store_true", help="run decode compare (internal)")
     ap.add_argument("--track", action="store_true", help="generate tracking figure (internal)")
+    ap.add_argument("--edgesam", action="store_true", help="run EdgeSAM two-stage bench (internal)")
     ap.add_argument("--figdir", default=None)
     args = ap.parse_args()
 
@@ -395,6 +451,11 @@ def main():
         return
     if args.track:  # child: detect + ByteTrack figure
         track_figure(figdir)
+        return
+    if args.edgesam:  # child: EdgeSAM two-stage bench + figure
+        r = edgesam_bench(figdir)
+        if r is not None:
+            print("EDGESAM_JSON:" + json.dumps(r))
         return
 
     info = board_info()
@@ -428,6 +489,17 @@ def main():
     subprocess.run(
         [sys.executable, os.path.abspath(__file__), "--track", "--figdir", figdir],
         text=True, env=dict(os.environ))
+
+    # EdgeSAM two-stage interactive segmentation bench + figure, own process.
+    eproc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--edgesam", "--figdir", figdir],
+        capture_output=True, text=True, env=dict(os.environ))
+    for line in eproc.stdout.splitlines():
+        if line.startswith("EDGESAM_JSON:"):
+            rows.append(json.loads(line[len("EDGESAM_JSON:"):]))
+            r = rows[-1]
+            print(f"{'edgesam':5s} enc {r['infer_ms']:6.2f}ms  e2e {r['e2e_ms']:6.2f}ms  "
+                  f"mem {r['mem_mb']:5.1f}MB  model {r['model_mb']:5.1f}MB  -> {r['summary']}")
 
     if rows:
         os.makedirs(outdir, exist_ok=True)

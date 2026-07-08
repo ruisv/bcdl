@@ -197,8 +197,31 @@ std::vector<InstanceMask> decodeInstanceSeg(
         const float score = sigmoid(best_raw);
         if (score < cfg.conf_thresh) continue;
 
-        // LTRB -> model-input pixel box about the cell center (no un-letterbox).
-        const float* d = bp + cell * 4;
+        // LTRB distances about the cell center. Plain head (reg_max==0) reads 4
+        // values; DFL head reduces each side's `reg_max` raw logits via the
+        // softmax-weighted expectation Σ b·softmax(b) (ultralytics DFL: 64 ch =
+        // 4 sides × 16 bins, side-major) — mirrors YoloLtrbDetector.
+        const int reg = cfg.reg_max;
+        const int box_stride = (reg > 0) ? 4 * reg : 4;
+        float d[4];
+        if (reg > 0) {
+          const float* bb = bp + cell * box_stride;
+          for (int side = 0; side < 4; ++side) {
+            const float* sl = bb + static_cast<int64_t>(side) * reg;
+            float maxv = sl[0];
+            for (int b = 1; b < reg; ++b) maxv = std::max(maxv, sl[b]);
+            float sum = 0.0f, acc = 0.0f;
+            for (int b = 0; b < reg; ++b) {
+              const float e = std::exp(sl[b] - maxv);
+              sum += e;
+              acc += e * static_cast<float>(b);
+            }
+            d[side] = (sum > 0.0f) ? acc / sum : 0.0f;
+          }
+        } else {
+          const float* bb = bp + cell * 4;
+          d[0] = bb[0]; d[1] = bb[1]; d[2] = bb[2]; d[3] = bb[3];
+        }
         const float cx = static_cast<float>(gx) + 0.5f;
         const float cy = static_cast<float>(gy) + 0.5f;
         Detection det;
@@ -278,7 +301,7 @@ std::vector<InstanceMask> InstanceSegmenter::postprocess(const LetterboxInfo& lb
   std::vector<const float*> cls_ptr(scales, nullptr), box_ptr(scales, nullptr),
       mc_ptr(scales, nullptr);
   std::vector<std::pair<int, int>> grid(scales, {0, 0});
-  int nc = 0, np = 0;
+  int nc = 0, np = 0, box_ch = 0;
 
   for (int s = 0; s < scales; ++s) {
     std::vector<int> cls_shape, box_shape, mc_shape;
@@ -302,6 +325,15 @@ std::vector<InstanceMask> InstanceSegmenter::postprocess(const LetterboxInfo& lb
     } else if (mc_shape.size() == 3) {
       this_np = mc_shape[2];
     }
+    // Box channel count drives plain-LTRB (4) vs DFL (4*reg_max) auto-detection.
+    int this_box_ch = 0;
+    if (box_shape.size() == 4) this_box_ch = box_shape[3];
+    else if (box_shape.size() == 3) this_box_ch = box_shape[2];
+    if (this_box_ch > 0) {
+      if (box_ch == 0) box_ch = this_box_ch;
+      else if (this_box_ch != box_ch)
+        throw Error(-1, "BCDL InstanceSegmenter: inconsistent box channels across scales");
+    }
     grid[s] = {H, W};
     if (this_nc > 0) {
       if (nc == 0) nc = this_nc;
@@ -315,8 +347,19 @@ std::vector<InstanceMask> InstanceSegmenter::postprocess(const LetterboxInfo& lb
     }
   }
 
+  // Auto-detect the box head format from its channel count: 4 => plain LTRB,
+  // 4*reg_max => DFL (e.g. 64 -> reg_max 16 for yolov8/v11/YOLOE seg heads).
+  InstanceSegConfig eff = cfg_;
+  if (box_ch == 4) {
+    eff.reg_max = 0;
+  } else if (box_ch > 0 && box_ch % 4 == 0) {
+    eff.reg_max = box_ch / 4;
+  } else if (box_ch != 0) {
+    throw Error(-1, "BCDL InstanceSegmenter: box channel count is neither 4 nor 4*reg_max");
+  }
+
   return decodeInstanceSeg(cls_ptr, box_ptr, mc_ptr, grid, nc, np, proto, mH, mW, pC,
-                           cfg_, lb, orig_w, orig_h);
+                           eff, lb, orig_w, orig_h);
 }
 
 }  // namespace bcdl

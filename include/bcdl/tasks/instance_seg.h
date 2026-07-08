@@ -52,6 +52,12 @@ struct InstanceSegConfig {
   /// When false, only boxes/scores/classes are produced and the (relatively
   /// expensive) per-instance mask assembly is skipped (InstanceMask.mask empty).
   bool compute_masks = true;
+  /// Box head format: 0 => plain LTRB (4 ch/cell); >0 => DFL with this reg_max
+  /// (4*reg_max ch/cell, e.g. 16 for a 64-channel yolov8/v11/YOLOE box head),
+  /// decoded via per-side softmax-weighted expectation. InstanceSegmenter auto-
+  /// detects this from the box tensor's channel count; only the raw
+  /// decodeInstanceSeg() entry point relies on this being set correctly.
+  int reg_max = 0;
 };
 
 /// Decode parallel per-scale float cls/box/mc buffers + a prototype tensor into

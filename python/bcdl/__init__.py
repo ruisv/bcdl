@@ -111,6 +111,51 @@ def letterbox_numpy(img: np.ndarray, dst_w: int, dst_h: int, pad: int = 114):
     return canvas, lb
 
 
+def letterbox_chw_float(img: np.ndarray, dst_w: int, dst_h: int, pad: int = 114,
+                        to_rgb: bool = True, scale: float = 1.0 / 255.0,
+                        mean=None, std=None):
+    """Preprocess a BGR (or gray) image for a FLOAT-input model — e.g. a
+    **QAT-exported** YOLO whose input is ``[1,3,H,W]`` float32 rather than the
+    NV12 two-plane layout the PTQ (hb_compile) export takes.
+
+    Aspect-preserving letterbox to (dst_h, dst_w) with border value ``pad``,
+    optional BGR->RGB, multiply by ``scale`` (default 1/255), optional per-channel
+    ``(x - mean) / std`` (ImageNet-style), then HWC->NCHW contiguous float32.
+    Returns ``(nchw, LetterboxInfo)``; feed ``nchw`` as the single model input to
+    ``YoloLtrbDetector.detect([nchw], lb)`` (or use ``detect_float`` below).
+
+    The letterbox geometry is identical to :func:`letterbox_numpy`, so the
+    returned ``lb`` maps decoded boxes back to original-image pixels exactly as
+    the NV12 path does.
+
+    Fast path (``mean is None``): a single ``cv2.dnn.blobFromImage`` call fuses
+    uint8->float32 + scale + BGR->RGB + HWC->NCHW into one optimized C pass (no
+    intermediate numpy allocations). The ImageNet ``mean/std`` path preallocates
+    the NCHW output and writes each channel in place."""
+    import cv2
+
+    canvas, lb = letterbox_numpy(img, dst_w, dst_h, pad)
+    if canvas.ndim == 2:
+        canvas = canvas[:, :, None]
+    if mean is None:
+        # scalefactor*(img) + swapRB + NCHW, all in one C call -> contiguous (1,C,H,W) f32.
+        return cv2.dnn.blobFromImage(canvas, scalefactor=float(scale),
+                                     swapRB=bool(to_rgb and canvas.shape[2] == 3),
+                                     crop=False), lb
+    # ImageNet-style (x*scale - mean)/std: one output alloc, per-channel in place.
+    C = canvas.shape[2]
+    out = np.empty((1, C, canvas.shape[0], canvas.shape[1]), np.float32)
+    order = range(C - 1, -1, -1) if (to_rgb and C == 3) else range(C)
+    m = np.asarray(mean, np.float32).reshape(-1)
+    s = np.asarray(std, np.float32).reshape(-1)
+    sc = np.float32(scale)
+    for dc, srcc in enumerate(order):
+        np.multiply(canvas[:, :, srcc], sc, out=out[0, dc])   # uint8->f32 + scale, no temp
+        out[0, dc] -= m[dc]
+        out[0, dc] /= s[dc]
+    return out, lb
+
+
 class Detector:
     """High-level detector: wraps an Engine + DetectConfig. Preprocessing is the
     caller's responsibility (model layout/normalization vary); pass the formatted
@@ -154,6 +199,19 @@ class YoloLtrbDetector:
         """Post-process the Engine's current output (run engine.infer() first)."""
         return self._det.postprocess(lb)
 
+    def detect_float(self, img_bgr: np.ndarray, dst_w: int = 640, dst_h: int = 640,
+                     pad: int = 114, to_rgb: bool = True, scale: float = 1.0 / 255.0,
+                     mean=None, std=None, timeout_ms: int = 0):
+        """One-call detect for a **FLOAT-input (QAT-exported) LTRB model**: letterbox
+        + normalize + NCHW (:func:`letterbox_chw_float`), set the single input,
+        infer, and decode to Detections in original-image pixels. ``img_bgr`` is
+        the original frame. Use this instead of the NV12 ``detect([Y,UV], lb)``
+        when the model input is ``[1,3,H,W]`` float32 (the horizon_plugin_pytorch
+        QAT / hbdk4 export). Postprocess is identical — the LTRB head decode +
+        sigmoid + NMS are the same for PTQ and QAT models."""
+        nchw, lb = letterbox_chw_float(img_bgr, dst_w, dst_h, pad, to_rgb, scale, mean, std)
+        return self.detect([nchw], lb, timeout_ms)
+
 
 # --- media: VpImage + JPU/VPU codecs ---------------------------------------
 # VpImage is the unified shared-memory image. Construct one from numpy via the
@@ -167,8 +225,9 @@ vp_image_from_bgr = bcdl_py.vp_image_from_bgr
 vp_image_from_nv12 = bcdl_py.vp_image_from_nv12
 JpegEncoder = bcdl_py.JpegEncoder
 JpegDecoder = bcdl_py.JpegDecoder
-# GDC hardware letterbox — only present when built with BCDL_HAVE_GDC (board).
+# GDC hardware ops — only present when built with BCDL_HAVE_GDC (board).
 GdcLetterbox = getattr(bcdl_py, "GdcLetterbox", None)
+GdcRemap = getattr(bcdl_py, "GdcRemap", None)
 VideoEncConfig = bcdl_py.VideoEncConfig
 VideoDecConfig = bcdl_py.VideoDecConfig
 VideoEncoder = bcdl_py.VideoEncoder
@@ -377,6 +436,141 @@ compute_mono3d_feature_xform = bcdl_py.compute_mono3d_feature_xform
 # Mono3d (SMOKE) numpy path: channel-first cls[nc,H,W]/reg[8,H,W] raw logits +
 # feature affine + camera K -> Mono3dBoxes (no Engine; mirrors Mono3dDetector).
 decode_mono3d = bcdl_py.decode_mono3d
+
+# --- open-vocabulary label table (YOLOE prompt-free) -----------------------
+# class_id -> prompt-name map; detection decode is unchanged (reuse
+# YoloLtrbDetector / Detector with num_classes == len(LabelMap)).
+LabelMap = bcdl_py.LabelMap
+
+# --- ReID appearance embeddings (BoT-SORT association primitives) ----------
+normalize_embedding = bcdl_py.normalize_embedding
+cosine_similarity = bcdl_py.cosine_similarity
+
+# --- promptable segmentation (EdgeSAM / SAM mask decoder tail) --------------
+SamConfig = bcdl_py.SamConfig
+SamMask = bcdl_py.SamMask
+# SAM numpy path: low_res_logits [Nmask,Hm,Wm] + iou_pred [Nmask] -> best SamMask.
+decode_sam_masks = bcdl_py.decode_sam_masks
+
+
+def _read_packed_output(engine, idx, shape):
+    """Read a PACKED (contiguous) float engine output, reshaped to `shape`, using
+    the tensor's DECLARED dtype (F32/F16) rather than assuming float32. Used by
+    SamSession for the encoder embedding + low-res mask logits (both packed F32
+    from the EdgeSAM hbms). Rejects non-float (scaled-int) outputs — those need
+    per-tensor dequant via the C++ `outputAsFloat` path, not a raw byte read —
+    and rejects a short buffer. (Assumes no last-dim stride padding, which holds
+    for these hbms; stride-padded outputs would need the C++ reader.)"""
+    dt = np.dtype(engine.output_dtype(idx))
+    if dt.kind != "f":
+        raise RuntimeError(
+            f"SamSession: output {idx} dtype {dt} is not float; a scaled-int output "
+            "needs the C++ dequant path (outputAsFloat), not this packed reader")
+    n = int(np.prod(shape))
+    flat = np.frombuffer(engine._e.output_bytes(idx), dt)
+    if flat.size < n:
+        raise RuntimeError(
+            f"SamSession: output {idx} has {flat.size} elems < {n} for shape {shape}")
+    return flat[:n].reshape(shape)
+
+
+class SamMaskDecoder:
+    """SAM/EdgeSAM mask-decoder tail. 2 outputs: low-res mask logits + iou_pred."""
+
+    def __init__(self, engine: "Engine", config: "SamConfig | None" = None,
+                 masks_index: int = 0, iou_index: int = 1):
+        self.engine = engine
+        self.config = config if config is not None else SamConfig()
+        self._d = bcdl_py.SamMaskDecoder(engine._e, self.config, masks_index, iou_index)
+
+    def postprocess(self):
+        return self._d.postprocess()
+
+
+class SamSession:
+    """EdgeSAM interactive segmentation over the two-hbm (encoder + decoder)
+    pipeline.
+
+    ``set_image(bgr)`` SAM-preprocesses one image (resize longest side to
+    ``input_size`` + pad, BGR->RGB; the ImageNet norm is baked into the encoder
+    ``.hbm`` so raw pixels are fed) and caches the encoder embedding. Then each
+    ``predict(x, y)`` runs only the (lightweight) decoder against that cached
+    embedding, so repeated clicks are cheap.
+
+    Each deployed EdgeSAM decoder is a FIXED-point-count graph (statically shaped
+    at conversion): the ``decoder`` handles a single click point; the optional
+    ``box_decoder`` handles a 2-corner box. The iou-prediction head is int8-
+    degraded, so mask selection among the multimask outputs defaults to ``"area"``
+    (largest) rather than the unreliable predicted-iou argmax; pass ``select=<int>``
+    to force an index. ``predict`` / ``predict_box`` return ``(mask, index)`` where
+    ``mask`` is a full-resolution ``(H, W)`` uint8 (0/1) array in the ORIGINAL
+    image size.
+    """
+
+    def __init__(self, encoder: "Engine", decoder: "Engine",
+                 box_decoder: "Engine | None" = None, input_size: int = 1024):
+        self.enc = encoder
+        self.dec = decoder
+        self.box_dec = box_decoder
+        self.input_size = input_size
+        self._emb = None
+        self._scale = 1.0
+        self._nh = self._nw = self._ow = self._oh = 0
+
+    @staticmethod
+    def _masks_out_index(decoder: "Engine") -> int:
+        # The masks output is the 4-D one ([1, Nmask, mh, mw]); scores is [1, Nmask].
+        return next((i for i in range(decoder.num_outputs)
+                     if len(decoder.output_shape(i)) == 4), decoder.num_outputs - 1)
+
+    def set_image(self, bgr) -> "SamSession":
+        import cv2
+        h, w = bgr.shape[:2]
+        s = self.input_size / max(h, w)
+        nh, nw = int(round(h * s)), int(round(w * s))
+        canvas = np.zeros((self.input_size, self.input_size, 3), np.uint8)
+        canvas[:nh, :nw] = cv2.resize(bgr, (nw, nh))
+        x = np.ascontiguousarray(
+            cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).transpose(2, 0, 1)[None].astype(np.float32))
+        self.enc._e.set_input(0, x)
+        self.enc._e.infer(0)
+        eshape = self.enc.output_shape(0)
+        self._emb = _read_packed_output(self.enc, 0, eshape).astype(np.float32, copy=True)
+        self._scale, self._nh, self._nw, self._ow, self._oh = s, nh, nw, w, h
+        return self
+
+    def _decode(self, decoder, coords, labels, select):
+        """Run one decoder pass. `coords` are ORIGINAL-image (x,y) pairs; `labels`
+        the matching SAM prompt labels. Returns (full-res mask, index)."""
+        import cv2
+        if self._emb is None:
+            raise RuntimeError("SamSession: call set_image() first")
+        pt = np.array([[[cx * self._scale, cy * self._scale] for cx, cy in coords]], np.float32)
+        lab = np.array([[float(v) for v in labels]], np.float32)
+        decoder._e.set_input(0, self._emb)
+        decoder._e.set_input(1, np.ascontiguousarray(pt))
+        decoder._e.set_input(2, np.ascontiguousarray(lab))
+        decoder._e.infer(0)
+        mo = self._masks_out_index(decoder)
+        _, nmask, mh, mw = decoder.output_shape(mo)
+        masks = _read_packed_output(decoder, mo, (nmask, mh, mw))
+        binm = (masks > 0).astype(np.uint8)
+        areas = binm.reshape(nmask, -1).sum(1)
+        idx = int(select) if isinstance(select, int) else int(areas.argmax())
+        # low-res mask -> input canvas -> crop scaled region -> original size.
+        up = cv2.resize(binm[idx], (self.input_size, self.input_size),
+                        interpolation=cv2.INTER_NEAREST)[:self._nh, :self._nw]
+        full = cv2.resize(up, (self._ow, self._oh), interpolation=cv2.INTER_NEAREST)
+        return full.astype(np.uint8), idx
+
+    def predict(self, x: float, y: float, label: int = 1, select="area"):
+        return self._decode(self.dec, [(x, y)], [label], select)
+
+    def predict_box(self, x1: float, y1: float, x2: float, y2: float, select="area"):
+        if self.box_dec is None:
+            raise RuntimeError("SamSession.predict_box: no box_decoder was provided")
+        # SAM box convention: two corners with labels 2 (top-left) / 3 (bottom-right).
+        return self._decode(self.box_dec, [(x1, y1), (x2, y2)], [2, 3], select)
 
 
 class Classifier:
@@ -614,6 +808,7 @@ __all__ = [
     "LetterboxInfo",
     "compute_letterbox",
     "letterbox_numpy",
+    "letterbox_chw_float",
     "decode",
     "nms",
     "iou",
@@ -636,6 +831,7 @@ __all__ = [
     "jpeg_save",
     "jpeg_decode",
     "GdcLetterbox",
+    "GdcRemap",
     # depth
     "DepthConfig",
     "DepthMap",
@@ -689,6 +885,17 @@ __all__ = [
     "compute_mono3d_feature_xform",
     "decode_mono3d",
     "Mono3dDetector",
+    # open-vocabulary label table (YOLOE prompt-free)
+    "LabelMap",
+    # ReID appearance embeddings (BoT-SORT primitives)
+    "normalize_embedding",
+    "cosine_similarity",
+    # promptable segmentation (EdgeSAM / SAM mask decoder tail)
+    "SamConfig",
+    "SamMask",
+    "SamMaskDecoder",
+    "SamSession",
+    "decode_sam_masks",
     # multi-object tracking
     "Track",
     "ByteTrackConfig",

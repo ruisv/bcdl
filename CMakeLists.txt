@@ -79,6 +79,7 @@ add_library(bcdl SHARED
   src/tasks/classification.cc
   src/tasks/pose.cc
   src/tasks/instance_seg.cc
+  src/tasks/promptable_seg.cc
   src/tasks/obb.cc
   src/tasks/mono3d.cc
   src/tasks/ocr.cc
@@ -124,11 +125,15 @@ find_library(HB_VPF_LIB  NAMES vpf   PATHS /usr/hobot/lib)
 find_library(HB_VIO_LIB  NAMES vio   PATHS /usr/hobot/lib)
 find_library(HB_CAM_LIB  NAMES cam   PATHS /usr/hobot/lib)
 find_library(HB_MEM_LIB  NAMES hbmem PATHS /usr/hobot/lib)
+find_library(HB_GDCBIN_LIB NAMES gdcbin PATHS /usr/hobot/lib)
 if(HOBOT_GDC_INCLUDE_DIR AND HB_VPF_LIB AND HB_VIO_LIB AND HB_CAM_LIB AND HB_MEM_LIB)
   set(BCDL_HAVE_GDC ON)
-  target_sources(bcdl PRIVATE src/preproc/gdc_letterbox.cc)
+  target_sources(bcdl PRIVATE src/preproc/gdc_letterbox.cc src/preproc/gdc_remap.cc)
   target_include_directories(bcdl PRIVATE ${HOBOT_GDC_INCLUDE_DIR})
   target_link_libraries(bcdl PUBLIC ${HB_VPF_LIB} ${HB_VIO_LIB} ${HB_CAM_LIB} ${HB_MEM_LIB})
+  if(HB_GDCBIN_LIB)   # GdcRemap's runtime warp-LUT generation (hbn_gen_gdc_cfg)
+    target_link_libraries(bcdl PUBLIC ${HB_GDCBIN_LIB})
+  endif()
   target_compile_definitions(bcdl PUBLIC BCDL_HAVE_GDC=1)
   message(STATUS "GDC hardware letterbox: enabled (${HOBOT_GDC_INCLUDE_DIR})")
 else()
