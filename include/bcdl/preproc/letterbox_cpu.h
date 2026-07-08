@@ -61,6 +61,17 @@ LetterboxInfo letterboxCpu(VpImage& dst, const VpImage& src, uint8_t padValue = 
 /// expected input range before trusting accuracy.
 void bgrToNv12Cpu(VpImage& dstNv12, const VpImage& srcBgr);
 
+/// CPU NV12 -> BGR (U8C3) conversion — the inverse of bgrToNv12Cpu(), using the
+/// SAME BT.601 FULL-RANGE convention (so an NV12->BGR->NV12 round-trip is
+/// self-consistent). `dst` must be HB_VP_IMAGE_FORMAT_BGR with the same
+/// width/height as the NV12 `src`. The source Y stride (src.raw().stride) and
+/// interleaved-UV stride (src.raw().uvStride) are honored; dst.cleanCache() is
+/// called at the end. Hand-written (no OpenCV dependency), OpenMP over rows.
+///     R = Y + 1.402*(V-128)
+///     G = Y - 0.344*(U-128) - 0.714*(V-128)
+///     B = Y + 1.772*(U-128)
+void nv12ToBgrCpu(VpImage& dstBgr, const VpImage& srcNv12);
+
 /// Convenience: letterbox a BGR (U8C3) `src` directly into an NV12 `dst`. Resizes
 /// and pads in BGR via an internal temporary, then bgrToNv12Cpu()'s into `dst`.
 /// `dst` must be HB_VP_IMAGE_FORMAT_NV12 (even dims). Returns the letterbox

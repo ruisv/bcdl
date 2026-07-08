@@ -686,6 +686,7 @@ ByteTracker = bcdl_py.ByteTracker
 # numpy-composition alternative, drive Detector/YoloLtrbDetector + ByteTracker.
 DetectHead = bcdl_py.DetectHead
 PipelineConfig = bcdl_py.PipelineConfig
+StageProfile = bcdl_py.StageProfile  # per-stage timing (DetectionPipeline / async)
 
 
 class TrackingPipeline:
@@ -781,6 +782,59 @@ class AsyncDetectionPipeline:
     def head(self) -> "DetectHead":
         """Resolved decoder family (kAuto replaced by the concrete choice)."""
         return self._p.head
+
+    def profile(self) -> "StageProfile":
+        """Per-stage service timing (preproc / infer / postproc), each measured on
+        its own worker thread — the slowest stage bounds throughput. Read after
+        finish() + full drain for a settled value."""
+        return self._p.profile()
+
+
+class AsyncVideoDetectionPipeline:
+    """Full compressed-video -> detections pipeline (VPU decode ‖ CPU preproc ‖
+    BPU infer), all in C++. Feed raw Annex-B byte chunks; the pipeline segments
+    and decodes them internally, so Python only pumps bytes (e.g. from an
+    ``ffmpeg -c copy`` RTSP/mp4 demux). submit()/next() release the GIL.
+
+        pipe = bcdl.AsyncVideoDetectionPipeline(engine, cfg, bcdl.VideoType.H264, depth=4)
+        while chunk := ffmpeg.stdout.read(65536):
+            pipe.submit(chunk)                       # blocks on backpressure
+            while (dets := pipe.next_nowait()) is not None:
+                draw(dets)
+        pipe.finish()
+        while (dets := pipe.next()) is not None:      # drain the last frames
+            draw(dets)
+    """
+
+    def __init__(self, engine: "Engine",
+                 config: "PipelineConfig | None" = None,
+                 codec: "VideoType" = None,
+                 depth: int = 4):
+        self.config = config if config is not None else PipelineConfig()
+        codec = codec if codec is not None else VideoType.H264
+        self._p = bcdl_py.AsyncVideoDetectionPipeline(engine._e, self.config, codec, depth)
+
+    def submit(self, data: bytes) -> bool:
+        """Feed a chunk of Annex-B compressed bytes. Blocks on backpressure;
+        returns False once finish()ed."""
+        return self._p.submit(bytes(data))
+
+    def next(self) -> "list | None":
+        """Blocking pop of the next frame's detections in decode order; None once
+        finished AND drained."""
+        return self._p.next()
+
+    def next_nowait(self) -> "list | None":
+        """Non-blocking pop: detections if one is ready, else None."""
+        return self._p.next_nowait()
+
+    def finish(self) -> None:
+        """Signal end of stream; drains in-flight frames then next() ends."""
+        self._p.finish()
+
+    def profile(self) -> "StageProfile":
+        """Per-stage timing incl. decode_ms (VPU decode + NV12->BGR)."""
+        return self._p.profile()
 
 # --- OCR: DBNet detect / orientation cls / CTC recognize -------------------
 # decode_ctc/decode_dbnet/load_char_dict are pure (no model). The Engine-bound
@@ -902,8 +956,10 @@ __all__ = [
     "ByteTracker",
     "DetectHead",
     "PipelineConfig",
+    "StageProfile",
     "TrackingPipeline",
     "AsyncDetectionPipeline",
+    "AsyncVideoDetectionPipeline",
     # OCR
     "RecResult",
     "ClsDirResult",

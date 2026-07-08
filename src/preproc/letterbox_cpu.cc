@@ -202,6 +202,63 @@ void bgrToNv12Cpu(VpImage& dstNv12, const VpImage& srcBgr) {
   dstNv12.cleanCache();
 }
 
+void nv12ToBgrCpu(VpImage& dstBgr, const VpImage& srcNv12) {
+  if (srcNv12.format() != HB_VP_IMAGE_FORMAT_NV12 ||
+      dstBgr.format() != HB_VP_IMAGE_FORMAT_BGR) {
+    throw Error(-1, "nv12ToBgrCpu: src must be NV12 and dst must be BGR (U8C3)");
+  }
+  const int w = srcNv12.width();
+  const int h = srcNv12.height();
+  if (w != dstBgr.width() || h != dstBgr.height()) {
+    throw Error(-1, "nv12ToBgrCpu: src and dst dimensions must match");
+  }
+
+  const int yStride = srcNv12.raw().stride;
+  const int uvStride = srcNv12.raw().uvStride;
+  const int dstStride = dstBgr.raw().stride;
+  const auto* yBase = static_cast<const uint8_t*>(srcNv12.data());
+  const auto* uvBase = static_cast<const uint8_t*>(srcNv12.raw().uvVirAddr);
+  if (uvBase == nullptr) {
+    uvBase = yBase + static_cast<std::size_t>(yStride) * static_cast<std::size_t>(h);
+  }
+  auto* dstBase = static_cast<uint8_t*>(dstBgr.data());
+
+#ifdef BCDL_HAVE_OPENCV
+  // Fast path: OpenCV's SIMD NV12->BGR (BT.601). Pack the strided planes into a
+  // tight [h*3/2, w] Mat, convert, then copy rows into dst honoring its stride.
+  cv::Mat nv12(h * 3 / 2, w, CV_8UC1);
+  for (int r = 0; r < h; ++r)
+    std::memcpy(nv12.ptr(r), yBase + static_cast<std::size_t>(r) * yStride, w);
+  for (int r = 0; r < h / 2; ++r)
+    std::memcpy(nv12.ptr(h + r), uvBase + static_cast<std::size_t>(r) * uvStride, w);
+  cv::Mat bgr;
+  cv::cvtColor(nv12, bgr, cv::COLOR_YUV2BGR_NV12);
+  const std::size_t rowBytes = static_cast<std::size_t>(w) * 3;
+  for (int r = 0; r < h; ++r)
+    std::memcpy(dstBase + static_cast<std::size_t>(r) * dstStride, bgr.ptr(r), rowBytes);
+#else
+  // BT.601 FULL-range YUV->BGR, exact inverse of bgrToNv12Cpu's forward matrix.
+#pragma omp parallel for schedule(static)
+  for (int y = 0; y < h; ++y) {
+    const uint8_t* yRow = yBase + static_cast<std::size_t>(y) * yStride;
+    const uint8_t* uvRow = uvBase + static_cast<std::size_t>(y / 2) * uvStride;
+    uint8_t* dRow = dstBase + static_cast<std::size_t>(y) * dstStride;
+    for (int x = 0; x < w; ++x) {
+      const float Y = yRow[x];
+      const uint8_t* uv = uvRow + static_cast<std::size_t>(x / 2) * 2;
+      const float U = static_cast<float>(uv[0]) - 128.0f;
+      const float V = static_cast<float>(uv[1]) - 128.0f;
+      uint8_t* p = dRow + static_cast<std::size_t>(x) * 3;
+      p[0] = clampU8(Y + 1.772f * U);                  // B
+      p[1] = clampU8(Y - 0.344f * U - 0.714f * V);     // G
+      p[2] = clampU8(Y + 1.402f * V);                  // R
+    }
+  }
+#endif
+
+  dstBgr.cleanCache();
+}
+
 LetterboxInfo letterboxToNv12Cpu(VpImage& dstNv12, const VpImage& srcBgr,
                                  uint8_t padValue) {
   if (dstNv12.format() != HB_VP_IMAGE_FORMAT_NV12) {

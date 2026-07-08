@@ -6,7 +6,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07
+
 ### Added
+- **Video object detection — `AsyncVideoDetectionPipeline`** — the whole
+  compressed-video → detections path in C++: `submit(Annex-B bytes)` → internal
+  AU segmentation → four overlapped stages (VPU decode ‖ NV12→BGR ‖ CPU preproc
+  ‖ BPU infer+NMS) → `next()`/`next_nowait()`. A thin caller that only pumps an
+  `ffmpeg -c copy` byte stream reaches the decode-bound ceiling (yolo26n 1080p
+  H.264 ~240 FPS); the Python binding releases the GIL. New demos
+  `examples/video_det_demo.{cc,py}`, `examples/video_det_demo_async.cc`, and the
+  thin RTSP driver `examples/rtsp_det_demo.py`.
+- **H.265 decode** — `VideoDecoder` rewritten on the `media_codec` (`hb_mm_mc_*`)
+  streaming API with reorder support and a decoupled `feed()` / `receive()` /
+  `flush()` interface (the old per-AU model timed out on HEVC). Caveat: a
+  hierarchical-GOP HEVC stream (camera SVC / smart-codec) decodes its base
+  temporal layer only.
+- **Per-stage `StageProfile` timing** — `decode` / `preproc` / `infer` /
+  `postproc` ms per frame from `DetectionPipeline` and `AsyncDetectionPipeline`
+  (in the async path the slowest stage bounds throughput), plus
+  `AsyncDetectionPipeline::tryNext()` (non-blocking pop) and `nv12ToBgrCpu()`
+  (NV12→BGR, OpenCV SIMD + BT.601 fallback).
 - **`bcdl::GdcRemap` — hardware dense remap on the VPS GDC engine** (+ Python
   binding `bcdl.GdcRemap(map_x, map_y, in_w, in_h, grid_step=16)`). An arbitrary
   FIXED warp with cv2.remap semantics (built for stereo rectification) compiled

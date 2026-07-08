@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "bcdl/core/sys_mem.h"
@@ -70,22 +71,26 @@ struct VideoDecConfig {
   uint32_t in_buf_size = 0;
 };
 
-/// Hardware H.264/H.265 decoder running on the VPU (HB_UCP_VPU_CORE_0).
+/// Hardware H.264/H.265 decoder running on the VPU, built on the `media_codec`
+/// (`hb_mm_mc_*`) streaming API — a DECOUPLED feed/drain model with reorder
+/// support. This matters for HEVC (and any stream with B-frame reorder): the
+/// display-order frame for an input access unit is generally NOT ready the
+/// instant that AU is fed, so the older "submit one AU, immediately get its
+/// frame" model timed out. Here inputs are queued and decoded frames are drained
+/// independently, in display order, exactly as D-Robotics' sample_codec does.
 ///
-/// Produces an owned NV12 VpImage (the only planar-YUV layout VpImage can back).
+/// Produces an owned NV12 VpImage (the only planar-YUV layout VpImage can back);
+/// each returned frame is copied out (honoring the codec strides) into a fresh,
+/// caller-owned VpImage and the codec buffer is returned immediately.
 ///
-/// Lifetime note: the codec decodes into an internal hbVPImage that is freed
-/// when the task is released. decode() copies the Y/UV planes (honouring the
-/// codec's stride) into a fresh, caller-owned VpImage before releasing the task.
-///
-/// Input reuse: a single device buffer (in_buf_) holds the compressed bytes
-/// handed to the VPU. It is grown only when an incoming chunk is larger than its
-/// current capacity, so steady-state decoding does no per-call allocation.
-///
-/// Buffering: like all stream decoders, the VPU may buffer one or more access
-/// units before emitting a frame (it needs reference frames). decode() returns
-/// true and fills `out` only when a frame is ready; otherwise it returns false
-/// and `out` is untouched. Feed successive chunks until a frame appears.
+/// Two interfaces:
+///  - decode(data,size,out): convenience — feed one AU then wait briefly for a
+///    frame. Fine for low-latency H.264 (~1:1). For reorder streams the trailing
+///    frames need flush().
+///  - feed()/receive()/flush(): the decoupled path used by
+///    AsyncVideoDetectionPipeline — feed AUs, drain ready frames non-blockingly,
+///    then flush() the reorder tail at end-of-stream. This is the HEVC-correct
+///    path.
 class VideoDecoder {
  public:
   explicit VideoDecoder(const VideoDecConfig& cfg);
@@ -94,20 +99,40 @@ class VideoDecoder {
   VideoDecoder(const VideoDecoder&) = delete;
   VideoDecoder& operator=(const VideoDecoder&) = delete;
 
-  /// Feed compressed bytes (one access unit / chunk). Returns true and fills
-  /// `out` with an owned NV12 VpImage when a frame is ready, else returns false.
+  /// Feed one access unit, then wait up to a short internal timeout for one
+  /// decoded frame. Returns true + fills `out` (display order) when a frame is
+  /// ready, else false. Trailing reorder-buffered frames need flush().
   bool decode(const uint8_t* data, std::size_t size, VpImage& out);
   bool decode(const std::vector<uint8_t>& data, VpImage& out) {
     return decode(data.data(), data.size(), out);
   }
 
+  /// Queue one compressed access unit for decoding (does not wait for output).
+  /// Blocks briefly if the codec's input queue is full. Returns false on error.
+  bool feed(const uint8_t* data, std::size_t size);
+
+  /// Drain one decoded frame in display order. `timeout_ms == 0` is non-blocking
+  /// (returns false immediately if none ready). Returns true + fills `out` on a
+  /// frame, false on timeout / no-frame / end-of-stream marker.
+  bool receive(VpImage& out, int timeout_ms = 0);
+
+  /// After the last feed(): signal end-of-stream once, then drain the remaining
+  /// reorder-buffered frames — call repeatedly until it returns false.
+  bool flush(VpImage& out);
+
+  /// Queue an end-of-stream marker WITHOUT draining (for a decoupled feed thread
+  /// + receive thread setup, mirroring D-Robotics' sample_codec): the feed side
+  /// calls this once after the last feed(); the receive side keeps calling
+  /// receive() until frames stop. Idempotent.
+  void feedEndOfStream();
+
   hbVPVideoType type() const noexcept { return cfg_.type; }
   hbVPImageFormat format() const noexcept { return cfg_.format; }
 
  private:
-  hbVPVideoContext ctx_ = nullptr;
   VideoDecConfig cfg_;
-  SysMem in_buf_;  // reused device buffer for the input bytes (grows as needed)
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace bcdl

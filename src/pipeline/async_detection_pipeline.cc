@@ -1,5 +1,6 @@
 #include "bcdl/pipeline/async_detection_pipeline.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -38,6 +39,17 @@ class BoundedChannel {
     std::unique_lock<std::mutex> lk(m_);
     not_empty_.wait(lk, [&] { return !q_.empty() || closed_; });
     if (q_.empty()) return false;  // closed and drained
+    out = std::move(q_.front());
+    q_.pop();
+    not_full_.notify_one();
+    return true;
+  }
+
+  /// Non-blocking pop: fills `out` and returns true if an item was available,
+  /// else returns false immediately (whether or not the channel is closed).
+  bool tryPop(T& out) {
+    std::lock_guard<std::mutex> lk(m_);
+    if (q_.empty()) return false;
     out = std::move(q_.front());
     q_.pop();
     not_full_.notify_one();
@@ -89,6 +101,14 @@ struct AsyncDetectionPipeline::Impl {
   std::thread infer_thr;
   bool finished = false;
 
+  // Per-stage service timing. preproc_ms is written only by preproc_thr; the
+  // infer/postproc/frames fields only by infer_thr — so each is single-writer
+  // and safe to read once both threads have joined (after finish()/destruction).
+  double preproc_ms = 0;
+  double infer_ms = 0;
+  double postproc_ms = 0;
+  uint64_t prof_frames = 0;
+
   Impl(Engine& e, PipelineConfig resolved, int d)
       : engine(e),
         cfg(std::move(resolved)),
@@ -125,8 +145,11 @@ struct AsyncDetectionPipeline::Impl {
     while (raw.pop(f)) {
       int slot;
       if (!freeq.pop(slot)) break;  // shutting down
+      auto a = std::chrono::steady_clock::now();
       const LetterboxInfo lb = preprocBgrToNv12(src, lb_bgr, slots[slot],
                                                 f.bgr.data(), f.w, f.h, cfg.pad_value);
+      preproc_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - a).count();
       if (!ready.push(Ready{slot, lb})) break;  // shutting down
     }
     ready.close();  // no more preprocessed frames will arrive
@@ -136,9 +159,15 @@ struct AsyncDetectionPipeline::Impl {
   void inferLoop() {
     Ready item;
     while (ready.pop(item)) {
+      auto a = std::chrono::steady_clock::now();
       feedNv12Input(engine, slots[item.slot]);
       engine.infer();
+      auto b = std::chrono::steady_clock::now();
       std::vector<Detection> dets = decoder.postprocess(item.lb);
+      auto c = std::chrono::steady_clock::now();
+      infer_ms += std::chrono::duration<double, std::milli>(b - a).count();
+      postproc_ms += std::chrono::duration<double, std::milli>(c - b).count();
+      ++prof_frames;
       freeq.push(item.slot);  // slot reusable now that infer consumed it
       if (!results.push(std::move(dets))) break;  // shutting down
     }
@@ -169,10 +198,24 @@ bool AsyncDetectionPipeline::next(std::vector<Detection>& out) {
   return impl_->results.pop(out);
 }
 
+bool AsyncDetectionPipeline::tryNext(std::vector<Detection>& out) {
+  return impl_->results.tryPop(out);
+}
+
 void AsyncDetectionPipeline::finish() {
   if (impl_->finished) return;
   impl_->finished = true;
   impl_->raw.close();  // preproc drains raw -> closes ready -> infer closes results
+}
+
+StageProfile AsyncDetectionPipeline::profile() const {
+  // Single-writer fields; call after finish() + full drain for a settled read.
+  StageProfile p;
+  p.preproc_ms = impl_->preproc_ms;
+  p.infer_ms = impl_->infer_ms;
+  p.postproc_ms = impl_->postproc_ms;
+  p.frames = impl_->prof_frames;
+  return p;
 }
 
 }  // namespace bcdl

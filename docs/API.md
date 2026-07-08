@@ -479,6 +479,58 @@ while (dets := pipe.next()) is not None:
     **and** drained.
   - `finish()` — signal end of stream (idempotent; also runs on GC).
   - `head -> DetectHead` — resolved decoder family.
+  - `profile() -> StageProfile` — per-stage *service* time
+    (`preproc_ms`/`infer_ms`/`postproc_ms` totals + `*_per_frame()`); the slowest
+    stage bounds throughput. Read after `finish()` + drain.
+
+## AsyncVideoDetectionPipeline
+
+The whole compressed-video → detections path in C++ (`decode ‖ nv12→bgr ‖ preproc
+‖ infer+NMS`, four overlapped stages). **Python only pumps bytes** — feed Annex-B
+chunks (e.g. an `ffmpeg -c copy` RTSP/mp4 stream) and read detections; all
+decode/convert/detect threads run in C++ with the GIL released. This is what lets
+a thin Python driver hit the C++ decode-bound ceiling (**~233 FPS @1080p H.264**)
+instead of the ~81 FPS a Python-orchestrated decode loop is capped at.
+
+```python
+cfg = bcdl.PipelineConfig(); cfg.detect.num_classes = 80
+pipe = bcdl.AsyncVideoDetectionPipeline(engine, cfg, bcdl.VideoType.H264, depth=4)
+
+while chunk := ffmpeg.stdout.read(65536):     # ffmpeg -c copy (no software decode)
+    pipe.submit(chunk)                        # AUs segmented + VPU-decoded in C++
+    while (dets := pipe.next_nowait()) is not None:
+        ...                                   # drain what's ready
+pipe.finish()
+while (dets := pipe.next()) is not None:      # blocking drain of last frames
+    ...
+```
+
+- **`AsyncVideoDetectionPipeline(engine, config=None, codec=VideoType.H264, depth=4)`**:
+  - `submit(bytes) -> bool` — feed Annex-B bytes; blocks on backpressure.
+  - `next() -> list[Detection] | None` — blocking pop in decode order.
+  - `next_nowait() -> list[Detection] | None` — non-blocking pop.
+  - `finish()`, `profile() -> StageProfile` (incl. `decode_ms`).
+- Video decode handles **H.264 and H.265** (a hierarchical-GOP HEVC stream
+  decodes its base temporal layer only — see the VideoDecoder note above).
+- See [`examples/rtsp_det_demo.py`](../examples/rtsp_det_demo.py) — a thin RTSP
+  driver built on this (ffmpeg pipe → `submit` → `next_nowait`).
+
+### Video demo (mp4/h264 in → detect → mp4 out)
+
+[`examples/video_det_demo.py`](../examples/video_det_demo.py) is the end-to-end
+Python demo: **VPU** decode → `AsyncDetectionPipeline` (BPU) → draw → **VPU**
+encode → `.mp4`. It reads raw `.h264/.h265` **or** `.mp4/.mov` (MP4 is demuxed to
+Annex-B with `ffmpeg -c copy`; the VPU still does the actual decode), and muxes
+the VPU's elementary stream into `.mp4` with `ffmpeg -c copy` (container only, no
+re-encode). Prints the per-stage `profile()` distribution.
+
+```bash
+python examples/video_det_demo.py det.hbm in.mp4 out.mp4          # mp4 -> mp4
+python examples/video_det_demo.py det.hbm in.h264 out.mp4 300 4   # [max_frames] [depth]
+```
+
+Note: decode and encode share the single VPU core, so the full round-trip runs
+slower (~78 FPS @1080p yolo26n) than the decode-only detect path (~234 FPS).
 
 ---
 
@@ -505,10 +557,21 @@ ec.width, ec.height, ec.bitrate_kbps, ec.framerate = 1280, 720, 4000, 30
 enc = bcdl.VideoEncoder(ec)
 chunk = enc.encode(vp_image)                   # bytes (may be empty if buffered)
 
-dc = bcdl.VideoDecConfig(); dc.type = bcdl.VideoType.H264
+dc = bcdl.VideoDecConfig(); dc.type = bcdl.VideoType.H265   # or .H264
 dec = bcdl.VideoDecoder(dc)
 frame = dec.decode(nal_bytes)                  # VpImage or None while buffering
+# Decoupled feed/drain (handles H.265 reorder): feed arbitrary bytes, drain in
+# display order, flush the reorder tail at end-of-stream.
+dec.feed(chunk_bytes)                           # queue bytes (no AU split needed)
+while (f := dec.receive(0)) is not None: ...    # non-blocking drain (0 = no wait)
+while (f := dec.flush()) is not None: ...        # after last feed: reorder tail
 ```
+
+> **H.265 note:** the decoder uses the reorder-correct `media_codec` API, so H.265
+> works (an older per-AU model timed out on it). A **hierarchical-GOP** HEVC stream
+> (Hikvision SVC / "H.265+"/smart-codec) decodes **base temporal layer only**
+> (~1/4 of frames) — an SoC-SDK limitation; disable the camera's SVC mode for full
+> rate. H.264 and non-hierarchical HEVC decode fully.
 
 - **`ImageFormat`** enum — `Y`, `NV12`, `RGB`, `BGR`.
 - **`VpImage(width, height, format)`** — `width`, `height`, `format`, `valid`;

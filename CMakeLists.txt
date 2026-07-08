@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(bcdl LANGUAGES CXX VERSION 0.1.1)
+project(bcdl LANGUAGES CXX VERSION 0.2.0)
 
 # --- Guard: this project only builds on the aarch64 RDK board ----------------
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
@@ -87,6 +87,7 @@ add_library(bcdl SHARED
   src/tasks/segmentation.cc
   src/pipeline/detection_pipeline.cc
   src/pipeline/async_detection_pipeline.cc
+  src/pipeline/async_video_detection_pipeline.cc
   src/pipeline/stereo_pipeline.cc
   src/tracks/byte_tracker.cc)
 add_library(bcdl::bcdl ALIAS bcdl)
@@ -121,6 +122,16 @@ endif()
 # GDC runs on /dev/gdc (VPS), bypassing the root-locked/offline vDSP that
 # hb_vp_warp_affine (bcdl::letterbox) uses. Optional: only wired when present.
 find_path(HOBOT_GDC_INCLUDE_DIR NAMES gdc_cfg.h PATHS /usr/hobot/include)
+# libmultimedia = the media_codec (hb_mm_mc_*) streaming codec API used by
+# VideoDecoder for reorder-correct H.264/H.265 decode.
+find_library(HB_MULTIMEDIA_LIB NAMES multimedia PATHS /usr/hobot/lib)
+if(HB_MULTIMEDIA_LIB)
+  target_link_libraries(bcdl PUBLIC ${HB_MULTIMEDIA_LIB})
+else()
+  message(WARNING "libmultimedia not found — VideoDecoder (media_codec) will not link. "
+                  "Set HOBOT_LIB_DIR if it exists.")
+endif()
+
 find_library(HB_VPF_LIB  NAMES vpf   PATHS /usr/hobot/lib)
 find_library(HB_VIO_LIB  NAMES vio   PATHS /usr/hobot/lib)
 find_library(HB_CAM_LIB  NAMES cam   PATHS /usr/hobot/lib)
@@ -249,6 +260,12 @@ if(BCDL_BUILD_EXAMPLES)
     add_executable(video_det_demo examples/video_det_demo.cc)
     target_link_libraries(video_det_demo PRIVATE bcdl::bcdl ${OpenCV_LIBS})
     set_target_properties(video_det_demo PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+    # 3-stage overlapped video path: VPU decode || CPU preproc || BPU infer+NMS.
+    add_executable(video_det_demo_async examples/video_det_demo_async.cc)
+    target_link_libraries(video_det_demo_async PRIVATE bcdl::bcdl ${OpenCV_LIBS})
+    set_target_properties(video_det_demo_async PROPERTIES
       BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
 
     # Stereo depth: a side-by-side stereo pair -> StereoPipeline (LAS2 .hbm) ->

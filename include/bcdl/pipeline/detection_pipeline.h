@@ -41,6 +41,27 @@ struct PipelineConfig {
   std::vector<int> ltrb_strides = {8, 16, 32};  ///< kYoloLtrb: stride per scale
 };
 
+/// Per-stage timing accumulator (milliseconds, summed over all frames), shared
+/// by the synchronous DetectionPipeline and the threaded AsyncDetectionPipeline
+/// so both report a comparable preproc / infer / postproc breakdown.
+///
+/// In the SYNC pipeline the three stages run back-to-back, so their sum equals
+/// the per-frame process() cost. In the ASYNC pipeline each stage is timed on
+/// its own worker thread (SERVICE time), so the sum EXCEEDS wall time — that is
+/// the point: it shows which stage bounds the overlapped pipeline.
+struct StageProfile {
+  double decode_ms = 0;    ///< VPU video decode + NV12->BGR (video pipelines only; 0 otherwise)
+  double preproc_ms = 0;   ///< letterbox BGR -> NV12 (CPU)
+  double infer_ms = 0;     ///< feed NV12 input + Engine::infer (BPU submit+wait)
+  double postproc_ms = 0;  ///< dequant + decode + per-class NMS (CPU)
+  uint64_t frames = 0;
+  double totalMs() const { return decode_ms + preproc_ms + infer_ms + postproc_ms; }
+  double decodePerFrame() const { return frames ? decode_ms / frames : 0.0; }
+  double preprocPerFrame() const { return frames ? preproc_ms / frames : 0.0; }
+  double inferPerFrame() const { return frames ? infer_ms / frames : 0.0; }
+  double postprocPerFrame() const { return frames ? postproc_ms / frames : 0.0; }
+};
+
 // ---------------------------------------------------------------------------
 // Shared pipeline core — reused by the synchronous DetectionPipeline and the
 // threaded AsyncDetectionPipeline so the preproc / feed / decode logic lives in
@@ -139,6 +160,11 @@ class DetectionPipeline {
   /// Resolved decoder family (kAuto is replaced by the concrete choice).
   DetectHead head() const noexcept { return cfg_.head; }
 
+  /// Per-stage timing accumulated across every process() call. Zero until the
+  /// first frame; reset with resetProfile().
+  const StageProfile& profile() const noexcept { return prof_; }
+  void resetProfile() noexcept { prof_ = StageProfile{}; }
+
  private:
   Engine& engine_;
   PipelineConfig cfg_;
@@ -147,6 +173,7 @@ class DetectionPipeline {
   VpImage nv12_;     ///< reused NV12 letterbox target (input_w x input_h)
   HeadDecoder decoder_;
   LetterboxInfo last_lb_;
+  StageProfile prof_;  ///< per-stage timing accumulator (see profile())
 };
 
 }  // namespace bcdl

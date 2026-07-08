@@ -1,5 +1,6 @@
 #include "bcdl/pipeline/detection_pipeline.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -148,15 +149,30 @@ std::vector<Detection> DetectionPipeline::process(const uint8_t* bgr, int width,
     throw Error(-1, "DetectionPipeline::process: invalid BGR frame");
   }
 
-  last_lb_ = preprocBgrToNv12(src_, lb_bgr_, nv12_, bgr, width, height, cfg_.pad_value);
-  feedNv12Input(engine_, nv12_);
+  using Clock = std::chrono::steady_clock;
+  auto ms = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
 
-  // Synchronous infer (submit + wait + invalidate output caches inside Engine).
+  auto t0 = Clock::now();
+  last_lb_ = preprocBgrToNv12(src_, lb_bgr_, nv12_, bgr, width, height, cfg_.pad_value);
+  auto t1 = Clock::now();
+
+  // Feed + synchronous infer (submit + wait + invalidate output caches inside Engine).
+  feedNv12Input(engine_, nv12_);
   engine_.infer();
+  auto t2 = Clock::now();
 
   // Decode + per-class NMS; boxes mapped back to original-image pixels via the
   // letterbox geometry of this frame.
-  return decoder_.postprocess(last_lb_);
+  auto dets = decoder_.postprocess(last_lb_);
+  auto t3 = Clock::now();
+
+  prof_.preproc_ms += ms(t0, t1);
+  prof_.infer_ms += ms(t1, t2);
+  prof_.postproc_ms += ms(t2, t3);
+  ++prof_.frames;
+  return dets;
 }
 
 }  // namespace bcdl

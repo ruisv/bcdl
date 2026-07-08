@@ -43,6 +43,7 @@
 #include "bcdl/tasks/segmentation.h"
 #include "bcdl/tracks/reid.h"
 #include "bcdl/pipeline/async_detection_pipeline.h"
+#include "bcdl/pipeline/async_video_detection_pipeline.h"
 #include "bcdl/pipeline/detection_pipeline.h"
 #include "bcdl/pipeline/stereo_pipeline.h"
 #include "bcdl/pipeline/tracking_pipeline.h"
@@ -492,6 +493,30 @@ NB_MODULE(bcdl_py, m) {
           "data"_a,
           "Feed one compressed chunk; returns an NV12 VpImage when a frame is "
           "ready, else None (the decoder is still buffering reference frames).")
+      .def(
+          "feed",
+          [](bcdl::VideoDecoder& d, nb::bytes data) {
+            return d.feed(reinterpret_cast<const uint8_t*>(data.c_str()), data.size());
+          },
+          "data"_a, "Queue one access unit for decoding (does not wait for output).")
+      .def(
+          "receive",
+          [](bcdl::VideoDecoder& d, int timeout_ms) -> std::optional<bcdl::VpImage> {
+            bcdl::VpImage out;
+            if (d.receive(out, timeout_ms)) return std::optional<bcdl::VpImage>(std::move(out));
+            return std::nullopt;
+          },
+          "timeout_ms"_a = 0,
+          "Drain one decoded frame in display order (timeout_ms=0 is non-blocking); "
+          "None on timeout / no frame.")
+      .def(
+          "flush",
+          [](bcdl::VideoDecoder& d) -> std::optional<bcdl::VpImage> {
+            bcdl::VpImage out;
+            if (d.flush(out)) return std::optional<bcdl::VpImage>(std::move(out));
+            return std::nullopt;
+          },
+          "After the last feed(): drain the reorder tail; call until it returns None.")
       .def_prop_ro("type", &bcdl::VideoDecoder::type)
       .def_prop_ro("format", &bcdl::VideoDecoder::format);
 
@@ -1258,6 +1283,21 @@ NB_MODULE(bcdl_py, m) {
       .def_rw("head", &bcdl::PipelineConfig::head)
       .def_rw("ltrb_strides", &bcdl::PipelineConfig::ltrb_strides);
 
+  // Per-stage timing (preproc / infer / postproc), shared by the pipelines.
+  // In AsyncDetectionPipeline these are per-thread SERVICE times, so the slowest
+  // stage — not their sum — bounds throughput.
+  nb::class_<bcdl::StageProfile>(m, "StageProfile")
+      .def_ro("decode_ms", &bcdl::StageProfile::decode_ms)
+      .def_ro("preproc_ms", &bcdl::StageProfile::preproc_ms)
+      .def_ro("infer_ms", &bcdl::StageProfile::infer_ms)
+      .def_ro("postproc_ms", &bcdl::StageProfile::postproc_ms)
+      .def_ro("frames", &bcdl::StageProfile::frames)
+      .def("total_ms", &bcdl::StageProfile::totalMs)
+      .def("decode_per_frame", &bcdl::StageProfile::decodePerFrame)
+      .def("preproc_per_frame", &bcdl::StageProfile::preprocPerFrame)
+      .def("infer_per_frame", &bcdl::StageProfile::inferPerFrame)
+      .def("postproc_per_frame", &bcdl::StageProfile::postprocPerFrame);
+
   nb::class_<bcdl::TrackingPipeline>(m, "TrackingPipeline")
       .def(nb::init<bcdl::Engine&, bcdl::PipelineConfig, bcdl::ByteTrackConfig>(),
            "engine"_a, "det_config"_a = bcdl::PipelineConfig{},
@@ -1334,7 +1374,62 @@ NB_MODULE(bcdl_py, m) {
            nb::call_guard<nb::gil_scoped_release>(),
            "Signal no more frames; next() drains the in-flight ones then "
            "returns None. Idempotent; also called on destruction.")
+      .def("profile", &bcdl::AsyncDetectionPipeline::profile,
+           "Per-stage service timing (StageProfile); read after finish() + drain.")
       .def_prop_ro("head", &bcdl::AsyncDetectionPipeline::head);
+
+  // --- full compressed-video -> detections pipeline (VPU decode ‖ CPU preproc ‖
+  // BPU infer), all in C++ so a Python caller only pumps bytes. submit()/next()
+  // RELEASE the GIL so the C++ worker threads run while Python does nothing.
+  nb::class_<bcdl::AsyncVideoDetectionPipeline>(m, "AsyncVideoDetectionPipeline")
+      .def(nb::init<bcdl::Engine&, bcdl::PipelineConfig, hbVPVideoType, int>(),
+           "engine"_a, "config"_a = bcdl::PipelineConfig{},
+           "codec"_a = HB_VP_VIDEO_TYPE_H264, "depth"_a = 4, nb::keep_alive<1, 2>())
+      .def(
+          "submit",
+          [](bcdl::AsyncVideoDetectionPipeline& p, nb::bytes data) {
+            const auto* d = reinterpret_cast<const uint8_t*>(data.c_str());
+            const std::size_t n = data.size();
+            nb::gil_scoped_release rel;
+            return p.submit(d, n);
+          },
+          "data"_a,
+          "Feed a chunk of Annex-B compressed bytes (segmented + VPU-decoded "
+          "internally). Blocks on backpressure; False after finish().")
+      .def(
+          "next",
+          [](bcdl::AsyncVideoDetectionPipeline& p)
+              -> std::optional<std::vector<bcdl::Detection>> {
+            std::vector<bcdl::Detection> out;
+            bool ok;
+            {
+              nb::gil_scoped_release rel;
+              ok = p.next(out);
+            }
+            if (!ok) return std::nullopt;
+            return out;
+          },
+          "Pop the next frame's detections in decode order (blocks). None once "
+          "finished AND fully drained.")
+      .def(
+          "next_nowait",
+          [](bcdl::AsyncVideoDetectionPipeline& p)
+              -> std::optional<std::vector<bcdl::Detection>> {
+            std::vector<bcdl::Detection> out;
+            bool ok;
+            {
+              nb::gil_scoped_release rel;
+              ok = p.tryNext(out);
+            }
+            if (!ok) return std::nullopt;
+            return out;
+          },
+          "Non-blocking pop: detections if one is ready, else None. Never blocks.")
+      .def("finish", &bcdl::AsyncVideoDetectionPipeline::finish,
+           nb::call_guard<nb::gil_scoped_release>(),
+           "Signal end of stream; drains in-flight frames then next() ends.")
+      .def("profile", &bcdl::AsyncVideoDetectionPipeline::profile,
+           "Per-stage timing incl. decode_ms (StageProfile); read after drain.");
 
   // ===========================================================================
   // OCR: text detection (DBNet) + orientation cls + recognition (CTC)

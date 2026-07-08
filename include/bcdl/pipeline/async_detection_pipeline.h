@@ -61,6 +61,11 @@ class AsyncDetectionPipeline {
   /// Returns false once the pipeline is finished AND fully drained.
   bool next(std::vector<Detection>& out);
 
+  /// Non-blocking variant of next(): fills `out` and returns true if a result is
+  /// already available, else returns false immediately (nothing ready yet, or
+  /// finished+drained). Never blocks.
+  bool tryNext(std::vector<Detection>& out);
+
   /// Signal that no more frames will be submitted. After the in-flight frames
   /// drain, next() returns false. Idempotent. Called by the destructor.
   void finish();
@@ -68,6 +73,12 @@ class AsyncDetectionPipeline {
   const PipelineConfig& config() const noexcept { return cfg_; }
   /// Resolved decoder family (kAuto replaced by the concrete choice).
   DetectHead head() const noexcept { return cfg_.head; }
+
+  /// Per-stage SERVICE timing accumulated across the pipeline's lifetime (each
+  /// stage timed on its own worker thread, so the fields sum to more than wall
+  /// time — the max of the per-frame stages is what bounds throughput). Read
+  /// after finish() + full drain for a settled value.
+  StageProfile profile() const;
 
  private:
   PipelineConfig cfg_;  // resolved at construction (mirrors impl_'s copy)

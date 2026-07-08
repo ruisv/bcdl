@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
 
     int frames = 0;
     long total_dets = 0;
-    double dec_ms = 0, det_ms = 0;
+    double dec_ms = 0, det_ms = 0, cvt_ms = 0, wall_ms = 0;
     bcdl::VpImage nv12;
     for (const auto& [b, e] : aus) {
       if (max_frames && frames >= max_frames) break;
@@ -148,11 +148,14 @@ int main(int argc, char** argv) {
 
       cv::Mat bgr = nv12ToBgr(nv12);
       if (!bgr.isContinuous()) bgr = bgr.clone();
+      auto t1b = std::chrono::steady_clock::now();
+      cvt_ms += std::chrono::duration<double, std::milli>(t1b - t1).count();
 
       auto t2 = std::chrono::steady_clock::now();
       auto dets = pipe.process(bgr.ptr<uint8_t>(0), bgr.cols, bgr.rows);
       auto t3 = std::chrono::steady_clock::now();
       det_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
+      wall_ms += std::chrono::duration<double, std::milli>(t3 - t0).count();
 
       ++frames;
       total_dets += static_cast<long>(dets.size());
@@ -173,16 +176,36 @@ int main(int argc, char** argv) {
       }
     }
 
-    std::printf(
-        "decoded+detected %d frames | decode %.2f ms/f, detect %.2f ms/f "
-        "(%.1f FPS end-to-end) | total dets %ld\n",
-        frames, frames ? dec_ms / frames : 0.0, frames ? det_ms / frames : 0.0,
-        (dec_ms + det_ms) > 0 ? frames * 1000.0 / (dec_ms + det_ms) : 0.0, total_dets);
     if (frames == 0) {
       std::fprintf(stderr, "FAIL: no frames processed\n");
       return 3;
     }
-    std::printf("OK: video -> VPU decode -> DetectionPipeline ran.\n");
+
+    // Per-stage time distribution over the whole run. decode/cvt are timed here;
+    // preproc/infer/postproc come from the pipeline's own StageProfile so the
+    // "detect" cost is broken into its three sub-stages.
+    const bcdl::StageProfile& sp = pipe.profile();
+    const double wall_f = wall_ms / frames;  // real per-frame wall (decode+cvt+detect)
+    auto row = [&](const char* name, double total_ms, const char* unit) {
+      const double per_f = total_ms / frames;
+      std::printf("  %-14s %7.2f ms/f  %5.1f%%   (%s)\n", name, per_f,
+                  wall_f > 0 ? 100.0 * per_f / wall_f : 0.0, unit);
+    };
+    std::printf("\n=== per-frame time distribution (%d frames, real wall %.2f ms/f) ===\n",
+                frames, wall_f);
+    row("decode",     dec_ms,          "VPU  hardware decode");
+    row("nv12->bgr",  cvt_ms,          "CPU  cvtColor");
+    row("  preproc",  sp.preproc_ms,   "CPU  letterbox BGR->NV12");
+    row("  infer",    sp.infer_ms,     "BPU  feed + submit/wait");
+    row("  postproc", sp.postproc_ms,  "CPU  decode + NMS");
+    std::printf("  %-14s %7.2f ms/f  100.0%%\n", "= total wall", wall_f);
+    std::printf(
+        "FPS: real wall = %.1f  |  detect-only(no decode) = %.1f  |  BPU infer-only = %.1f\n",
+        wall_ms > 0 ? frames * 1000.0 / wall_ms : 0.0,
+        det_ms > 0 ? frames * 1000.0 / det_ms : 0.0,
+        sp.infer_ms > 0 ? frames * 1000.0 / sp.infer_ms : 0.0);
+    std::printf("total dets %ld | OK: video -> VPU decode -> DetectionPipeline ran.\n",
+                total_dets);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 2;

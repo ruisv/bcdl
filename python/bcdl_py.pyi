@@ -420,6 +420,15 @@ class VideoDecoder:
         Feed one compressed chunk; returns an NV12 VpImage when a frame is ready, else None (the decoder is still buffering reference frames).
         """
 
+    def feed(self, data: bytes) -> bool:
+        """Queue one access unit for decoding (does not wait for output)."""
+
+    def receive(self, timeout_ms: int = 0) -> VpImage | None:
+        """Drain one decoded frame in display order (timeout_ms=0 is non-blocking); None on timeout / no frame."""
+
+    def flush(self) -> VpImage | None:
+        """After the last feed(): drain the reorder tail; call until it returns None."""
+
     @property
     def type(self) -> VideoType: ...
 
@@ -959,6 +968,32 @@ class PipelineConfig:
     @ltrb_strides.setter
     def ltrb_strides(self, arg: Sequence[int], /) -> None: ...
 
+class StageProfile:
+    @property
+    def decode_ms(self) -> float: ...
+
+    @property
+    def preproc_ms(self) -> float: ...
+
+    @property
+    def infer_ms(self) -> float: ...
+
+    @property
+    def postproc_ms(self) -> float: ...
+
+    @property
+    def frames(self) -> int: ...
+
+    def total_ms(self) -> float: ...
+
+    def decode_per_frame(self) -> float: ...
+
+    def preproc_per_frame(self) -> float: ...
+
+    def infer_per_frame(self) -> float: ...
+
+    def postproc_per_frame(self) -> float: ...
+
 class TrackingPipeline:
     def __init__(self, engine: Engine, det_config: PipelineConfig = ..., track_config: ByteTrackConfig = ...) -> None: ...
 
@@ -988,8 +1023,29 @@ class AsyncDetectionPipeline:
         Signal no more frames; next() drains the in-flight ones then returns None. Idempotent; also called on destruction.
         """
 
+    def profile(self) -> StageProfile:
+        """Per-stage service timing (StageProfile); read after finish() + drain."""
+
     @property
     def head(self) -> DetectHead: ...
+
+class AsyncVideoDetectionPipeline:
+    def __init__(self, engine: Engine, config: PipelineConfig = ..., codec: VideoType = ..., depth: int = 4) -> None: ...
+
+    def submit(self, data: bytes) -> bool:
+        """Feed Annex-B compressed bytes (segmented + VPU-decoded internally). Blocks on backpressure; False after finish()."""
+
+    def next(self) -> list[Detection] | None:
+        """Blocking pop of the next frame's detections in decode order; None once finished AND drained."""
+
+    def next_nowait(self) -> list[Detection] | None:
+        """Non-blocking pop: detections if one is ready, else None."""
+
+    def finish(self) -> None:
+        """Signal end of stream; drains in-flight frames then next() ends."""
+
+    def profile(self) -> StageProfile:
+        """Per-stage timing incl. decode_ms (VPU decode + NV12->BGR)."""
 
 class RecResult:
     @property

@@ -433,12 +433,30 @@ ec.width = 1280; ec.height = 720;        // format
 bcdl::VideoEncoder enc(ec);
 std::vector<uint8_t> chunk = enc.encode(frame_vpimage);  // may be empty (buffered)
 
-bcdl::VideoDecConfig dc; dc.type = HB_VP_VIDEO_TYPE_H264;  // + format, in_buf_size
+bcdl::VideoDecConfig dc; dc.type = HB_VP_VIDEO_TYPE_H264;  // or _H265; + format, in_buf_size
 bcdl::VideoDecoder dec(dc);
 bcdl::VpImage out;
 if (dec.decode(nal_data, nal_size, out)) { /* frame ready (NV12) */ }
-// else the decoder is still buffering reference frames
+// else the decoder is still buffering (reorder / reference frames)
 ```
+
+The **decoder** is built on the `media_codec` (`hb_mm_mc_*`) streaming API, which
+**decouples input feeding from output draining and honors reorder** — required
+for H.265 (a per-AU "decode → immediately get its frame" model times out on
+reorder streams). Two ways to drive it:
+
+- `decode(data, size, out) -> bool` — convenience: feed one chunk, wait briefly
+  for a frame. Good for low-latency H.264; trailing reorder frames need `flush()`.
+- **Decoupled** (feed thread + receive thread, as `AsyncVideoDetectionPipeline`
+  uses): `feed(data, size)` queues bytes; `receive(out, timeout_ms)` drains a
+  frame in display order (`timeout_ms=0` non-blocking); `feedEndOfStream()` then
+  `flush(out)` drain the reorder tail. Feed mode is `STREAM_SIZE`, so callers may
+  feed arbitrary byte chunks — no NAL/AU splitting needed.
+
+> **H.265 caveat (hierarchical GOP):** a stream with temporal sub-layers (e.g. a
+> Hikvision cam with SVC / "H.265+"/smart-codec on) decodes **base temporal layer
+> only** (~1/4 of frames) — the `target_dec_temporal_id_plus1` control has no
+> effect on the current SoC SDK. Non-hierarchical HEVC and H.264 decode fully.
 
 ---
 
@@ -481,12 +499,25 @@ bcdl::DetectionPipeline pipe(engine, cfg);
 std::vector<bcdl::Detection> dets = pipe.process(bgr, width, height);
 const bcdl::LetterboxInfo& lb = pipe.lastLetterbox();
 bcdl::DetectHead resolved = pipe.head();
+
+// Per-stage timing accumulated across every process() call (for profiling).
+const bcdl::StageProfile& sp = pipe.profile();
+// sp.preproc_ms / infer_ms / postproc_ms (summed), sp.frames, sp.totalMs(),
+// sp.preprocPerFrame() / inferPerFrame() / postprocPerFrame().
+pipe.resetProfile();
 ```
 
 `DetectHead::kAuto` resolves from the Engine's output signature at construction.
 Shared helpers (`resolveDetectionConfig`, `requireNv12InputModel`,
 `feedNv12Input`, `preprocBgrToNv12`, `HeadDecoder`) are exposed for custom
 pipelines.
+
+`StageProfile` (shared with `AsyncDetectionPipeline`) breaks the per-frame cost
+into `preproc` (letterbox BGR→NV12, CPU), `infer` (feed + BPU submit/wait), and
+`postproc` (decode + NMS, CPU). In the **sync** pipeline the three run
+back-to-back so their sum is the `process()` cost; in the **async** pipeline they
+are per-stage *service* times measured on separate threads, so their sum exceeds
+wall time and the **slowest** stage bounds throughput.
 
 ## AsyncDetectionPipeline
 
@@ -509,6 +540,47 @@ while (p.next(dets)) { /* last in-flight results */ }
 - `submit(bgr, w, h) -> bool` — `false` after `finish()` (frame not accepted).
 - `next(out) -> bool` — `false` once finished **and** drained.
 - `depth` ≥ 2 to overlap; larger tolerates more jitter at the cost of latency.
+- `profile() -> StageProfile` — per-stage *service* times (each stage on its own
+  thread; the slowest bounds throughput). Read after `finish()` + full drain.
+
+Feeding decoded video frames through a decode thread → `AsyncDetectionPipeline`
+gives a full `decode ‖ preproc ‖ infer+NMS` overlap; see
+`examples/video_det_demo_async.cc` (yolo26n 1080p: serial 119 → overlapped 234
+FPS, decode-bound). For a compressed-bytes-in interface, use
+`AsyncVideoDetectionPipeline` (below) — it owns that overlap so callers only pump
+bytes.
+
+## AsyncVideoDetectionPipeline
+
+`bcdl/pipeline/async_video_detection_pipeline.h` — the whole compressed-video →
+detections path in one C++ object: it segments Annex-B bytes into access units,
+VPU-decodes, converts NV12→BGR, and detects, with **four overlapped stages**
+(`decode ‖ nv12→bgr ‖ preproc ‖ infer+NMS`). Callers only feed bytes, so a thin
+driver (e.g. Python pumping an `ffmpeg -c copy` stream) reaches the C++
+decode-bound ceiling instead of being throttled by its own orchestration.
+
+```cpp
+bcdl::AsyncVideoDetectionPipeline p(engine, cfg, HB_VP_VIDEO_TYPE_H264, /*depth=*/4);
+std::vector<bcdl::Detection> dets;
+while (int n = read(ffmpeg_stdout, buf, sizeof buf)) {
+  p.submit(buf, n);                    // Annex-B bytes; blocks on backpressure
+  while (p.tryNext(dets)) { /* draw / count */ }   // non-blocking drain
+}
+p.finish();
+while (p.next(dets)) { /* drain the last in-flight frames */ }
+```
+
+- `submit(data, n) -> bool` — feed a chunk of Annex-B bytes (any size; AUs
+  segmented internally). Blocks while full; `false` after `finish()`.
+- `next(out) -> bool` — blocking pop in decode order; `false` once finished+drained.
+- `tryNext(out) -> bool` — non-blocking pop; drain while feeding.
+- `profile() -> StageProfile` — `decode_ms` (VPU decode) + preproc/infer/postproc.
+
+Measured: **yolo26n 1080p H.264 → ~233 FPS** (decode-bound 4.3 ms/f), same ceiling
+whether driven from C++ or a thin Python caller. Video decode handles **H.264 and
+H.265** (a hierarchical-GOP HEVC stream decodes base temporal layer only).
+`nv12ToBgrCpu()` (preproc/letterbox_cpu.h) does the colour convert (OpenCV SIMD
+when available, hand-written BT.601 fallback).
 
 ## TrackingPipeline
 
@@ -580,6 +652,8 @@ int main(int argc, char** argv) {
 ```
 
 For more, the [`examples/`](../examples/) directory has runnable programs:
-`det_demo`, `ocr_demo`, `track_demo`, `video_det_demo`, `stereo_demo`,
-`jpeg_roundtrip`, `video_roundtrip`, `mempool_demo`, and the `*_bench` drivers.
+`det_demo`, `ocr_demo`, `track_demo`, `video_det_demo` (serial, prints a
+per-stage time distribution), `video_det_demo_async` (3-stage overlapped
+decode‖preproc‖infer, serial-vs-async compare), `stereo_demo`, `jpeg_roundtrip`,
+`video_roundtrip`, `mempool_demo`, and the `*_bench` drivers.
 ```
