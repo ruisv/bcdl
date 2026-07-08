@@ -23,3 +23,6 @@ tests/data/
 # editor
 .vscode/
 .cache/
+
+# macOS
+.DS_Store
