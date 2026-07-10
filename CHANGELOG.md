@@ -6,6 +6,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07
+
+Packaging fix. No library or binding changes.
+
+### Fixed
+- **`python/bcdl_py.pyi` regenerated.** The committed type stub had fallen behind
+  the nanobind bindings and was missing 14 classes/enums, 8 module functions and
+  `InstanceSegConfig.reg_max` — the stereo pipeline, the Mono3D head, the two GDC
+  classes, and the SOTA heads (`LabelMap`, the SAM mask decoder, the ReID
+  embedding helpers). `GdcLetterbox` also still advertised the `bin_path`
+  argument removed in 0.3.0. Since the stub ships in the wheel and the conda
+  package, the gap reached users as absent type information. Types and module
+  functions now match the bindings 67/67 and 28/28.
+
+  Regenerating needs `-DBCDL_BUILD_STUBS=ON` on a board, in a build with GDC
+  enabled (the stub is produced by importing the module, so a GDC-less build
+  silently drops `GdcLetterbox`/`GdcRemap`). Note that a plain rebuild will not
+  refresh it: the stub target is keyed on `bcdl_py.so`, so once the `.pyi` is
+  newer than the module, ninja skips it. Delete the `.pyi` to force it.
+
 ## [0.3.0] — 2026-07
 
 Hardening of the video path, and NV12-native preprocessing. The compressed-video
