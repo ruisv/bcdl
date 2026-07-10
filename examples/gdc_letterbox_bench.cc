@@ -37,16 +37,15 @@ static void dumpNv12(const char* path, const bcdl::VpImage& im) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 3) { std::fprintf(stderr, "usage: %s image.jpg gdc.bin [out.nv12] [iters]\n", argv[0]); return 1; }
-  const char* bin_path = argv[2];
-  const char* out_path = argc > 3 ? argv[3] : "gdc_lb_out.nv12";
-  const int iters = argc > 4 ? std::atoi(argv[4]) : 200;
+  if (argc < 2) { std::fprintf(stderr, "usage: %s image.jpg [out.nv12] [iters]\n", argv[0]); return 1; }
+  const char* out_path = argc > 2 ? argv[2] : "gdc_lb_out.nv12";
+  const int iters = argc > 3 ? std::atoi(argv[3]) : 200;
   try {
     bcdl::JpegDecoder jpu;
     bcdl::VpImage src = jpu.decode(readFile(argv[1]));
     std::printf("JPU decode -> NV12 %dx%d\n", src.width(), src.height());
 
-    bcdl::GdcLetterbox gdc(bin_path, src.width(), src.height(), 640, 640);
+    bcdl::GdcLetterbox gdc(src.width(), src.height(), 640, 640);
     const auto& lb = gdc.info();
     std::printf("letterbox: scale=%.4f pad=(%.1f,%.1f)\n", lb.scale, lb.padX, lb.padY);
 

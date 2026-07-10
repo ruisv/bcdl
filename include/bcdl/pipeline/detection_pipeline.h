@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "bcdl/preproc/geometry.h"  // LetterboxInfo, YuvRange
 #include "bcdl/preproc/vp_image.h"
 #include "bcdl/tasks/detection.h"
 
@@ -50,13 +51,15 @@ struct PipelineConfig {
 /// its own worker thread (SERVICE time), so the sum EXCEEDS wall time — that is
 /// the point: it shows which stage bounds the overlapped pipeline.
 struct StageProfile {
-  double decode_ms = 0;    ///< VPU video decode + NV12->BGR (video pipelines only; 0 otherwise)
+  double decode_ms = 0;    ///< VPU video decode (video pipelines only; 0 otherwise)
+  double cvt_ms = 0;       ///< NV12 -> BGR colour conversion (video pipelines only)
   double preproc_ms = 0;   ///< letterbox BGR -> NV12 (CPU)
   double infer_ms = 0;     ///< feed NV12 input + Engine::infer (BPU submit+wait)
   double postproc_ms = 0;  ///< dequant + decode + per-class NMS (CPU)
   uint64_t frames = 0;
-  double totalMs() const { return decode_ms + preproc_ms + infer_ms + postproc_ms; }
+  double totalMs() const { return decode_ms + cvt_ms + preproc_ms + infer_ms + postproc_ms; }
   double decodePerFrame() const { return frames ? decode_ms / frames : 0.0; }
+  double cvtPerFrame() const { return frames ? cvt_ms / frames : 0.0; }
   double preprocPerFrame() const { return frames ? preproc_ms / frames : 0.0; }
   double inferPerFrame() const { return frames ? infer_ms / frames : 0.0; }
   double postprocPerFrame() const { return frames ? postproc_ms / frames : 0.0; }
@@ -105,8 +108,8 @@ class HeadDecoder {
 ///
 /// Construct once with an Engine, then call process() per frame. ALL scratch
 /// buffers are allocated up front and reused, so steady-state process() does no
-/// per-frame heap allocation for image buffers — this is the M4 value (a held
-/// camera stream runs at ~90% of single-frame FPS). Held buffers:
+/// per-frame heap allocation for image buffers — this is the M4 value (see
+/// a camera stream reaches ~90% of the single-frame FPS). Held buffers:
 ///   - `src_`    : a BGR wrapper sized to the *incoming* frame. Re-allocated
 ///                 only when the caller's (width,height) changes; otherwise the
 ///                 caller's rows are memcpy'd into the existing buffer.

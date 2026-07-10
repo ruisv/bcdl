@@ -1,7 +1,9 @@
 #include "bcdl/media/video_codec.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "bcdl/core/status.h"
 #include "bcdl/core/task.h"
@@ -135,6 +137,9 @@ namespace {
 constexpr int kDecInTimeoutMs = 1000;  // dequeue/queue an input buffer
 constexpr int kDecodeWaitMs = 40;      // decode(): wait for one ready frame
 constexpr int kFlushWaitMs = 300;      // flush(): drain reorder tail
+constexpr int kDrainPollMs = 20;       // ~Impl: poll for buffers the codec holds
+constexpr int kStatusPollUs = 200;     // recv(): how often to re-read the codec's status
+constexpr int kReadyWaitMs = 3;        // recv(): dequeue wait once status says a frame exists
 }  // namespace
 
 // media_codec-backed decoupled decoder. hb_mm_mc_* separates input queueing from
@@ -157,11 +162,15 @@ struct VideoDecoder::Impl {
     ctx.encoder = false;
     ctx.codec_id = id;
     mc_video_codec_dec_params_t* p = &ctx.video_dec_params;
-    // STREAM_SIZE: feed arbitrary compressed bytes and let the decoder find frame
-    // boundaries itself. More robust than FRAME_SIZE for streams whose pictures
-    // span multiple slice NALs (some HEVC), and it means callers need not split
-    // access units at all.
-    p->feed_mode = MC_FEEDING_MODE_STREAM_SIZE;
+    // FRAME_SIZE: each queued input buffer holds exactly one access unit. This is
+    // what both vendor apps use (sample_codec, sunrise_camera), and it is REQUIRED
+    // here: with MC_FEEDING_MODE_STREAM_SIZE the decoder's own bitstream-ring
+    // update path (updateDecoderBitstream -> vdi_write_memory -> osal_free)
+    // corrupts the glibc heap and the process dies mid-decode — measured on S100P
+    // / libmultimedia 1.2.3 at 6/20 runs decoding alone, 16/20 with any concurrent
+    // load. FRAME_SIZE: 0/20 in both.
+    // Callers must therefore feed() whole access units, not arbitrary byte chunks.
+    p->feed_mode = MC_FEEDING_MODE_FRAME_SIZE;
     p->pix_fmt = MC_PIXEL_FORMAT_NV12;
     const uint32_t bs = cfg.in_buf_size != 0 ? cfg.in_buf_size : kDecInBufDefault;
     p->bitstream_buf_size = alignUp(bs, kDecInBufAlign);
@@ -198,6 +207,25 @@ struct VideoDecoder::Impl {
 
   ~Impl() {
     if (started) {
+      // Destroying mid-stream (AUs fed, frames never drained) is legal, but both
+      // hb_mm_mc_stop() and hb_mm_mc_flush() block until the codec's internal
+      // components (`vdec_render`) have emptied their output port — and only the
+      // application can empty it. Give every decoded buffer back first, or the
+      // destructor hangs forever. Bounded: the codec can only hold as many
+      // frames as its already-queued inputs produce.
+      media_codec_buffer_t ob{};
+      media_codec_output_buffer_info_t info{};
+      for (int empty_polls = 0; empty_polls < 3;) {
+        // Gate on the status counter here too — a dequeue that finds nothing
+        // prints an ERROR line, and this loop ends on exactly such calls.
+        if (waitForFrame(Clock::now() + std::chrono::milliseconds(kDrainPollMs)) &&
+            hb_mm_mc_dequeue_output_buffer(&ctx, &ob, &info, kReadyWaitMs) == 0) {
+          hb_mm_mc_queue_output_buffer(&ctx, &ob, 0);
+          empty_polls = 0;
+        } else {
+          ++empty_polls;
+        }
+      }
       hb_mm_mc_stop(&ctx);      // best-effort; never throw from a destructor
       hb_mm_mc_release(&ctx);
     }
@@ -224,12 +252,56 @@ struct VideoDecoder::Impl {
     return hb_mm_mc_queue_input_buffer(&ctx, &in, kDecInTimeoutMs) == 0;
   }
 
+  using Clock = std::chrono::steady_clock;
+
+  // True once the codec reports at least one decoded frame queued, waiting until
+  // `deadline`. Polls the codec's status counter, which is silent, instead of
+  // blocking inside a dequeue, which is not.
+  bool waitForFrame(Clock::time_point deadline) {
+    for (;;) {
+      mc_inter_status_t st{};
+      if (hb_mm_mc_get_status(&ctx, &st) != 0) return true;  // can't tell: let dequeue decide
+      if (st.cur_output_buf_cnt > 0) return true;
+      if (Clock::now() >= deadline) return false;
+      std::this_thread::sleep_for(std::chrono::microseconds(kStatusPollUs));
+    }
+  }
+
   // Dequeue one decoded frame (display order). Returns false on timeout / EOS
   // marker; copies a valid frame into `out` and returns the codec buffer.
   bool recv(VpImage& out, int timeout_ms) {
+    // A dequeue that finds no frame makes the codec print an ERROR line on stdout
+    // ("Component vdec_render isn't ready!"). A drain-to-empty cadence ends every
+    // AU with exactly such a call, so a clean 1385-frame decode emitted 1385 error
+    // lines. Ask the codec how many frames are ready instead, and dequeue only
+    // when there is one — never blocking inside the dequeue, which is what logs.
+    // Semantics are unchanged: timeout_ms == 0 still never waits.
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
     media_codec_buffer_t ob{};
     media_codec_output_buffer_info_t info{};
-    if (hb_mm_mc_dequeue_output_buffer(&ctx, &ob, &info, timeout_ms) != 0) return false;
+    for (;;) {
+      if (!waitForFrame(deadline)) return false;
+      // The counter is incremented before the frame reaches the output port, so a
+      // zero-timeout dequeue right after it turns positive still misses ~1% of the
+      // time — and a missed dequeue is exactly what prints. Give it a couple of
+      // milliseconds: the frame is known to exist, so this returns at once.
+      if (hb_mm_mc_dequeue_output_buffer(&ctx, &ob, &info, kReadyWaitMs) == 0) break;
+      if (Clock::now() >= deadline) return false;
+    }
+
+    // media_codec_buffer_t is a union. Only interpret it as a decoded picture
+    // once we've confirmed (a) it IS a frame buffer — not a stream / EOS /
+    // status buffer — and (b) the decode actually succeeded (decode_result != 0;
+    // 0 == FAIL). Reading vframe_buf on a non-frame or failed buffer reinterprets
+    // unrelated union bytes as width/stride/vir_ptr and the copy below then reads
+    // and writes out of bounds, corrupting the heap. The vendor sample
+    // (sample_codec.c vp_codec_get_output) gates on exactly these two fields;
+    // skipping them is what let reorder/EOS buffers crash the concurrent path.
+    if (ob.type != MC_VIDEO_FRAME_BUFFER ||
+        info.video_frame_info.decode_result == 0) {
+      hb_mm_mc_queue_output_buffer(&ctx, &ob, 0);  // hand the buffer back, skip
+      return false;
+    }
 
     const mc_video_frame_buffer_info_t& vb = ob.vframe_buf;
     const bool valid = vb.size > 0 && vb.width > 0 && vb.height > 0 &&
@@ -239,8 +311,14 @@ struct VideoDecoder::Impl {
       return false;
     }
 
-    VpImage frame(vb.width, vb.height, HB_VP_IMAGE_FORMAT_NV12);
-    const hbVPImage& dst = frame.raw();
+    // Reuse the caller's buffer when it already matches; only (re)allocate on a
+    // size/format change. A caller that recycles one buffer (or a pool) then
+    // pays no per-frame hbUCPMallocCached/hbUCPFree on this hot path.
+    if (out.width() != vb.width || out.height() != vb.height ||
+        out.format() != HB_VP_IMAGE_FORMAT_NV12) {
+      out = VpImage(vb.width, vb.height, HB_VP_IMAGE_FORMAT_NV12);
+    }
+    const hbVPImage& dst = out.raw();
     // Y plane: `height` rows of `width` bytes at the codec's luma stride.
     {
       const auto* sp = vb.vir_ptr[0];
@@ -262,7 +340,6 @@ struct VideoDecoder::Impl {
                     static_cast<std::size_t>(copy));
     }
     hb_mm_mc_queue_output_buffer(&ctx, &ob, 0);  // return the buffer to the codec
-    out = std::move(frame);
     return true;
   }
 };

@@ -286,6 +286,12 @@ yolo26s @1280×720 的流式吞吐：同步 **216 FPS**，异步重叠 **334 FPS
 硬件 **JPEG** 解码（JPU）在样例图上比 `cv2`/libjpeg 快 **≈3.6–5.3×**，并卸载
 CPU（零拷贝 NV12→BPU）。
 
+压缩视频端到端（`AsyncVideoDetectionPipeline`，yolo26n @1080p）：**H.264 441 FPS**、
+**H.265 439–451 FPS**，瓶颈落在 VPU 解码。解码出的 NV12 由 GDC 硬件 letterbox 直接落到
+模型输入，无 BGR 往返（0.97 ms/帧，其中仅 ~0.3 ms 占 CPU）。纯 VPU 解码 452 / 481 FPS。
+输入必须是 **Annex-B 裸流**——mp4 请先用 `ffmpeg -c:v copy -bsf:v h264_mp4toannexb`
+解封装（只拆容器，不碰像素）。
+
 在板上复现：
 
 ```bash

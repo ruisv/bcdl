@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "gdc_bin.h"  // runtime warp-LUT generation (shared with GdcRemap)
+
 extern "C" {
 #include "gdc_cfg.h"
 #include "gdc_bin_cfg.h"
@@ -50,12 +52,28 @@ void copyBlock(uint8_t* dst, int dstStride, const uint8_t* src, int srcStride,
                 src + (size_t)(y + r) * srcStride + x, w);
 }
 
+// Same, mapping each byte through a 256-entry LUT (range conversion rides along
+// with the copy-out, so it costs no extra pass over the frame).
+void copyBlockLut(uint8_t* dst, int dstStride, const uint8_t* src, int srcStride,
+                  int x, int y, int w, int h, const uint8_t* lut) {
+  for (int r = 0; r < h; ++r) {
+    const uint8_t* s = src + (size_t)(y + r) * srcStride + x;
+    uint8_t* d = dst + (size_t)(y + r) * dstStride + x;
+    for (int c = 0; c < w; ++c) d[c] = lut[s[c]];
+  }
+}
+
+uint8_t clampU8(double v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : std::lround(v))); }
+
 }  // namespace
 
 struct GdcLetterbox::Impl {
   int iw = 0, ih = 0, ow = 0, oh = 0;
   int px = 0, py = 0, cw = 0, ch = 0;  // content window (even)
   uint8_t pad = 114;
+  bool range_conv = false;             // apply y_lut / uv_lut on copy-out
+  uint8_t y_lut[256]{};
+  uint8_t uv_lut[256]{};
   hbn_vnode_handle_t vnode = 0;
   hb_mem_common_buf_t bin{};
   hbn_vnode_image_t in{};  // persistent input graph buffer
@@ -63,13 +81,22 @@ struct GdcLetterbox::Impl {
   bool timing = false;     // BCDL_GDC_TIMING (read once at construction)
 };
 
-GdcLetterbox::GdcLetterbox(const std::string& bin_path, int in_w, int in_h, int out_w,
-                           int out_h, uint8_t pad)
+GdcLetterbox::GdcLetterbox(int in_w, int in_h, int out_w, int out_h, uint8_t pad,
+                           YuvRange range)
     : p_(new Impl), in_w_(in_w), in_h_(in_h), out_w_(out_w), out_h_(out_h) {
   p_->iw = in_w; p_->ih = in_h; p_->ow = out_w; p_->oh = out_h; p_->pad = pad;
 
-  // Geometry (aspect-preserving fit + center). Match bcdl::computeLetterbox and
-  // the offline-generated bin's Affine window.
+  // Studio->full expansion, the exact composition of cv::cvtColor(YUV2BGR_NV12)
+  // with a full-range BGR->NV12 encode: the cross terms cancel and what is left
+  // is a per-plane affine map. 255/219 on luma, 255/224 on chroma.
+  p_->range_conv = (range == YuvRange::kStudioToFull);
+  for (int v = 0; v < 256; ++v) {
+    p_->y_lut[v] = clampU8((v - 16) * (255.0 / 219.0));
+    p_->uv_lut[v] = clampU8(128.0 + (v - 128) * (255.0 / 224.0));
+  }
+
+  // Geometry (aspect-preserving fit + center), identical to bcdl::computeLetterbox
+  // so post-processing's inverse map is unchanged.
   lb_ = computeLetterbox(in_w, in_h, out_w, out_h);
   p_->cw = even((int)std::lround(in_w * lb_.scale));
   p_->ch = even((int)std::lround(in_h * lb_.scale));
@@ -84,24 +111,30 @@ GdcLetterbox::GdcLetterbox(const std::string& bin_path, int in_w, int in_h, int 
     GDC_CHECK(hb_mem_module_open());
     p_->mem_open = true;
 
-    // 1) Load the pre-generated warp-LUT bin into an hb_mem com buffer.
-    FILE* bf = std::fopen(bin_path.c_str(), "rb");
-    if (!bf) throw std::runtime_error("GdcLetterbox: cannot open bin " + bin_path);
-    std::fseek(bf, 0, SEEK_END);
-    long bin_size = std::ftell(bf);
-    std::fseek(bf, 0, SEEK_SET);
-    std::vector<uint8_t> cfg(bin_size);
-    size_t got = std::fread(cfg.data(), 1, bin_size, bf);
-    std::fclose(bf);
-    if (got != (size_t)bin_size || bin_size <= 0)
-      throw std::runtime_error("GdcLetterbox: bad bin read");
-
-    int64_t flags = HB_MEM_USAGE_MAP_INITIALIZED | HB_MEM_USAGE_PRIV_HEAP_2_RESERVERD |
-                    HB_MEM_USAGE_CPU_READ_OFTEN | HB_MEM_USAGE_CPU_WRITE_OFTEN |
-                    HB_MEM_USAGE_CACHED;
-    GDC_CHECK(hb_mem_alloc_com_buf(bin_size, flags, &p_->bin));
-    std::memcpy(p_->bin.virt_addr, cfg.data(), bin_size);
-    GDC_CHECK(hb_mem_flush_buf(p_->bin.fd, 0, bin_size));
+    // 1) Generate the warp LUT for this geometry. The letterbox is affine, and
+    // bilinear interpolation between grid nodes reproduces an affine map
+    // EXACTLY — provided no cell straddles the content/pad edge, where nodes get
+    // clamped into the input. Hence a grid step that divides the content window
+    // as well as the output extent. Pixels outside the content window sample
+    // clamped (edge-replicated) input; run() overwrites them with flat pad.
+    const int step = gdcbin::gridStepFor({out_w, out_h, p_->px, p_->py, p_->cw, p_->ch});
+    const int gw = out_w / step + 1, gh = out_h / step + 1;
+    std::vector<point_t> pts(static_cast<size_t>(gw) * gh);
+    const double sc = lb_.scale;
+    for (int gy = 0; gy < gh; ++gy)
+      for (int gx = 0; gx < gw; ++gx) {
+        // Evaluate the inverse letterbox AT the node coordinate (which for the
+        // last node is the output's exclusive edge, out_w/out_h). Sampling a
+        // dense map instead would clamp that node one pixel inward — 1/scale
+        // input pixels of error across the whole final cell. Pixel-center
+        // convention, matching cv::resize(INTER_LINEAR) and letterboxCpu().
+        const double u = gx * step, v = gy * step;
+        point_t& p = pts[static_cast<size_t>(gy) * gw + gx];
+        p.x = (u - p_->px + 0.5) / sc - 0.5;
+        p.y = (v - p_->py + 0.5) / sc - 0.5;
+      }
+    gdcbin::clampAndDedupeGrid(pts, gw, gh, in_w, in_h);
+    gdcbin::allocCustomGridCfg(pts, gw, gh, in_w, in_h, out_w, out_h, &p_->bin);
 
     // 2) Open + configure the GDC vnode (feedback mode).
     GDC_CHECK(hbn_vnode_open(HB_GDC, 0, AUTO_ALLOC_ID, &p_->vnode));
@@ -136,7 +169,11 @@ GdcLetterbox::GdcLetterbox(const std::string& bin_path, int in_w, int in_h, int 
 
     // 3) Persistent input graph buffer (NV12, in_w x in_h). Allocate at the
     // 16-aligned stride we told GDC (input_stride) so the two always agree.
-    GDC_CHECK(hb_mem_alloc_graph_buf(in_w, in_h, MEM_PIX_FMT_NV12, flags,
+    const int64_t buf_flags = HB_MEM_USAGE_MAP_INITIALIZED |
+                              HB_MEM_USAGE_PRIV_HEAP_2_RESERVERD |
+                              HB_MEM_USAGE_CPU_READ_OFTEN |
+                              HB_MEM_USAGE_CPU_WRITE_OFTEN | HB_MEM_USAGE_CACHED;
+    GDC_CHECK(hb_mem_alloc_graph_buf(in_w, in_h, MEM_PIX_FMT_NV12, buf_flags,
                                      align16(in_w), in_h, &p_->in.buffer));
   } catch (...) {
     this->~GdcLetterbox();
@@ -200,8 +237,14 @@ LetterboxInfo GdcLetterbox::run(const VpImage& src, VpImage& dst) {
   const int os = out.buffer.stride;
   const uint8_t* oy = static_cast<const uint8_t*>(out.buffer.virt_addr[0]);
   const uint8_t* ouv = static_cast<const uint8_t*>(out.buffer.virt_addr[1]);
-  copyBlock(dy, dr.stride, oy, os, p_->px, p_->py, p_->cw, p_->ch);            // Y content
-  copyBlock(duv, dr.uvStride, ouv, os, p_->px, p_->py / 2, p_->cw, p_->ch / 2);  // UV content
+  if (p_->range_conv) {
+    copyBlockLut(dy, dr.stride, oy, os, p_->px, p_->py, p_->cw, p_->ch, p_->y_lut);
+    copyBlockLut(duv, dr.uvStride, ouv, os, p_->px, p_->py / 2, p_->cw, p_->ch / 2,
+                 p_->uv_lut);
+  } else {
+    copyBlock(dy, dr.stride, oy, os, p_->px, p_->py, p_->cw, p_->ch);            // Y content
+    copyBlock(duv, dr.uvStride, ouv, os, p_->px, p_->py / 2, p_->cw, p_->ch / 2);  // UV content
+  }
   dst.cleanCache();
 
   hbn_vnode_releaseframe(p_->vnode, 0, &out);

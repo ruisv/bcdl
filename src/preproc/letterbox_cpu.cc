@@ -34,6 +34,39 @@ inline uint8_t clampU8(float v) {
   return static_cast<uint8_t>(i < 0 ? 0 : (i > 255 ? 255 : i));
 }
 
+// Bilinear resize of an interleaved `chans`-channel U8 plane, OpenCV's
+// pixel-center convention. Used when OpenCV is absent.
+void bilinearPlane(uint8_t* dst, int dstStride, int dw, int dh, const uint8_t* src,
+                   int srcStride, int sw, int sh, int chans) {
+  const float sx = static_cast<float>(sw) / dw, sy = static_cast<float>(sh) / dh;
+#pragma omp parallel for schedule(static)
+  for (int y = 0; y < dh; ++y) {
+    float fy = (y + 0.5f) * sy - 0.5f;
+    if (fy < 0) fy = 0;
+    int y0 = static_cast<int>(fy);
+    if (y0 > sh - 1) y0 = sh - 1;
+    const int y1 = std::min(y0 + 1, sh - 1);
+    const float wy = fy - y0;
+    uint8_t* d = dst + static_cast<std::size_t>(y) * dstStride;
+    for (int x = 0; x < dw; ++x) {
+      float fx = (x + 0.5f) * sx - 0.5f;
+      if (fx < 0) fx = 0;
+      int x0 = static_cast<int>(fx);
+      if (x0 > sw - 1) x0 = sw - 1;
+      const int x1 = std::min(x0 + 1, sw - 1);
+      const float wx = fx - x0;
+      for (int c = 0; c < chans; ++c) {
+        const float a = src[static_cast<std::size_t>(y0) * srcStride + x0 * chans + c];
+        const float b = src[static_cast<std::size_t>(y0) * srcStride + x1 * chans + c];
+        const float e = src[static_cast<std::size_t>(y1) * srcStride + x0 * chans + c];
+        const float f = src[static_cast<std::size_t>(y1) * srcStride + x1 * chans + c];
+        const float top = a + (b - a) * wx, bot = e + (f - e) * wx;
+        d[x * chans + c] = clampU8(top + (bot - top) * wy);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 LetterboxInfo letterboxCpu(VpImage& dst, const VpImage& src, uint8_t padValue) {
@@ -202,7 +235,7 @@ void bgrToNv12Cpu(VpImage& dstNv12, const VpImage& srcBgr) {
   dstNv12.cleanCache();
 }
 
-void nv12ToBgrCpu(VpImage& dstBgr, const VpImage& srcNv12) {
+void nv12ToBgrCpu(VpImage& dstBgr, const VpImage& srcNv12, YuvRange range) {
   if (srcNv12.format() != HB_VP_IMAGE_FORMAT_NV12 ||
       dstBgr.format() != HB_VP_IMAGE_FORMAT_BGR) {
     throw Error(-1, "nv12ToBgrCpu: src must be NV12 and dst must be BGR (U8C3)");
@@ -224,37 +257,54 @@ void nv12ToBgrCpu(VpImage& dstBgr, const VpImage& srcNv12) {
   auto* dstBase = static_cast<uint8_t*>(dstBgr.data());
 
 #ifdef BCDL_HAVE_OPENCV
-  // Fast path: OpenCV's SIMD NV12->BGR (BT.601). Pack the strided planes into a
-  // tight [h*3/2, w] Mat, convert, then copy rows into dst honoring its stride.
-  cv::Mat nv12(h * 3 / 2, w, CV_8UC1);
-  for (int r = 0; r < h; ++r)
-    std::memcpy(nv12.ptr(r), yBase + static_cast<std::size_t>(r) * yStride, w);
-  for (int r = 0; r < h / 2; ++r)
-    std::memcpy(nv12.ptr(h + r), uvBase + static_cast<std::size_t>(r) * uvStride, w);
-  cv::Mat bgr;
-  cv::cvtColor(nv12, bgr, cv::COLOR_YUV2BGR_NV12);
-  const std::size_t rowBytes = static_cast<std::size_t>(w) * 3;
-  for (int r = 0; r < h; ++r)
-    std::memcpy(dstBase + static_cast<std::size_t>(r) * dstStride, bgr.ptr(r), rowBytes);
-#else
-  // BT.601 FULL-range YUV->BGR, exact inverse of bgrToNv12Cpu's forward matrix.
+  if (range == YuvRange::kStudioToFull) {
+    // Fast path: cv::cvtColor's NV12->BGR IS the studio-swing expansion — same
+    // matrix as the hand path below, SIMD. Pack the strided planes into a tight
+    // [h*3/2, w] Mat, convert, then copy rows into dst honoring its stride.
+    cv::Mat nv12(h * 3 / 2, w, CV_8UC1);
+    for (int r = 0; r < h; ++r)
+      std::memcpy(nv12.ptr(r), yBase + static_cast<std::size_t>(r) * yStride, w);
+    for (int r = 0; r < h / 2; ++r)
+      std::memcpy(nv12.ptr(h + r), uvBase + static_cast<std::size_t>(r) * uvStride, w);
+    cv::Mat bgr;
+    cv::cvtColor(nv12, bgr, cv::COLOR_YUV2BGR_NV12);
+    const std::size_t rowBytes = static_cast<std::size_t>(w) * 3;
+    for (int r = 0; r < h; ++r)
+      std::memcpy(dstBase + static_cast<std::size_t>(r) * dstStride, bgr.ptr(r), rowBytes);
+    dstBgr.cleanCache();
+    return;
+  }
+  // kAsIs has no OpenCV equivalent (cv::cvtColor always assumes studio swing),
+  // so it falls through to the hand path.
+#endif
+
+  // BT.601, either studio-swing expanded (matching cv::cvtColor) or full-range
+  // (the exact inverse of bgrToNv12Cpu's forward matrix). Both branches of the
+  // build must produce the same pixels for the same `range` — that they did not
+  // is the bug this signature fixes.
+  const bool studio = (range == YuvRange::kStudioToFull);
+  const float ky = studio ? 1.164f : 1.0f;
+  const float kr = studio ? 1.596f : 1.402f;
+  const float kgu = studio ? 0.391f : 0.344f;
+  const float kgv = studio ? 0.813f : 0.714f;
+  const float kb = studio ? 2.018f : 1.772f;
+  const float yoff = studio ? 16.0f : 0.0f;
 #pragma omp parallel for schedule(static)
   for (int y = 0; y < h; ++y) {
     const uint8_t* yRow = yBase + static_cast<std::size_t>(y) * yStride;
     const uint8_t* uvRow = uvBase + static_cast<std::size_t>(y / 2) * uvStride;
     uint8_t* dRow = dstBase + static_cast<std::size_t>(y) * dstStride;
     for (int x = 0; x < w; ++x) {
-      const float Y = yRow[x];
+      const float Y = ky * (static_cast<float>(yRow[x]) - yoff);
       const uint8_t* uv = uvRow + static_cast<std::size_t>(x / 2) * 2;
       const float U = static_cast<float>(uv[0]) - 128.0f;
       const float V = static_cast<float>(uv[1]) - 128.0f;
       uint8_t* p = dRow + static_cast<std::size_t>(x) * 3;
-      p[0] = clampU8(Y + 1.772f * U);                  // B
-      p[1] = clampU8(Y - 0.344f * U - 0.714f * V);     // G
-      p[2] = clampU8(Y + 1.402f * V);                  // R
+      p[0] = clampU8(Y + kb * U);                 // B
+      p[1] = clampU8(Y - kgu * U - kgv * V);      // G
+      p[2] = clampU8(Y + kr * V);                 // R
     }
   }
-#endif
 
   dstBgr.cleanCache();
 }
@@ -268,6 +318,69 @@ LetterboxInfo letterboxToNv12Cpu(VpImage& dstNv12, const VpImage& srcBgr,
   VpImage tmpBgr(dstNv12.width(), dstNv12.height(), HB_VP_IMAGE_FORMAT_BGR);
   const LetterboxInfo lb = letterboxCpu(tmpBgr, srcBgr, padValue);
   bgrToNv12Cpu(dstNv12, tmpBgr);
+  return lb;
+}
+
+LetterboxInfo letterboxNv12Cpu(VpImage& dstNv12, const VpImage& srcNv12, uint8_t padValue,
+                               YuvRange range) {
+  if (srcNv12.format() != HB_VP_IMAGE_FORMAT_NV12 ||
+      dstNv12.format() != HB_VP_IMAGE_FORMAT_NV12) {
+    throw Error(-1, "letterboxNv12Cpu: src and dst must both be NV12");
+  }
+  const int W = srcNv12.width(), H = srcNv12.height();
+  const int OW = dstNv12.width(), OH = dstNv12.height();
+  const LetterboxInfo lb = computeLetterbox(W, H, OW, OH);
+  // Even-align the content window: NV12 chroma is 2x2 subsampled, so an odd
+  // offset or extent would split a chroma sample.
+  const int cw = static_cast<int>(std::lround(W * lb.scale)) & ~1;
+  const int ch = static_cast<int>(std::lround(H * lb.scale)) & ~1;
+  const int px = static_cast<int>(std::lround(lb.padX)) & ~1;
+  const int py = static_cast<int>(std::lround(lb.padY)) & ~1;
+
+  const auto& dr = dstNv12.raw();
+  auto* dy = static_cast<uint8_t*>(dstNv12.data());
+  auto* duv = static_cast<uint8_t*>(dr.uvVirAddr);
+  for (int r = 0; r < OH; ++r) std::memset(dy + static_cast<std::size_t>(r) * dr.stride, padValue, OW);
+  for (int r = 0; r < OH / 2; ++r) std::memset(duv + static_cast<std::size_t>(r) * dr.uvStride, 128, OW);
+
+  if (cw > 0 && ch > 0) {
+    const auto& sr = srcNv12.raw();
+    auto* yroi = dy + static_cast<std::size_t>(py) * dr.stride + px;
+    auto* uvroi = duv + static_cast<std::size_t>(py / 2) * dr.uvStride + px;
+    const auto* sy_p = static_cast<const uint8_t*>(srcNv12.data());
+    const auto* suv_p = static_cast<const uint8_t*>(sr.uvVirAddr);
+#ifdef BCDL_HAVE_OPENCV
+    // Resize straight into the centered ROI of the padded canvas; the ROI Mats
+    // carry the canvas strides, so cv::resize writes in place. Interleaved UV is
+    // one CV_8UC2 plane at half resolution, so U and V stay paired.
+    cv::Mat sy(H, W, CV_8UC1, const_cast<uint8_t*>(sy_p), sr.stride);
+    cv::Mat dyroi(ch, cw, CV_8UC1, yroi, dr.stride);
+    cv::resize(sy, dyroi, cv::Size(cw, ch), 0, 0, cv::INTER_LINEAR);
+    cv::Mat suv(H / 2, W / 2, CV_8UC2, const_cast<uint8_t*>(suv_p), sr.uvStride);
+    cv::Mat duvroi(ch / 2, cw / 2, CV_8UC2, uvroi, dr.uvStride);
+    cv::resize(suv, duvroi, cv::Size(cw / 2, ch / 2), 0, 0, cv::INTER_LINEAR);
+#else
+    bilinearPlane(yroi, dr.stride, cw, ch, sy_p, sr.stride, W, H, 1);
+    bilinearPlane(uvroi, dr.uvStride, cw / 2, ch / 2, suv_p, sr.uvStride, W / 2, H / 2, 2);
+#endif
+
+    if (range == YuvRange::kStudioToFull) {
+      uint8_t y_lut[256], uv_lut[256];
+      for (int v = 0; v < 256; ++v) {
+        y_lut[v] = clampU8((v - 16) * (255.0f / 219.0f));
+        uv_lut[v] = clampU8(128.0f + (v - 128) * (255.0f / 224.0f));
+      }
+      for (int r = py; r < py + ch; ++r) {
+        uint8_t* p = dy + static_cast<std::size_t>(r) * dr.stride + px;
+        for (int c = 0; c < cw; ++c) p[c] = y_lut[p[c]];
+      }
+      for (int r = py / 2; r < (py + ch) / 2; ++r) {
+        uint8_t* p = duv + static_cast<std::size_t>(r) * dr.uvStride + px;
+        for (int c = 0; c < cw; ++c) p[c] = uv_lut[p[c]];
+      }
+    }
+  }
+  dstNv12.cleanCache();
   return lb;
 }
 

@@ -417,7 +417,7 @@ class VideoDecoder:
 
     def decode(self, data: bytes) -> VpImage | None:
         """
-        Feed one compressed chunk; returns an NV12 VpImage when a frame is ready, else None (the decoder is still buffering reference frames).
+        Feed one access unit; returns an NV12 VpImage when a frame is ready, else None (the decoder is still buffering reference frames).
         """
 
     def feed(self, data: bytes) -> bool:
@@ -973,6 +973,9 @@ class StageProfile:
     def decode_ms(self) -> float: ...
 
     @property
+    def cvt_ms(self) -> float: ...
+
+    @property
     def preproc_ms(self) -> float: ...
 
     @property
@@ -987,6 +990,8 @@ class StageProfile:
     def total_ms(self) -> float: ...
 
     def decode_per_frame(self) -> float: ...
+
+    def cvt_per_frame(self) -> float: ...
 
     def preproc_per_frame(self) -> float: ...
 

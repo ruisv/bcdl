@@ -93,10 +93,17 @@ def main(argv):
     wall = time.perf_counter() - (t_first or time.perf_counter())
     sp = pipe.profile()
     print(f"\n=== live RTSP summary ({recv} frames) ===")
-    print(f"  decode   {sp.decode_per_frame():.2f} ms/f  (VPU hardware decode)")
-    print(f"  preproc  {sp.preproc_per_frame():.2f} ms/f  (CPU letterbox)")
-    print(f"  infer    {sp.infer_per_frame():.2f} ms/f  (BPU)")
-    print(f"  postproc {sp.postproc_per_frame():.2f} ms/f  (CPU NMS)")
+    # Stages overlap on their own threads, so throughput is bounded by the
+    # slowest one, not by their sum.
+    stages = [("decode", sp.decode_per_frame(), "VPU hardware decode"),
+              ("nv12->bgr", sp.cvt_per_frame(), "CPU colour convert"),
+              ("preproc", sp.preproc_per_frame(), "CPU letterbox"),
+              ("infer", sp.infer_per_frame(), "BPU"),
+              ("postproc", sp.postproc_per_frame(), "CPU NMS")]
+    slowest = max(s[1] for s in stages)
+    for name, per_f, unit in stages:
+        mark = "  <== bottleneck" if per_f == slowest else ""
+        print(f"  {name:<10} {per_f:.2f} ms/f  ({unit}){mark}")
     print(f"end-to-end {recv / wall:.1f} FPS | total dets {total_dets}")
     print("OK: rtsp -> ffmpeg(-c copy, no decode) -> C++ VPU decode -> BPU detect")
     return 0

@@ -12,6 +12,8 @@
 
 #include <unistd.h>
 
+#include "gdc_bin.h"  // runtime warp-LUT generation (shared with GdcLetterbox)
+
 extern "C" {
 #include "gdc_cfg.h"
 #include "gdc_bin_cfg.h"
@@ -25,20 +27,6 @@ extern "C" {
 #ifndef AUTO_ALLOC_ID
 #define AUTO_ALLOC_ID (-1)
 #endif
-
-extern "C" {
-// libgdcbin internals (exported but not in the SDK headers). The public
-// hbn_gen_gdc_cfg wrapper NEVER forwards CUSTOM grid points (it calls only
-// gdc_init/gdc_calculate — verified by disassembly — so the validator sees a
-// zeroed grid); we drive the generator directly and inject the points via
-// gdc_set_custom_points between init and calculate.
-void* gdc_init(void);
-uint32_t gdc_calculate(void* ctx, const param_t* prm, const window_t* wins,
-                       uint32_t wnd_num, void** cfg_buf, uint32_t a, void* b,
-                       uint32_t c, uint32_t d);   // returns cfg size in u32 words
-void gdc_set_custom_points(void* ctx, const custom_tranformation_t* c);
-void gdc_cleanup(void* ctx);
-}
 
 namespace bcdl {
 
@@ -92,87 +80,20 @@ GdcRemap::GdcRemap(const float* map_x, const float* map_y, int in_w, int in_h,
   //     between nodes); nodes must be strictly positive and adjacent nodes
   //     must not coincide (validator), hence the epsilon de-duplication on
   //     clamped border nodes.
-  const int gw = out_w / grid_step + 1;   // nodes per row
-  const int gh = out_h / grid_step + 1;   // node rows
-  std::vector<point_t> pts(static_cast<size_t>(gw) * gh);
-  for (int gy = 0; gy < gh; ++gy) {
-    const int oy = std::min(gy * grid_step, out_h - 1);
-    for (int gx = 0; gx < gw; ++gx) {
-      const int ox = std::min(gx * grid_step, out_w - 1);
-      const size_t di = static_cast<size_t>(oy) * out_w + ox;
-      point_t& p = pts[static_cast<size_t>(gy) * gw + gx];
-      p.x = std::min(std::max(0.5, static_cast<double>(map_x[di])), in_w - 1.0);
-      p.y = std::min(std::max(0.5, static_cast<double>(map_y[di])), in_h - 1.0);
-    }
-  }
-  // The validator rejects adjacent nodes that coincide (happens where the map
-  // clamps at the image border): nudge duplicates apart by ~1e-3 px — only
-  // ever hits out-of-image border samples, visually irrelevant.
-  for (int gy = 0; gy < gh; ++gy)
-    for (int gx = 0; gx < gw; ++gx) {
-      point_t& p = pts[static_cast<size_t>(gy) * gw + gx];
-      auto same = [&](const point_t& q) {
-        return std::abs(p.x - q.x) < 1e-9 && std::abs(p.y - q.y) < 1e-9;
-      };
-      if (gx > 0 && same(pts[static_cast<size_t>(gy) * gw + gx - 1])) p.x += 1e-3;
-      if (gy > 0 && same(pts[static_cast<size_t>(gy - 1) * gw + gx])) p.y += 1e-3;
-    }
-
-  param_t prm{};
-  prm.format = FMT_SEMIPLANAR_420;
-  prm.in = {static_cast<uint32_t>(in_w), static_cast<uint32_t>(in_h)};
-  prm.out = {static_cast<uint32_t>(out_w), static_cast<uint32_t>(out_h)};
-  prm.x_offset = 0;
-  prm.y_offset = 0;
-  // diameter/fov only parameterize the fisheye-style transforms; keep the
-  // conventional defaults so CUSTOM ignores them.
-  prm.diameter = std::min(in_w, in_h);
-  prm.fov = 180.0;
-
-  window_t win{};
-  win.out_r = {0, 0, out_w, out_h};
-  win.transform = CUSTOM;
-  win.input_roi_r = {0, 0, in_w, in_h};
-  win.zoom = 1.0;
-  win.keep_ratio = 1;
-  win.custom.full_tile_calc = 0;
-  win.custom.tile_incr_x = 0;
-  win.custom.tile_incr_y = 0;
-  win.custom.w = gw - 1;   // tile counts, NOT node counts (see note above)
-  win.custom.h = gh - 1;
-  win.custom.centerx = (gw - 1) / 2.0;   // GRID-INDEX units (see note above)
-  win.custom.centery = (gh - 1) / 2.0;
-  win.custom.points = pts.data();
+  int gw = 0, gh = 0;
+  const auto pts =
+      gdcbin::gridFromDenseMap(map_x, map_y, in_w, in_h, out_w, out_h, grid_step, &gw, &gh);
 
   try {
     GDC_CHECK(hb_mem_module_open());
     p_->mem_open = true;
 
-    // 1) Generate the warp-LUT cfg at runtime from the CUSTOM grid, driving
-    // libgdcbin directly (see the extern decl above for why not hbn_gen_gdc_cfg).
-    void* ctx = gdc_init();
-    if (!ctx) throw std::runtime_error("GdcRemap: gdc_init failed");
-    gdc_set_custom_points(ctx, &win.custom);
-    void* cfg_buf = nullptr;
-    uint64_t scratch[2] = {0, 0};
-    uint32_t words = gdc_calculate(ctx, &prm, &win, 1, &cfg_buf, 0, scratch, 0, 0);
-    gdc_cleanup(ctx);
-    const uint64_t cfg_size = static_cast<uint64_t>(words) * 4;
-    if (!words || !cfg_buf)
-      throw std::runtime_error("GdcRemap: gdc_calculate produced no config");
+    // 1) Generate the warp-LUT cfg at runtime from the CUSTOM grid.
+    gdcbin::allocCustomGridCfg(pts, gw, gh, in_w, in_h, out_w, out_h, &p_->bin);
 
-    int64_t flags = HB_MEM_USAGE_MAP_INITIALIZED | HB_MEM_USAGE_PRIV_HEAP_2_RESERVERD |
-                    HB_MEM_USAGE_CPU_READ_OFTEN | HB_MEM_USAGE_CPU_WRITE_OFTEN |
-                    HB_MEM_USAGE_CACHED;
-    int gen_rc = hb_mem_alloc_com_buf(cfg_size, flags, &p_->bin);
-    if (gen_rc == 0) {
-      std::memcpy(p_->bin.virt_addr, cfg_buf, cfg_size);
-      hb_mem_flush_buf(p_->bin.fd, 0, cfg_size);
-    }
-    hbn_free_gdc_cfg(static_cast<uint32_t*>(cfg_buf));
-    if (gen_rc != 0)
-      throw std::runtime_error("GdcRemap: hb_mem_alloc_com_buf failed, ret=" +
-                               std::to_string(gen_rc));
+    const int64_t flags = HB_MEM_USAGE_MAP_INITIALIZED | HB_MEM_USAGE_PRIV_HEAP_2_RESERVERD |
+                          HB_MEM_USAGE_CPU_READ_OFTEN | HB_MEM_USAGE_CPU_WRITE_OFTEN |
+                          HB_MEM_USAGE_CACHED;
 
     // 2) Open + configure the GDC vnode (feedback mode) — as GdcLetterbox.
     GDC_CHECK(hbn_vnode_open(HB_GDC, 0, AUTO_ALLOC_ID, &p_->vnode));

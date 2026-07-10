@@ -109,6 +109,10 @@ class VideoDecoder {
 
   /// Queue one compressed access unit for decoding (does not wait for output).
   /// Blocks briefly if the codec's input queue is full. Returns false on error.
+  ///
+  /// `data` must be exactly ONE access unit (one picture's worth of NALs,
+  /// start-code prefixed) — the decoder runs in FRAME_SIZE feeding mode. Feeding
+  /// arbitrary byte chunks is not supported.
   bool feed(const uint8_t* data, std::size_t size);
 
   /// Drain one decoded frame in display order. `timeout_ms == 0` is non-blocking

@@ -183,14 +183,30 @@ int main(int argc, char** argv) {
       bcdl::DetectionPipeline pipe(engine, cfg);
       bcdl::VpImage nv12;
       auto t0 = Clock::now();
-      for (const auto& [b, e] : aus) {
-        if (max_frames && serial_frames >= max_frames) break;
-        if (!dec.decode(stream.data() + b, e - b, nv12)) continue;
-        cv::Mat bgr = nv12ToBgr(nv12);
+      // Same drain cadence as Pass 2 (feed, drain all ready frames, flush the
+      // reorder tail) so both passes see the SAME frames — otherwise the serial
+      // baseline silently drops the tail and the speedup comparison is void.
+      auto handleFrame = [&](bcdl::VpImage& f) {
+        cv::Mat bgr = nv12ToBgr(f);
         if (!bgr.isContinuous()) bgr = bgr.clone();
         auto dets = pipe.process(bgr.ptr<uint8_t>(0), bgr.cols, bgr.rows);
         serial_dets += static_cast<long>(dets.size());
         ++serial_frames;
+      };
+      for (const auto& [b, e] : aus) {
+        if (max_frames && serial_frames >= max_frames) break;
+        while (!dec.feed(stream.data() + b, e - b)) {
+          if (!dec.receive(nv12, 5)) break;
+          handleFrame(nv12);
+        }
+        while (dec.receive(nv12, 0)) {
+          handleFrame(nv12);
+          if (max_frames && serial_frames >= max_frames) break;
+        }
+      }
+      while (!max_frames || serial_frames < max_frames) {
+        if (!dec.flush(nv12)) break;
+        handleFrame(nv12);
       }
       serial_ms = msSince(t0);
     }
@@ -203,37 +219,68 @@ int main(int argc, char** argv) {
     {
       bcdl::VideoDecoder dec({vtype});
       bcdl::AsyncDetectionPipeline pipe(engine, cfg, depth);
-      FrameChannel chan(static_cast<size_t>(depth) + 2);
+      // A recycling buffer pool: free_chan holds empty NV12 buffers, filled_chan
+      // holds decoded ones. The producer pulls a free buffer, decodes into it
+      // (VideoDecoder::receive REUSES the buffer, so after warm-up there is NO
+      // per-frame hbUCP alloc/free on the decode thread), and forwards it; the
+      // consumer uses it and returns it to free_chan. The same fixed set of
+      // buffers cycles for the whole run, so steady state does no per-frame
+      // hbUCP alloc/free on the decode thread.
+      const int poolN = depth + 4;
+      FrameChannel free_chan(poolN + 1), filled_chan(poolN + 1);
+      for (int i = 0; i < poolN; ++i) free_chan.push(bcdl::VpImage{});
 
       auto t0 = Clock::now();
-      // Decode thread: pure VPU decode, hand owned NV12 frames to the channel.
-      // Times its own service cost (safe to read after join()).
       std::thread producer([&] {
-        bcdl::VpImage nv12;
         int made = 0;
+        bool stop = false;
+        // Decode one ready frame into a recycled buffer and forward it.
+        // Returns: 1 = forwarded, 0 = no frame ready now, -1 = stop.
+        auto drainOne = [&]() -> int {
+          if (max_frames && made >= max_frames) return -1;
+          bcdl::VpImage buf;
+          if (!free_chan.pop(buf)) return -1;                 // shutting down
+          if (!dec.receive(buf, 0)) { free_chan.push(std::move(buf)); return 0; }
+          if (!filled_chan.push(std::move(buf))) return -1;
+          ++made;
+          return 1;
+        };
         for (const auto& [b, e] : aus) {
           if (max_frames && made >= max_frames) break;
           auto d0 = Clock::now();
-          bool got = dec.decode(stream.data() + b, e - b, nv12);
+          while (!dec.feed(stream.data() + b, e - b)) {       // input full: drain + retry
+            int r = drainOne();
+            if (r < 0) { stop = true; break; }
+            if (r == 0) break;
+          }
+          if (!stop) { int r; while ((r = drainOne()) == 1) {} if (r < 0) stop = true; }
           a_dec_ms += msSince(d0);
-          if (!got) continue;
-          if (!chan.push(std::move(nv12))) break;
+          if (stop) break;
+        }
+        // Flush the reorder tail at EOS, into recycled buffers.
+        while (!stop) {
+          if (max_frames && made >= max_frames) break;
+          bcdl::VpImage buf;
+          if (!free_chan.pop(buf)) break;
+          if (!dec.flush(buf)) { free_chan.push(std::move(buf)); break; }
+          if (!filled_chan.push(std::move(buf))) break;
           ++made;
         }
-        chan.close();
+        filled_chan.close();
       });
 
-      // Main: pop NV12, convert to BGR (CPU, overlaps the decode thread), feed
-      // the pipeline, keep ~depth frames in flight, drain results in order.
+      // Main: pop a decoded NV12 buffer, convert to BGR (CPU, overlaps the decode
+      // thread), feed the pipeline, recycle the buffer, drain results in order.
       std::vector<bcdl::Detection> dets;
-      bcdl::VpImage nv12;
-      while (chan.pop(nv12)) {
+      bcdl::VpImage buf;
+      while (filled_chan.pop(buf)) {
         auto c0 = Clock::now();
-        cv::Mat bgr = nv12ToBgr(nv12);
+        cv::Mat bgr = nv12ToBgr(buf);
         if (!bgr.isContinuous()) bgr = bgr.clone();
         a_cvt_ms += msSince(c0);
         pipe.submit(bgr.ptr<uint8_t>(0), bgr.cols, bgr.rows);
         ++async_sub;
+        free_chan.push(std::move(buf));  // recycle the NV12 buffer for reuse
         if (async_sub > depth && pipe.next(dets)) {
           async_dets += static_cast<long>(dets.size());
           ++async_recv;
@@ -245,6 +292,7 @@ int main(int argc, char** argv) {
         ++async_recv;
       }
       async_ms = msSince(t0);
+      free_chan.close();  // unblock the producer if it is waiting for a buffer
       producer.join();
       // Full drain above means both workers have exited their loops and their
       // single-writer timing fields are published through the channel mutexes.

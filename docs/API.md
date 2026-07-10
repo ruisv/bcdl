@@ -143,8 +143,8 @@ during the op. `None` off-board / without GDC support. Full semantics + the
 reverse-engineered CUSTOM-grid notes: [docs/GDC.md](GDC.md).
 
 ```python
-# hardware letterbox (pre-generated warp-LUT bin, fixed geometry)
-g = bcdl.GdcLetterbox(bin_path, in_w, in_h, out_w, out_h, pad=114)
+# hardware letterbox (warp LUT generated at construction)
+g = bcdl.GdcLetterbox(in_w, in_h, out_w, out_h, pad=114)
 dst = g.run(src_vpimage)                    # NV12 VpImage -> NV12 VpImage
 
 # hardware dense remap (cv2.remap semantics; LUT generated at runtime)
@@ -157,9 +157,11 @@ dst = g.run(src_vpimage)
   rectification. `grid_step` must divide both output dims. 2448×2048: 6.3 ms
   wall / ~1 ms CPU vs 14.7 ms all-cores `cv2.remap`; matches cv2 to p99 ≤ 2
   grey-levels. `BCDL_GDC_TIMING=1` prints copy/op breakdown.
-- **`GdcLetterbox(bin_path, in_w, in_h, out_w, out_h, pad=114)`** — letterbox
-  on GDC from an offline-generated AFFINE bin; `.info` returns the
-  `LetterboxInfo`.
+- **`GdcLetterbox(in_w, in_h, out_w, out_h, pad=114)`** — letterbox on GDC; the
+  warp LUT is generated at construction (no offline `.bin`). `.info` returns the
+  `LetterboxInfo`. 1920×1080 → 640×640: 0.97 ms wall, ~0.3 ms of it CPU. Geometry
+  matches the CPU letterbox exactly; the resamplers alias differently on
+  high-frequency detail — see [docs/GDC.md](GDC.md).
 
 ---
 
@@ -489,7 +491,7 @@ The whole compressed-video → detections path in C++ (`decode ‖ nv12→bgr �
 ‖ infer+NMS`, four overlapped stages). **Python only pumps bytes** — feed Annex-B
 chunks (e.g. an `ffmpeg -c copy` RTSP/mp4 stream) and read detections; all
 decode/convert/detect threads run in C++ with the GIL released. This is what lets
-a thin Python driver hit the C++ decode-bound ceiling (**~233 FPS @1080p H.264**)
+a thin Python driver hit the C++ decode-bound ceiling (**~441 FPS @1080p H.264**)
 instead of the ~81 FPS a Python-orchestrated decode loop is capped at.
 
 ```python
@@ -506,10 +508,15 @@ while (dets := pipe.next()) is not None:      # blocking drain of last frames
 ```
 
 - **`AsyncVideoDetectionPipeline(engine, config=None, codec=VideoType.H264, depth=4)`**:
-  - `submit(bytes) -> bool` — feed Annex-B bytes; blocks on backpressure.
+  - `submit(bytes) -> bool` — feed **Annex-B** bytes; blocks on backpressure.
+    An MP4 is *not* Annex-B (AVCC length prefixes, SPS/PPS in the `avcC` box), so
+    feeding one yields zero frames. Demux it first — container only, pixels
+    untouched, VPU still the only decoder:
+    `ffmpeg -i in.mp4 -c:v copy -bsf:v h264_mp4toannexb -f h264 -`. See
+    `load_annexb()` in [`examples/video_det_demo.py`](../examples/video_det_demo.py).
   - `next() -> list[Detection] | None` — blocking pop in decode order.
   - `next_nowait() -> list[Detection] | None` — non-blocking pop.
-  - `finish()`, `profile() -> StageProfile` (incl. `decode_ms`).
+  - `finish()`, `profile() -> StageProfile` (incl. `decode_ms`, `cvt_ms`).
 - Video decode handles **H.264 and H.265** (a hierarchical-GOP HEVC stream
   decodes its base temporal layer only — see the VideoDecoder note above).
 - See [`examples/rtsp_det_demo.py`](../examples/rtsp_det_demo.py) — a thin RTSP
@@ -530,7 +537,8 @@ python examples/video_det_demo.py det.hbm in.h264 out.mp4 300 4   # [max_frames]
 ```
 
 Note: decode and encode share the single VPU core, so the full round-trip runs
-slower (~78 FPS @1080p yolo26n) than the decode-only detect path (~234 FPS).
+slower (~104 FPS @1080p yolo26n, encode-bound at 3.56 ms/frame) than the
+decode-only detect path (~441 FPS).
 
 ---
 

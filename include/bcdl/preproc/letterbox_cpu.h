@@ -61,16 +61,47 @@ LetterboxInfo letterboxCpu(VpImage& dst, const VpImage& src, uint8_t padValue = 
 /// expected input range before trusting accuracy.
 void bgrToNv12Cpu(VpImage& dstNv12, const VpImage& srcBgr);
 
-/// CPU NV12 -> BGR (U8C3) conversion — the inverse of bgrToNv12Cpu(), using the
-/// SAME BT.601 FULL-RANGE convention (so an NV12->BGR->NV12 round-trip is
-/// self-consistent). `dst` must be HB_VP_IMAGE_FORMAT_BGR with the same
-/// width/height as the NV12 `src`. The source Y stride (src.raw().stride) and
-/// interleaved-UV stride (src.raw().uvStride) are honored; dst.cleanCache() is
-/// called at the end. Hand-written (no OpenCV dependency), OpenMP over rows.
-///     R = Y + 1.402*(V-128)
-///     G = Y - 0.344*(U-128) - 0.714*(V-128)
-///     B = Y + 1.772*(U-128)
-void nv12ToBgrCpu(VpImage& dstBgr, const VpImage& srcNv12);
+/// CPU NV12 -> BGR (U8C3) conversion. `dst` must be HB_VP_IMAGE_FORMAT_BGR with
+/// the same width/height as the NV12 `src`. Strides are honored;
+/// dst.cleanCache() is called at the end.
+///
+/// `range` says how to read the source's levels, and it changes the pixels:
+///
+///  - `kStudioToFull` (default) — the source carries **studio-swing** NV12, as a
+///    video decoder produces. Y in [16,235] is expanded to [0,255]:
+///        R = 1.164*(Y-16) + 1.596*(V-128)
+///        G = 1.164*(Y-16) - 0.813*(V-128) - 0.391*(U-128)
+///        B = 1.164*(Y-16) + 2.018*(U-128)
+///    This is exactly `cv::cvtColor(COLOR_YUV2BGR_NV12)`, which is used when
+///    OpenCV is available; the hand-written fallback computes the same thing.
+///
+///  - `kAsIs` — the source is already **full-range**, so only the colour matrix
+///    is applied. This is the exact inverse of bgrToNv12Cpu(), i.e. what makes an
+///    NV12->BGR->NV12 round-trip self-consistent:
+///        R = Y + 1.402*(V-128)
+///        G = Y - 0.344*(U-128) - 0.714*(V-128)
+///        B = Y + 1.772*(U-128)
+///
+/// (Before 2026-07-10 the two build configurations disagreed here: the OpenCV
+/// fast path expanded studio swing while the fallback did not, so a build without
+/// OpenCV fed the model different pixels.)
+void nv12ToBgrCpu(VpImage& dstBgr, const VpImage& srcNv12,
+                  YuvRange range = YuvRange::kStudioToFull);
+
+/// NV12 -> NV12 letterbox, with no BGR round-trip: each plane is resampled with
+/// the same bilinear kernel the BGR path uses, then `range` is applied.
+///
+/// Luma is exact: Y is a linear function of R,G,B and bilinear resampling is
+/// linear, so resampling Y equals resampling BGR and recomputing Y. Chroma
+/// differs slightly (the UV plane is resampled at half resolution rather than
+/// upsampled, resampled in BGR, and subsampled again) — measured on a real
+/// stream, detections agree with the BGR path within the model's own noise floor.
+///
+/// `dst` must be NV12 with even dims; borders are padded with `padValue` on luma
+/// and 128 on chroma (i.e. neutral grey). dst.cleanCache()'d, as elsewhere.
+LetterboxInfo letterboxNv12Cpu(VpImage& dstNv12, const VpImage& srcNv12,
+                               uint8_t padValue = 114,
+                               YuvRange range = YuvRange::kStudioToFull);
 
 /// Convenience: letterbox a BGR (U8C3) `src` directly into an NV12 `dst`. Resizes
 /// and pads in BGR via an internal temporary, then bgrToNv12Cpu()'s into `dst`.

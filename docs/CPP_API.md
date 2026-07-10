@@ -445,13 +445,35 @@ The **decoder** is built on the `media_codec` (`hb_mm_mc_*`) streaming API, whic
 for H.265 (a per-AU "decode → immediately get its frame" model times out on
 reorder streams). Two ways to drive it:
 
-- `decode(data, size, out) -> bool` — convenience: feed one chunk, wait briefly
-  for a frame. Good for low-latency H.264; trailing reorder frames need `flush()`.
+- `decode(data, size, out) -> bool` — convenience: feed one access unit, wait
+  briefly for a frame. Good for low-latency H.264; trailing reorder frames need
+  `flush()`.
 - **Decoupled** (feed thread + receive thread, as `AsyncVideoDetectionPipeline`
-  uses): `feed(data, size)` queues bytes; `receive(out, timeout_ms)` drains a
+  uses): `feed(data, size)` queues one AU; `receive(out, timeout_ms)` drains a
   frame in display order (`timeout_ms=0` non-blocking); `feedEndOfStream()` then
-  `flush(out)` drain the reorder tail. Feed mode is `STREAM_SIZE`, so callers may
-  feed arbitrary byte chunks — no NAL/AU splitting needed.
+  `flush(out)` drain the reorder tail.
+
+> **Feed one access unit, not arbitrary bytes.** The decoder runs in
+> `MC_FEEDING_MODE_FRAME_SIZE`: every `feed()`/`decode()` call must carry exactly
+> one picture's worth of start-code-prefixed NALs. (`AsyncVideoDetectionPipeline`
+> does this reassembly for you — its `submit()` takes arbitrary Annex-B bytes.)
+> The old `STREAM_SIZE` mode accepted arbitrary chunks but corrupts the heap from
+> inside the codec.
+
+> **Annex-B elementary stream only — an MP4 is not one.** MP4/MOV store NALs in
+> AVCC form (4-byte length prefixes, no start codes) with SPS/PPS hidden in the
+> `avcC` box, so the AU splitter finds nothing and the decoder silently produces
+> zero frames. Demux first, without touching the pixels:
+> `ffmpeg -i in.mp4 -c:v copy -bsf:v h264_mp4toannexb -f h264 -`
+> (`hevc_mp4toannexb` / `-f hevc` for H.265). `examples/video_det_demo.py`'s
+> `load_annexb()` does exactly this; the VPU stays the only decoder.
+
+> **Destroying a decoder mid-stream is safe, but only because the destructor
+> drains it.** `hb_mm_mc_stop()` blocks until the codec's `vdec_render` component
+> has emptied its output port, and `hb_mm_mc_flush()` blocks the same way — only
+> the application can empty it, so a naive `stop()` on a decoder still holding
+> decoded frames hangs forever. `~VideoDecoder` hands every pending output buffer
+> back first. Anything that drives `hb_mm_mc_*` directly must do the same.
 
 > **H.265 caveat (hierarchical GOP):** a stream with temporal sub-layers (e.g. a
 > Hikvision cam with SVC / "H.265+"/smart-codec on) decodes **base temporal layer
@@ -514,7 +536,8 @@ pipelines.
 
 `StageProfile` (shared with `AsyncDetectionPipeline`) breaks the per-frame cost
 into `preproc` (letterbox BGR→NV12, CPU), `infer` (feed + BPU submit/wait), and
-`postproc` (decode + NMS, CPU). In the **sync** pipeline the three run
+`postproc` (decode + NMS, CPU); the video pipelines also fill `decode_ms` and
+`cvt_ms`. In the **sync** pipeline the three run
 back-to-back so their sum is the `process()` cost; in the **async** pipeline they
 are per-stage *service* times measured on separate threads, so their sum exceeds
 wall time and the **slowest** stage bounds throughput.
@@ -574,13 +597,21 @@ while (p.next(dets)) { /* drain the last in-flight frames */ }
   segmented internally). Blocks while full; `false` after `finish()`.
 - `next(out) -> bool` — blocking pop in decode order; `false` once finished+drained.
 - `tryNext(out) -> bool` — non-blocking pop; drain while feeding.
-- `profile() -> StageProfile` — `decode_ms` (VPU decode) + preproc/infer/postproc.
+- `profile() -> StageProfile` — `decode_ms` (VPU decode) and `cvt_ms` (NV12→BGR)
+  on top of preproc/infer/postproc. All five are per-thread *service* times, so
+  the **slowest** bounds throughput.
 
-Measured: **yolo26n 1080p H.264 → ~233 FPS** (decode-bound 4.3 ms/f), same ceiling
-whether driven from C++ or a thin Python caller. Video decode handles **H.264 and
+Measured: **yolo26n 1080p H.264 → ~441 FPS**, decode-bound (`decode 0.29 |
+preproc 1.32 | infer 1.47 | postproc 0.65` ms/f). The pipeline letterboxes the
+decoded NV12 straight into the model input on the GDC hardware engine — no BGR
+round-trip; `cvt_ms` stays 0. H.265 runs 300/300 frames at 439–451 FPS. Video
+decode handles **H.264 and
 H.265** (a hierarchical-GOP HEVC stream decodes base temporal layer only).
-`nv12ToBgrCpu()` (preproc/letterbox_cpu.h) does the colour convert (OpenCV SIMD
-when available, hand-written BT.601 fallback).
+`nv12ToBgrCpu()` (preproc/letterbox_cpu.h) is still there for callers that want
+BGR out of a decoded frame. It takes a `YuvRange`: `kStudioToFull` (default —
+what a video decoder produces, and what `cv::cvtColor(COLOR_YUV2BGR_NV12)` does)
+or `kAsIs` (full-range in, the bit-exact inverse of `bgrToNv12Cpu()`). Both the
+OpenCV SIMD path and the hand-written fallback implement each range identically.
 
 ## TrackingPipeline
 

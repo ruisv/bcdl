@@ -6,6 +6,74 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07
+
+Hardening of the video path, and NV12-native preprocessing. The compressed-video
+pipeline is 1.8x faster and no longer detours through BGR.
+
+### Changed (breaking)
+- **`GdcLetterbox` builds its warp LUT at construction** — the `bin_path`
+  argument is gone, along with the need for an offline `.bin`. The affine
+  letterbox is expressed as a CUSTOM sampling grid and generated at runtime.
+- **`VideoDecoder::feed()` / `decode()` take exactly one access unit.** The
+  decoder now runs in `MC_FEEDING_MODE_FRAME_SIZE`; feeding arbitrary byte chunks
+  is no longer supported. (`AsyncVideoDetectionPipeline::submit()` still takes
+  arbitrary Annex-B bytes and does the reassembly for you.)
+- **`StageProfile` gained `cvt_ms`**, which `totalMs()` now includes.
+
+### Added
+- **`AsyncDetectionPipeline::submitNv12()`** — letterboxes a decoded NV12 frame
+  straight into a model-input slot, on the GDC hardware engine when present and
+  on the CPU otherwise. No BGR round-trip and no copy of the frame. Split into
+  `acquireSlot()` / `letterboxIntoSlot()` / `commitSlot()` for callers that must
+  not hold a recycled buffer while waiting for pipeline capacity.
+- **`letterboxNv12Cpu()`** — NV12→NV12 letterbox with no colour conversion; the
+  fallback when GDC is unavailable. `BCDL_NO_GDC=1` forces it, for A/B.
+- **`YuvRange`** (`preproc/geometry.h`) — makes the studio→full-range expansion
+  explicit. Video carries studio-swing NV12 (Y in [16,235]) while models are
+  calibrated on full-range pixels; the old BGR round-trip did this conversion by
+  accident, as a side effect of `cv::cvtColor`.
+- `StageProfile::cvt_ms` / `cvtPerFrame()` (Python: `cvt_ms`, `cvt_per_frame`).
+
+### Fixed
+- **VPU `INTERRUPT TIMEOUT` hang.** Feeding faster than dequeuing fills the
+  decoder's frame buffers and the next hardware decode stalls. Every decode path
+  now feeds one AU, drains every ready frame, then flushes the reorder tail.
+- **Heap corruption / random `SIGSEGV`.** The decoder ran in
+  `MC_FEEDING_MODE_STREAM_SIZE`, whose bitstream-ring update path corrupts the
+  glibc heap from inside the codec. Single-threaded decode alone crashed 6 runs
+  in 20, with no BPU in the process; `FRAME_SIZE` is clean and also faster (pure
+  decode 452 vs 281 FPS) and no longer drops a frame.
+- **H.265 stalled at 16 FPS and lost frames.** A blocking output dequeue holds
+  the codec's internal lock, so a feed thread racing a receive thread stalls
+  whenever the decoder has no frame ready. One thread now owns the codec context.
+- **Deadlock under backpressure.** The caller-facing results queue was bounded,
+  so a full queue blocked the infer stage, which stopped slots recycling, which
+  stalled every upstream stage — while the caller, blocked inside `submit()`, was
+  the only one who could drain it.
+- **`~VideoDecoder` hung** when the decoder still held decoded frames:
+  `hb_mm_mc_stop()` waits for the codec to empty its output port, and only the
+  application can empty it. The destructor now returns every pending buffer first.
+- **One `Component vdec_render isn't ready!` error line per decoded frame.** A
+  dequeue that finds no frame prints it (to stdout), and a drain-to-empty cadence
+  ends every access unit with such a call. `recv()` now asks
+  `hb_mm_mc_get_status()` first, which is silent.
+- **`AsyncVideoDetectionPipeline` dropped the last frame** at end of stream: the
+  trailing buffer can hold two access units, and under `FRAME_SIZE` only the
+  first of them decodes.
+- **Per-frame device allocation** in the video pipeline (334 allocations per 319
+  frames → 22, all warm-up).
+- **`nv12ToBgrCpu()`'s two build configurations produced different pixels** — the
+  OpenCV fast path expanded studio swing, the hand-written fallback did not. It
+  now takes a `YuvRange` and both branches implement each range.
+
+### Performance
+- `AsyncVideoDetectionPipeline`, 1080p H.264, yolo26n: **249 → 441 FPS**
+  (1385/1385 frames), decode-bound. H.265: **439–451 FPS** (300/300 frames).
+- Pure VPU decode: **452 FPS** (H.264) / **481 FPS** (H.265).
+- GDC hardware letterbox, 1920×1080 → 640×640: 0.97 ms/frame wall, ~0.3 ms of it
+  CPU, against 4.71 ms of pure CPU for the BGR chain it replaces.
+
 ## [0.2.0] — 2026-07
 
 ### Added

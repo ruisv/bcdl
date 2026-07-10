@@ -57,6 +57,38 @@ class AsyncDetectionPipeline {
   /// pipeline has been finish()ed (the frame is not accepted).
   bool submit(const uint8_t* bgr, int width, int height);
 
+  /// NV12-native submit, for callers whose source is already NV12 (a video
+  /// decoder). Letterboxes `nv12` straight into a free model-input slot — on the
+  /// GDC hardware engine when it is available, else on the CPU — and hands the
+  /// slot to the infer stage. No BGR round-trip and no copy of the frame: the
+  /// caller keeps ownership of `nv12` and may recycle it as soon as this returns.
+  ///
+  /// The letterbox runs on the CALLING thread (it replaces the preproc stage, so
+  /// that stage is idle on this path). Blocks while all slots are in flight
+  /// (backpressure). Returns false once finish()ed. `range` must match the
+  /// model's calibration — see YuvRange.
+  bool submitNv12(const VpImage& nv12, YuvRange range = YuvRange::kStudioToFull);
+
+  /// The three steps submitNv12() is made of, for a caller that must not hold its
+  /// frame while waiting for pipeline capacity.
+  ///
+  /// A stage that owns a recycled frame buffer and blocks inside submitNv12()
+  /// keeps that buffer out of circulation, which can starve its own producer and
+  /// deadlock the ring. Such a caller waits for a slot FIRST (holding nothing),
+  /// then takes a frame, letterboxes it, releases the frame, and commits.
+  ///
+  ///   int slot = acquireSlot();                    // blocks; -1 once finished
+  ///   auto lb  = letterboxIntoSlot(slot, nv12);    // frame no longer needed after
+  ///   commitSlot(slot, lb);                        // hand it to the infer stage
+  ///
+  /// Every acquireSlot() >= 0 must be paired with exactly one commitSlot() or
+  /// releaseSlot().
+  int acquireSlot();
+  LetterboxInfo letterboxIntoSlot(int slot, const VpImage& nv12,
+                                  YuvRange range = YuvRange::kStudioToFull);
+  bool commitSlot(int slot, const LetterboxInfo& lb);
+  void releaseSlot(int slot);
+
   /// Pop the next result, in submission order. Blocks until one is ready.
   /// Returns false once the pipeline is finished AND fully drained.
   bool next(std::vector<Detection>& out);

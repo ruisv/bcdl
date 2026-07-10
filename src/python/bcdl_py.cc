@@ -384,11 +384,10 @@ NB_MODULE(bcdl_py, m) {
 #ifdef BCDL_HAVE_GDC
   // --- GDC hardware letterbox (VPS /dev/gdc, bypasses the offline vDSP) -------
   nb::class_<bcdl::GdcLetterbox>(m, "GdcLetterbox")
-      .def(nb::init<const std::string&, int, int, int, int, uint8_t>(), "bin_path"_a,
-           "in_w"_a, "in_h"_a, "out_w"_a, "out_h"_a, "pad"_a = 114,
-           "Persistent GDC vnode + pre-generated warp-LUT bin for a fixed "
-           "(in_w,in_h)->(out_w,out_h) letterbox. Generate the bin offline (SDK "
-           "generate_bin) for the SAME geometry.")
+      .def(nb::init<int, int, int, int, uint8_t>(), "in_w"_a, "in_h"_a, "out_w"_a,
+           "out_h"_a, "pad"_a = 114,
+           "Persistent GDC vnode for a fixed (in_w,in_h)->(out_w,out_h) hardware "
+           "letterbox. The warp LUT is generated at construction.")
       .def(
           "run",
           [](bcdl::GdcLetterbox& g, const bcdl::VpImage& src) {
@@ -491,7 +490,7 @@ NB_MODULE(bcdl_py, m) {
             return std::nullopt;
           },
           "data"_a,
-          "Feed one compressed chunk; returns an NV12 VpImage when a frame is "
+          "Feed one access unit; returns an NV12 VpImage when a frame is "
           "ready, else None (the decoder is still buffering reference frames).")
       .def(
           "feed",
@@ -1288,12 +1287,14 @@ NB_MODULE(bcdl_py, m) {
   // stage — not their sum — bounds throughput.
   nb::class_<bcdl::StageProfile>(m, "StageProfile")
       .def_ro("decode_ms", &bcdl::StageProfile::decode_ms)
+      .def_ro("cvt_ms", &bcdl::StageProfile::cvt_ms)
       .def_ro("preproc_ms", &bcdl::StageProfile::preproc_ms)
       .def_ro("infer_ms", &bcdl::StageProfile::infer_ms)
       .def_ro("postproc_ms", &bcdl::StageProfile::postproc_ms)
       .def_ro("frames", &bcdl::StageProfile::frames)
       .def("total_ms", &bcdl::StageProfile::totalMs)
       .def("decode_per_frame", &bcdl::StageProfile::decodePerFrame)
+      .def("cvt_per_frame", &bcdl::StageProfile::cvtPerFrame)
       .def("preproc_per_frame", &bcdl::StageProfile::preprocPerFrame)
       .def("infer_per_frame", &bcdl::StageProfile::inferPerFrame)
       .def("postproc_per_frame", &bcdl::StageProfile::postprocPerFrame);

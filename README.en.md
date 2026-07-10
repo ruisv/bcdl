@@ -297,6 +297,14 @@ overlap **334 FPS** (1.55×). Hardware **JPEG** decode (JPU) is **≈3.6–5.3×
 faster than `cv2`/libjpeg on the sample images and offloads the CPU (zero-copy
 NV12→BPU).
 
+Compressed video, end to end (`AsyncVideoDetectionPipeline`, yolo26n @1080p):
+**441 FPS** on H.264 and **439–451 FPS** on H.265, bounded by the VPU decode. The
+decoded NV12 is letterboxed straight into the model input on the GDC hardware
+engine — no BGR round-trip (0.97 ms/frame, only ~0.3 ms of it CPU). Pure VPU
+decode runs at 452 / 481 FPS. The input must be an **Annex-B elementary stream**;
+demux an MP4 first with `ffmpeg -c:v copy -bsf:v h264_mp4toannexb` (container
+only, pixels untouched).
+
 Reproduce on the board:
 
 ```bash

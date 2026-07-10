@@ -137,24 +137,18 @@ int main(int argc, char** argv) {
     long total_dets = 0;
     double dec_ms = 0, det_ms = 0, cvt_ms = 0, wall_ms = 0;
     bcdl::VpImage nv12;
-    for (const auto& [b, e] : aus) {
-      if (max_frames && frames >= max_frames) break;
 
-      auto t0 = std::chrono::steady_clock::now();
-      bool got = dec.decode(stream.data() + b, e - b, nv12);
+    // Detect on one decoded frame, and (optionally) write the annotated JPEG.
+    auto handleFrame = [&](bcdl::VpImage& f, std::chrono::steady_clock::time_point t0) {
       auto t1 = std::chrono::steady_clock::now();
-      if (!got) continue;
-      dec_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-      cv::Mat bgr = nv12ToBgr(nv12);
+      cv::Mat bgr = nv12ToBgr(f);
       if (!bgr.isContinuous()) bgr = bgr.clone();
       auto t1b = std::chrono::steady_clock::now();
       cvt_ms += std::chrono::duration<double, std::milli>(t1b - t1).count();
 
-      auto t2 = std::chrono::steady_clock::now();
       auto dets = pipe.process(bgr.ptr<uint8_t>(0), bgr.cols, bgr.rows);
       auto t3 = std::chrono::steady_clock::now();
-      det_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
+      det_ms += std::chrono::duration<double, std::milli>(t3 - t1b).count();
       wall_ms += std::chrono::duration<double, std::milli>(t3 - t0).count();
 
       ++frames;
@@ -174,6 +168,38 @@ int main(int argc, char** argv) {
         std::snprintf(path, sizeof(path), "%s/det_%04d.jpg", out_dir, frames);
         cv::imwrite(path, bgr);
       }
+    };
+
+    // Feed one AU, then drain EVERY frame the decoder has ready before feeding the
+    // next. The VPU decodes on its own threads; feeding faster than we dequeue
+    // fills its frame buffers and the next hardware decode stalls (INTERRUPT
+    // TIMEOUT). Reorder streams (B-frames, HEVC) also emit frames out of step with
+    // the AUs, so the tail only comes out of flush() at end-of-stream.
+    for (const auto& [b, e] : aus) {
+      if (max_frames && frames >= max_frames) break;
+      auto t0 = std::chrono::steady_clock::now();
+      while (!dec.feed(stream.data() + b, e - b)) {  // input queue full: drain, retry
+        if (!dec.receive(nv12, 5)) break;
+        dec_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        handleFrame(nv12, t0);
+        t0 = std::chrono::steady_clock::now();
+      }
+      while (dec.receive(nv12, 0)) {  // drain all frames ready right now
+        dec_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        handleFrame(nv12, t0);
+        if (max_frames && frames >= max_frames) break;
+        t0 = std::chrono::steady_clock::now();
+      }
+      if (max_frames && frames >= max_frames) break;
+    }
+    while (frames < max_frames || !max_frames) {  // reorder tail at EOS
+      auto t0 = std::chrono::steady_clock::now();
+      if (!dec.flush(nv12)) break;
+      dec_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      handleFrame(nv12, t0);
     }
 
     if (frames == 0) {

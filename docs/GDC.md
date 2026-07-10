@@ -6,12 +6,46 @@ config, and produces the warped NV12 with the CPU idle. BCDL wraps it twice:
 
 | class | transform | LUT source | use |
 |---|---|---|---|
-| `bcdl::GdcLetterbox` | AFFINE (fixed letterbox) | offline `.bin` file | model-input letterbox |
+| `bcdl::GdcLetterbox` | affine letterbox (as a CUSTOM grid) | **generated at runtime** | model-input letterbox |
 | `bcdl::GdcRemap` | CUSTOM grid (arbitrary fixed warp) | **generated at runtime** | stereo rectification / dense remap |
+
+Both build the LUT at construction via `src/preproc/gdc_bin.{h,cc}` (which drives
+`libgdcbin`'s generator directly — `hbn_gen_gdc_cfg` never forwards CUSTOM grid
+points). **Header order landmine:** `gdc_cfg.h` must be included before
+`gdc_bin_cfg.h`, or `gdc_settings_t` is never declared.
 
 Both hold a persistent FEEDBACK-mode vnode + device input buffer; `run(src,
 dst)` costs two NV12 copies around the hardware op. `BCDL_GDC_TIMING=1` prints
 the per-run breakdown.
+
+## GdcLetterbox vs the CPU letterbox: same geometry, different aliasing
+
+`GdcLetterbox` and `letterboxNv12Cpu()` are **not bit-identical**, measured on
+S100P (1920×1080 → 640×640, both with `YuvRange::kStudioToFull`):
+
+- **Geometry is identical.** On a linear ramp — which any bilinear kernel
+  reproduces exactly — GDC matches the CPU path on 99.69% of pixels (max 1 LSB)
+  and matches the analytic value to 1 LSB. Scale, pad offset and the pixel-centre
+  convention all agree. Pad borders are byte-identical.
+- **High-frequency response differs.** On a single-pixel impulse at 3× downscale,
+  the CPU's 2×2 bilinear misses it entirely while GDC retains a trace: both alias,
+  differently. On real video: Y 80.8% of pixels identical, mean |Δ| 0.65, p99 13,
+  max 135 (texture edges); UV mean |Δ| 0.32.
+- **End-to-end this is below the model's noise floor.** Full-stream detections:
+  7791 (GDC) / 7718 (CPU NV12) / 7770 (the old BGR chain) — while perturbing the
+  model input by a single grey level already moves 6.5% of detections.
+
+Neither is strictly correct for a 3× downscale (that would be `INTER_AREA`), but
+the CPU path is closer to the `cv2.resize(INTER_LINEAR)` the model was calibrated
+with. `BCDL_NO_GDC=1` switches the pipeline to the CPU path for A/B.
+
+**Detection-preproc geometry (1920×1080 NV12 → 640×640 letterbox), S100P:**
+`copy-in 0.23 + gdc-op 0.69 (CPU idle) + copy-out 0.05 = 0.97 ms/frame`, of which
+only 0.28 ms is CPU — against **4.71 ms/frame of pure CPU** for the equivalent
+`nv12ToBgrCpu` + `letterboxCpu` + `bgrToNv12Cpu` chain the video pipeline uses
+today; `AsyncVideoDetectionPipeline` uses the GDC path. (Measured via `GdcRemap`
+with an affine-equivalent dense map, since `GdcLetterbox` still needs an offline
+`.bin`; the hardware op is the same.)
 
 ## GdcRemap
 

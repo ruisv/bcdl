@@ -22,14 +22,16 @@ namespace bcdl {
 /// buffers, not bcdl SysMem), and the result is copied into `dst`.
 class GdcLetterbox {
  public:
-  /// Open the GDC vnode with a pre-generated warp-LUT `bin_path` for the fixed
-  /// (in_w,in_h)->(out_w,out_h) letterbox. Generate the bin offline for the SAME
-  /// geometry via the SDK's generate_bin tool (aspect-preserving Affine placing
-  /// the full ROI at the centered window computeLetterbox() yields). Throws
-  /// bcdl::Error / std::runtime_error on any hobot/GDC failure. (v2 TODO: generate
-  /// the bin at runtime so the path arg goes away.)
-  GdcLetterbox(const std::string& bin_path, int in_w, int in_h, int out_w, int out_h,
-               uint8_t pad = 114);
+  /// Open the GDC vnode for the fixed (in_w,in_h)->(out_w,out_h) letterbox. The
+  /// warp LUT is generated at construction — no offline `.bin` file. The geometry
+  /// is exactly computeLetterbox()'s (uniform scale, centered, even-aligned), so
+  /// the returned LetterboxInfo drives the same un-letterbox inverse map as the
+  /// CPU path. Throws bcdl::Error / std::runtime_error on any hobot/GDC failure.
+  ///
+  /// `range` must match what the model was calibrated on — see YuvRange. `pad` is
+  /// a full-range luma value written after the conversion, so 114 stays 114.
+  GdcLetterbox(int in_w, int in_h, int out_w, int out_h, uint8_t pad = 114,
+               YuvRange range = YuvRange::kAsIs);
   ~GdcLetterbox();
 
   GdcLetterbox(const GdcLetterbox&) = delete;

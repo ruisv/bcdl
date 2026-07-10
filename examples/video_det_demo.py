@@ -193,14 +193,10 @@ def main(argv):
 
     t_wall = time.perf_counter()
     made = 0
-    for b, e in aus:
-        if max_frames and made >= max_frames:
-            break
-        t = time.perf_counter()
-        vp = dec.decode(bytes(stream[b:e]))
-        dec_ms += (time.perf_counter() - t) * 1e3
-        if vp is None:
-            continue
+
+    def submit_frame(vp):
+        """Convert one decoded NV12 frame to BGR and push it into the detector."""
+        nonlocal made, cvt_ms, frames
         t = time.perf_counter()
         bgr = nv12_to_bgr(vp.to_numpy(), vp.width, vp.height)
         cvt_ms += (time.perf_counter() - t) * 1e3
@@ -212,6 +208,39 @@ def main(argv):
             if dets is not None:
                 consume(dets)
                 frames += 1
+
+    # Feed one AU, then drain every frame the decoder already has. Feeding faster
+    # than we dequeue fills the VPU's frame buffers and the next hardware decode
+    # stalls (INTERRUPT TIMEOUT); reorder streams also emit frames out of step with
+    # the AUs, so the tail only appears via flush() at end-of-stream.
+    for b, e in aus:
+        if max_frames and made >= max_frames:
+            break
+        t = time.perf_counter()
+        while not dec.feed(bytes(stream[b:e])):     # input queue full: drain, retry
+            vp = dec.receive(5)
+            dec_ms += (time.perf_counter() - t) * 1e3
+            if vp is None:
+                break
+            submit_frame(vp)
+            t = time.perf_counter()
+        while (vp := dec.receive(0)) is not None:   # drain all frames ready now
+            dec_ms += (time.perf_counter() - t) * 1e3
+            submit_frame(vp)
+            if max_frames and made >= max_frames:
+                break
+            t = time.perf_counter()
+        if max_frames and made >= max_frames:
+            break
+
+    while not max_frames or made < max_frames:      # reorder tail at EOS
+        t = time.perf_counter()
+        vp = dec.flush()
+        dec_ms += (time.perf_counter() - t) * 1e3
+        if vp is None:
+            break
+        submit_frame(vp)
+
     pipe.finish()
     while (dets := pipe.next()) is not None:
         consume(dets)

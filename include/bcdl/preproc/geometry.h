@@ -14,6 +14,18 @@ namespace bcdl {
 /// edge. This is the standard YOLO preprocessing geometry — the inverse map
 /// below is what post-processing uses to project boxes from model-input
 /// coordinates back to original-image pixels.
+/// What to do with a decoder's YUV levels when letterboxing NV12 directly.
+///
+/// Video carries **studio-swing** NV12 (Y in [16,235], chroma in [16,240]); models
+/// are calibrated on full-range pixels. The BGR round-trip expands the range
+/// implicitly — `cv::cvtColor(COLOR_YUV2BGR_NV12)` assumes studio swing, and the
+/// BGR→NV12 step writes full range back — so an NV12-native letterbox must do it
+/// explicitly or the BPU sees ~14% less contrast than calibration.
+enum class YuvRange {
+  kAsIs,          ///< keep the source levels (correct for full-range sources)
+  kStudioToFull,  ///< Y' = 1.164*(Y-16), UV' = 128 + 1.138*(UV-128), clamped
+};
+
 struct LetterboxInfo {
   float scale = 1.0f;  ///< srcPix * scale -> dstPix (same on x and y)
   float padX = 0.0f;   ///< left padding added in the canvas (model coords)

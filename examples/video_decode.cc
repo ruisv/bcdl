@@ -118,22 +118,18 @@ int main(int argc, char** argv) {
 
     int decoded = 0, saved = 0, w0 = 0, h0 = 0;
     bcdl::VpImage frame;
-    auto t0 = std::chrono::steady_clock::now();
-    for (const auto& [b, e] : aus) {
-      if (max_frames && decoded >= max_frames) break;
-      if (!dec.decode(stream.data() + b, e - b, frame)) continue;  // buffered, no frame yet
+
+    // Handle one decoded frame (count + optionally dump a few JPEGs).
+    auto handleFrame = [&](bcdl::VpImage& f) {
       ++decoded;
       if (decoded == 1) {
-        w0 = frame.width();
-        h0 = frame.height();
+        w0 = f.width();
+        h0 = f.height();
         std::printf("first decoded frame: %dx%d NV12\n", w0, h0);
       }
-
-      // Dump a few frames to JPEG to prove the pixels are real. JPU needs
-      // width%16==0 and height%8==0; skip cleanly if the dims don't qualify.
-      if (out_dir && saved < 3 && (frame.width() % 16) == 0 && (frame.height() % 8) == 0) {
-        bcdl::JpegEncoder jenc(frame.width(), frame.height(), 90, HB_VP_IMAGE_FORMAT_NV12);
-        auto jpg = jenc.encode(frame);
+      if (out_dir && saved < 3 && (f.width() % 16) == 0 && (f.height() % 8) == 0) {
+        bcdl::JpegEncoder jenc(f.width(), f.height(), 90, HB_VP_IMAGE_FORMAT_NV12);
+        auto jpg = jenc.encode(f);
         char path[1024];
         std::snprintf(path, sizeof(path), "%s/frame_%03d.jpg", out_dir, decoded);
         if (FILE* fp = std::fopen(path, "wb")) {
@@ -143,7 +139,25 @@ int main(int argc, char** argv) {
           ++saved;
         }
       }
+    };
+
+    auto t0 = std::chrono::steady_clock::now();
+    // Feed each AU, then drain EVERY frame the decoder currently has ready. The
+    // VPU decodes on its own threads; if we feed faster than we dequeue, its
+    // frame buffers fill and the next hardware decode stalls (INTERRUPT TIMEOUT).
+    // So the correct streaming cadence (matching the vendor sample_codec, which
+    // runs a dedicated continuous output-drain thread) is: never leave a ready
+    // frame sitting in the decoder — drain to empty after every feed.
+    for (const auto& [b, e] : aus) {
+      if (max_frames && decoded >= max_frames) break;
+      // If the input queue is momentarily full, drain ready frames and retry.
+      while (!dec.feed(stream.data() + b, e - b)) {
+        if (!dec.receive(frame, 5)) break;
+        handleFrame(frame);
+      }
+      while (dec.receive(frame, 0)) handleFrame(frame);  // drain all ready now
     }
+    while (dec.flush(frame)) handleFrame(frame);  // drain the reorder tail at EOS
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 

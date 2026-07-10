@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(bcdl LANGUAGES CXX VERSION 0.2.0)
+project(bcdl LANGUAGES CXX VERSION 0.3.0)
 
 # --- Guard: this project only builds on the aarch64 RDK board ----------------
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
@@ -139,7 +139,8 @@ find_library(HB_MEM_LIB  NAMES hbmem PATHS /usr/hobot/lib)
 find_library(HB_GDCBIN_LIB NAMES gdcbin PATHS /usr/hobot/lib)
 if(HOBOT_GDC_INCLUDE_DIR AND HB_VPF_LIB AND HB_VIO_LIB AND HB_CAM_LIB AND HB_MEM_LIB)
   set(BCDL_HAVE_GDC ON)
-  target_sources(bcdl PRIVATE src/preproc/gdc_letterbox.cc src/preproc/gdc_remap.cc)
+  target_sources(bcdl PRIVATE src/preproc/gdc_bin.cc src/preproc/gdc_letterbox.cc
+                          src/preproc/gdc_remap.cc)
   target_include_directories(bcdl PRIVATE ${HOBOT_GDC_INCLUDE_DIR})
   target_link_libraries(bcdl PUBLIC ${HB_VPF_LIB} ${HB_VIO_LIB} ${HB_CAM_LIB} ${HB_MEM_LIB})
   if(HB_GDCBIN_LIB)   # GdcRemap's runtime warp-LUT generation (hbn_gen_gdc_cfg)
