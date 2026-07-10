@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 import enum
-from typing import Annotated
+from typing import Annotated, overload
 
 import numpy
 from numpy.typing import NDArray
@@ -256,6 +256,25 @@ class YoloLtrbDetector:
     @property
     def config(self) -> YoloLtrbConfig: ...
 
+class LabelMap:
+    def __init__(self) -> None: ...
+
+    @staticmethod
+    def from_file(path: str) -> LabelMap: ...
+
+    @staticmethod
+    def from_list(names: Sequence[str]) -> LabelMap: ...
+
+    @property
+    def names(self) -> list[str]: ...
+
+    @names.setter
+    def names(self, arg: Sequence[str], /) -> None: ...
+
+    def __len__(self) -> int: ...
+
+    def name(self, class_id: int) -> str: ...
+
 class ImageFormat(enum.Enum):
     Y = 0
 
@@ -320,6 +339,45 @@ class JpegDecoder:
 
     @property
     def out_format(self) -> ImageFormat: ...
+
+class GdcLetterbox:
+    def __init__(self, in_w: int, in_h: int, out_w: int, out_h: int, pad: int = 114) -> None:
+        """
+        Persistent GDC vnode for a fixed (in_w,in_h)->(out_w,out_h) hardware letterbox. The warp LUT is generated at construction.
+        """
+
+    def run(self, src: VpImage) -> VpImage:
+        """GDC-letterbox an NV12 VpImage into a new out_w x out_h NV12 VpImage."""
+
+    @property
+    def info(self) -> LetterboxInfo: ...
+
+    @property
+    def output_width(self) -> int: ...
+
+    @property
+    def output_height(self) -> int: ...
+
+class GdcRemap:
+    def __init__(self, map_x: Annotated[NDArray[numpy.float32], dict(order='C')], map_y: Annotated[NDArray[numpy.float32], dict(order='C')], in_w: int, in_h: int, grid_step: int = 16) -> None:
+        """
+        Persistent GDC vnode for a FIXED dense warp with cv2.remap semantics (out(x,y) = in(map_x[y,x], map_y[y,x])). The (out_h, out_w) float32 maps are sampled every grid_step px into a CUSTOM warp grid whose LUT is generated at construction (hbn_gen_gdc_cfg) — no bin file.
+        """
+
+    def run(self, src: VpImage) -> VpImage:
+        """Warp an NV12 VpImage into a new out_w x out_h NV12 VpImage."""
+
+    @property
+    def input_width(self) -> int: ...
+
+    @property
+    def input_height(self) -> int: ...
+
+    @property
+    def output_width(self) -> int: ...
+
+    @property
+    def output_height(self) -> int: ...
 
 class VideoType(enum.Enum):
     H264 = 0
@@ -424,10 +482,14 @@ class VideoDecoder:
         """Queue one access unit for decoding (does not wait for output)."""
 
     def receive(self, timeout_ms: int = 0) -> VpImage | None:
-        """Drain one decoded frame in display order (timeout_ms=0 is non-blocking); None on timeout / no frame."""
+        """
+        Drain one decoded frame in display order (timeout_ms=0 is non-blocking); None on timeout / no frame.
+        """
 
     def flush(self) -> VpImage | None:
-        """After the last feed(): drain the reorder tail; call until it returns None."""
+        """
+        After the last feed(): drain the reorder tail; call until it returns None.
+        """
 
     @property
     def type(self) -> VideoType: ...
@@ -505,6 +567,146 @@ class DepthEstimator:
 
     @property
     def config(self) -> DepthConfig: ...
+
+class StereoFit(enum.Enum):
+    Resize = 0
+
+    Crop = 1
+
+class StereoConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def input_w(self) -> int: ...
+
+    @input_w.setter
+    def input_w(self, arg: int, /) -> None: ...
+
+    @property
+    def input_h(self) -> int: ...
+
+    @input_h.setter
+    def input_h(self, arg: int, /) -> None: ...
+
+    @property
+    def fit(self) -> StereoFit: ...
+
+    @fit.setter
+    def fit(self, arg: StereoFit, /) -> None: ...
+
+    @property
+    def to_rgb(self) -> bool: ...
+
+    @to_rgb.setter
+    def to_rgb(self, arg: bool, /) -> None: ...
+
+    @property
+    def left_index(self) -> int: ...
+
+    @left_index.setter
+    def left_index(self, arg: int, /) -> None: ...
+
+    @property
+    def right_index(self) -> int: ...
+
+    @right_index.setter
+    def right_index(self, arg: int, /) -> None: ...
+
+    @property
+    def output_index(self) -> int: ...
+
+    @output_index.setter
+    def output_index(self, arg: int, /) -> None: ...
+
+    @property
+    def fx(self) -> float: ...
+
+    @fx.setter
+    def fx(self, arg: float, /) -> None: ...
+
+    @property
+    def baseline(self) -> float: ...
+
+    @baseline.setter
+    def baseline(self, arg: float, /) -> None: ...
+
+    @property
+    def valid_mask(self) -> bool: ...
+
+    @valid_mask.setter
+    def valid_mask(self, arg: bool, /) -> None: ...
+
+    @property
+    def disp_min(self) -> float: ...
+
+    @disp_min.setter
+    def disp_min(self, arg: float, /) -> None: ...
+
+    @property
+    def max_disp(self) -> float: ...
+
+    @max_disp.setter
+    def max_disp(self, arg: float, /) -> None: ...
+
+    @property
+    def left_margin(self) -> int: ...
+
+    @left_margin.setter
+    def left_margin(self, arg: int, /) -> None: ...
+
+    @property
+    def lr_check(self) -> bool: ...
+
+    @lr_check.setter
+    def lr_check(self, arg: bool, /) -> None: ...
+
+    @property
+    def lr_thresh(self) -> float: ...
+
+    @lr_thresh.setter
+    def lr_thresh(self, arg: float, /) -> None: ...
+
+class StereoResult:
+    @property
+    def disparity(self) -> DepthMap: ...
+
+    @property
+    def depth(self) -> NDArray[numpy.float32]:
+        """Metric depth (m) as float32 (H, W); shape (0,) when fx/baseline unset."""
+
+    @property
+    def valid(self) -> NDArray[numpy.uint8]:
+        """Validity mask uint8 (H, W), 1=keep; shape (0,) when valid_mask off."""
+
+def pack_stereo_input(bgr: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)], out_h: int, out_w: int, fit: StereoFit = StereoFit.Resize, to_rgb: bool = True) -> NDArray[numpy.float32]:
+    """
+    Fit (resize/crop) + channel-swap a BGR frame to a planar (3,H,W) float32.
+    """
+
+def disparity_to_depth(disparity: DepthMap, fx: float, baseline: float) -> NDArray[numpy.float32]:
+    """
+    Convert a disparity DepthMap to metric depth (m): z = fx*baseline/disp.
+    """
+
+def stereo_valid_mask(disparity: DepthMap, disp_min: float = 0.0, max_disp: float = 192.0, left_margin: int = 0, disp_right: DepthMap | None = None, lr_thresh: float = 1.5) -> NDArray[numpy.uint8]:
+    """
+    Geometry validity mask uint8 (H, W): disparity range + left-border + optional left-right consistency (pass disp_right).
+    """
+
+class StereoPipeline:
+    def __init__(self, engine: Engine, config: StereoConfig = ...) -> None: ...
+
+    def process(self, left: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)], right: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)]) -> StereoResult:
+        """Run one stereo pair (HxWx3 uint8 BGR); returns a StereoResult."""
+
+    @property
+    def config(self) -> StereoConfig: ...
+
+    @property
+    def input_w(self) -> int: ...
+
+    @property
+    def input_h(self) -> int: ...
 
 class SegConfig:
     def __init__(self) -> None: ...
@@ -672,6 +874,57 @@ def decode_pose(cls: Sequence[Annotated[NDArray[numpy.float32], dict(order='C', 
     Decode per-scale [H,W,1]/[H,W,4]/[H,W,K*3] float tensors -> PoseDetections.
     """
 
+def normalize_embedding(embedding: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)]) -> list[float]:
+    """L2-normalize a 1-D appearance embedding -> list[float]."""
+
+def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    """Cosine similarity of two equal-length embeddings in [-1,1]."""
+
+class SamConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def mask_threshold(self) -> float: ...
+
+    @mask_threshold.setter
+    def mask_threshold(self, arg: float, /) -> None: ...
+
+    @property
+    def multimask(self) -> bool: ...
+
+    @multimask.setter
+    def multimask(self, arg: bool, /) -> None: ...
+
+class SamMask:
+    @property
+    def index(self) -> int: ...
+
+    @property
+    def iou(self) -> float: ...
+
+    @property
+    def mask_w(self) -> int: ...
+
+    @property
+    def mask_h(self) -> int: ...
+
+    @property
+    def mask(self) -> NDArray[numpy.uint8]:
+        """Selected low-res binary mask as a uint8 (H, W) numpy array (0/1)."""
+
+class SamMaskDecoder:
+    def __init__(self, engine: Engine, config: SamConfig = ..., masks_index: int = 0, iou_index: int = 1) -> None: ...
+
+    def postprocess(self) -> SamMask: ...
+
+    @property
+    def config(self) -> SamConfig: ...
+
+def decode_sam_masks(low_res_logits: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)], iou_pred: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)], config: SamConfig) -> SamMask:
+    """
+    Select+binarize the best SAM mask from [Nmask,Hm,Wm] logits + [Nmask] iou.
+    """
+
 class InstanceSegConfig:
     def __init__(self) -> None: ...
 
@@ -710,6 +963,12 @@ class InstanceSegConfig:
 
     @compute_masks.setter
     def compute_masks(self, arg: bool, /) -> None: ...
+
+    @property
+    def reg_max(self) -> int: ...
+
+    @reg_max.setter
+    def reg_max(self, arg: int, /) -> None: ...
 
 class InstanceMask:
     @property
@@ -752,7 +1011,7 @@ class InstanceSegmenter:
 
 def decode_instance_seg(cls: Sequence[Annotated[NDArray[numpy.float32], dict(order='C', writable=False)]], box: Sequence[Annotated[NDArray[numpy.float32], dict(order='C', writable=False)]], mc: Sequence[Annotated[NDArray[numpy.float32], dict(order='C', writable=False)]], proto: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)], config: InstanceSegConfig, letterbox: LetterboxInfo, orig_w: int, orig_h: int) -> list[InstanceMask]:
     """
-    Decode per-scale [H,W,nc]/[H,W,4]/[H,W,np] + proto [mH,mW,np] -> InstanceMasks.
+    Decode per-scale [H,W,nc]/[H,W,4|4*reg_max]/[H,W,np] + proto [mH,mW,np] -> InstanceMasks.
     """
 
 class RotatedBox:
@@ -847,6 +1106,136 @@ def decode_obb(cls: Sequence[Annotated[NDArray[numpy.float32], dict(order='C', w
 
 def rotated_iou(a_cx: float, a_cy: float, a_w: float, a_h: float, a_angle: float, b_cx: float, b_cy: float, b_w: float, b_h: float, b_angle: float) -> float:
     """Rotated-rect IoU of two boxes (cx,cy,w,h,angle[rad])."""
+
+class CameraIntrinsics:
+    @overload
+    def __init__(self) -> None: ...
+
+    @overload
+    def __init__(self, fx: float, fy: float, cx: float, cy: float) -> None: ...
+
+    @property
+    def fx(self) -> float: ...
+
+    @fx.setter
+    def fx(self, arg: float, /) -> None: ...
+
+    @property
+    def fy(self) -> float: ...
+
+    @fy.setter
+    def fy(self, arg: float, /) -> None: ...
+
+    @property
+    def cx(self) -> float: ...
+
+    @cx.setter
+    def cx(self, arg: float, /) -> None: ...
+
+    @property
+    def cy(self) -> float: ...
+
+    @cy.setter
+    def cy(self, arg: float, /) -> None: ...
+
+class Mono3dBox:
+    @property
+    def class_id(self) -> int: ...
+
+    @property
+    def score(self) -> float: ...
+
+    @property
+    def x(self) -> float: ...
+
+    @property
+    def y(self) -> float: ...
+
+    @property
+    def z(self) -> float: ...
+
+    @property
+    def h(self) -> float: ...
+
+    @property
+    def w(self) -> float: ...
+
+    @property
+    def l(self) -> float: ...
+
+    @property
+    def yaw(self) -> float: ...
+
+    @property
+    def alpha(self) -> float: ...
+
+    @property
+    def box2d(self) -> list[float]: ...
+
+    def __repr__(self) -> str: ...
+
+class Mono3dConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def num_classes(self) -> int: ...
+
+    @num_classes.setter
+    def num_classes(self, arg: int, /) -> None: ...
+
+    @property
+    def conf_thresh(self) -> float: ...
+
+    @conf_thresh.setter
+    def conf_thresh(self, arg: float, /) -> None: ...
+
+    @property
+    def max_dets(self) -> int: ...
+
+    @max_dets.setter
+    def max_dets(self, arg: int, /) -> None: ...
+
+    @property
+    def nms_kernel(self) -> int: ...
+
+    @nms_kernel.setter
+    def nms_kernel(self, arg: int, /) -> None: ...
+
+    @property
+    def pred_2d(self) -> bool: ...
+
+    @pred_2d.setter
+    def pred_2d(self, arg: bool, /) -> None: ...
+
+    @property
+    def depth_ref(self) -> list[float]: ...
+
+    @depth_ref.setter
+    def depth_ref(self, arg: Sequence[float], /) -> None: ...
+
+    @property
+    def dim_ref(self) -> list[list[float]]: ...
+
+    @dim_ref.setter
+    def dim_ref(self, arg: Sequence[Sequence[float]], /) -> None: ...
+
+def compute_mono3d_feature_xform(orig_w: int, orig_h: int, feat_w: int, feat_h: int) -> LetterboxInfo:
+    """
+    Build the original<->feature affine (scale-to-width, center-height) for SMOKE decode.
+    """
+
+def decode_mono3d(cls: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)], reg: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)], config: Mono3dConfig, feat_xform: LetterboxInfo, K: CameraIntrinsics) -> list[Mono3dBox]:
+    """
+    Decode channel-first cls[nc,H,W]/reg[8,H,W] SMOKE logits -> Mono3dBoxes.
+    """
+
+class Mono3dDetector:
+    def __init__(self, engine: Engine, config: Mono3dConfig = ..., output_base: int = 0) -> None: ...
+
+    def postprocess(self, orig_w: int, orig_h: int, K: CameraIntrinsics) -> list[Mono3dBox]: ...
+
+    @property
+    def config(self) -> Mono3dConfig: ...
 
 class Track:
     @property
@@ -1035,22 +1424,26 @@ class AsyncDetectionPipeline:
     def head(self) -> DetectHead: ...
 
 class AsyncVideoDetectionPipeline:
-    def __init__(self, engine: Engine, config: PipelineConfig = ..., codec: VideoType = ..., depth: int = 4) -> None: ...
+    def __init__(self, engine: Engine, config: PipelineConfig = ..., codec: VideoType = VideoType.H264, depth: int = 4) -> None: ...
 
     def submit(self, data: bytes) -> bool:
-        """Feed Annex-B compressed bytes (segmented + VPU-decoded internally). Blocks on backpressure; False after finish()."""
+        """
+        Feed a chunk of Annex-B compressed bytes (segmented + VPU-decoded internally). Blocks on backpressure; False after finish().
+        """
 
     def next(self) -> list[Detection] | None:
-        """Blocking pop of the next frame's detections in decode order; None once finished AND drained."""
+        """
+        Pop the next frame's detections in decode order (blocks). None once finished AND fully drained.
+        """
 
     def next_nowait(self) -> list[Detection] | None:
-        """Non-blocking pop: detections if one is ready, else None."""
+        """Non-blocking pop: detections if one is ready, else None. Never blocks."""
 
     def finish(self) -> None:
         """Signal end of stream; drains in-flight frames then next() ends."""
 
     def profile(self) -> StageProfile:
-        """Per-stage timing incl. decode_ms (VPU decode + NV12->BGR)."""
+        """Per-stage timing incl. decode_ms (StageProfile); read after drain."""
 
 class RecResult:
     @property
