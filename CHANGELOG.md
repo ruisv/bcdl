@@ -4,6 +4,12 @@ All notable changes to BCDL are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<!-- This file ships verbatim with the published package: there is ONE copy, and
+     it is written at a publishable register. Keep it free of local filesystem
+     paths, machine names, customer references, and links to documents that are
+     not published alongside it. Detail that cannot meet that bar belongs in the
+     roadmap/design notes, not here. -->
+
 ## [Unreleased]
 
 ### Added
