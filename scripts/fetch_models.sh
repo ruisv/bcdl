@@ -14,8 +14,15 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${REPO}/models"
 
-# Source roots on the board (override via env if your layout differs).
-DEPLOY="${BCDL_SRC_DEPLOY:-/path/to/converted/models}"                           # your offline-converted .hbm models
+# Your local source roots go in scripts/local.env (gitignored), e.g.
+#   BCDL_SRC_DEPLOY=/your/path/to/converted/models
+# Anything not set there falls back to the neutral placeholders below and is
+# simply reported as MISSING.
+# shellcheck disable=SC1091
+[ -f "${REPO}/scripts/local.env" ] && . "${REPO}/scripts/local.env"
+
+# Source roots on the board (override via scripts/local.env or the environment).
+DEPLOY="${BCDL_SRC_DEPLOY:-/path/to/converted/models}"                            # offline-converted .hbm
 ZOO="${BCDL_SRC_ZOO:-/path/to/rdk_model_zoo/samples/vision}"                      # rdk_model_zoo checkout
 HOBOT="${BCDL_SRC_HOBOT:-/opt/hobot/model/s100/basic}"                            # board-shipped
 

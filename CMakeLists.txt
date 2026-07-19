@@ -205,6 +205,17 @@ if(BCDL_BUILD_EXAMPLES)
   set_target_properties(video_decode PROPERTIES
     BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
 
+  # Same-process VPU-decode || BPU-infer coexistence probe (no shared data, no
+  # OpenCV, no pipeline) — isolates a vendor-stack fault from our own pipeline
+  # structure. A local diagnostic harness that is not part of the distribution,
+  # so the target only exists when the source is present.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/coexist_probe.cc")
+    add_executable(coexist_probe examples/coexist_probe.cc)
+    target_link_libraries(coexist_probe PRIVATE bcdl::bcdl)
+    set_target_properties(coexist_probe PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+  endif()
+
   add_executable(depth_demo examples/depth_demo.cc)
   target_link_libraries(depth_demo PRIVATE bcdl::bcdl)
   set_target_properties(depth_demo PROPERTIES

@@ -4,10 +4,10 @@
 set -euo pipefail
 
 BOARD="${BOARD:-rdk}"
-DEST="${DEST:-~/projects/bcdl}"
+DEST="${DEST:-projects/bcdl}"   # relative to $HOME on the board, as in board_build.sh
 
 echo ">> bootstrapping conda env on ${BOARD}"
-ssh "$BOARD" 'bash -s' <<'REMOTE'
+ssh "$BOARD" "DEST='$DEST' bash -s" <<'REMOTE'
 set -euo pipefail
 
 # 1. Locate a conda. A non-interactive ssh shell does NOT source ~/.bashrc, so
@@ -32,8 +32,10 @@ echo ">> using conda at $(dirname "$(dirname "$(dirname "$CONDA_SH")")")"
 # shellcheck disable=SC1091
 source "$CONDA_SH"
 
-# 2. env from spec (created on next sync; fall back to inline if not synced yet)
-spec="$HOME/projects/bcdl/env/environment.yml"
+# 2. env from spec (created on next sync; fall back to inline if not synced yet).
+# DEST comes from the caller, so overriding it actually works — it used to be
+# declared and then ignored here, which silently pinned the checkout location.
+spec="$HOME/${DEST}/env/environment.yml"
 if conda env list | grep -qE '^\s*bcdl\s'; then
   echo ">> env 'bcdl' exists; updating"
   [ -f "$spec" ] && conda env update -n bcdl -f "$spec" --prune || true

@@ -26,3 +26,6 @@ tests/data/
 
 # macOS
 .DS_Store
+
+# local machine paths for scripts/fetch_models.sh (never commit)
+scripts/local.env
