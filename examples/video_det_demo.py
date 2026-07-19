@@ -187,7 +187,24 @@ def main(argv):
         t = time.perf_counter()
         vp = bcdl.vp_image_from_nv12(bgr_to_nv12_flat(crop), enc_w, enc_h)  # CPU
         t2 = time.perf_counter()
-        elem.extend(enc.encode(vp))                                        # VPU
+        # The encoder is a QUEUE, not a function: a packet does not necessarily
+        # come out per frame fed in. Feed, then drain to empty; if the input
+        # queue is momentarily full, drain and RETRY (at 1080p we generate
+        # frames far faster than the VPU encodes them, so this does happen).
+        # The tail is flushed after the loop.
+        for _ in range(100):
+            if enc.feed(vp):
+                break
+            pkt = enc.receive(5)
+            if pkt:
+                elem.extend(pkt)
+        else:
+            raise RuntimeError("VPU encoder never accepted a frame")
+        while True:
+            pkt = enc.receive(0)
+            if pkt is None:
+                break
+            elem.extend(pkt)                                               # VPU
         enc_ms += (time.perf_counter() - t2) * 1e3
         encprep_ms += (t2 - t) * 1e3
 
@@ -246,6 +263,15 @@ def main(argv):
         consume(dets)
         frames += 1
     wall_ms = (time.perf_counter() - t_wall) * 1e3
+
+    # Drain the encoder's tail: packets for frames already fed but not yet
+    # emitted. Without this the last frames are silently missing from the mp4.
+    if enc is not None:
+        while True:
+            pkt = enc.flush()
+            if pkt is None:
+                break
+            elem.extend(pkt)
 
     # Mux the VPU elementary stream into an MP4 (container only).
     with open(elem_path, "wb") as f:

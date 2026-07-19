@@ -34,6 +34,34 @@ copy() {
   fi
 }
 
+# Models converted on the x86 host are staged into ${DEPLOY} on the board. That
+# staging is what silently went stale before 2026-07-19: five M6/M8 models were
+# only ever on the convert host, so a re-run produced a models/ dir that could
+# not run those tests. Rather than trust the staging, treat the convert host as
+# the source of truth and SELF-HEAL: use the board-local copy when it is there,
+# otherwise pull it from the convert host and stage it for next time.
+CONVERT_HOST="${BCDL_CONVERT_HOST:-convert-host}"
+BUILD="${BCDL_SRC_BUILD:-/path/to/convert-project/models}"
+
+# copy_staged <name> <path-under-BUILD-on-convert-host>
+copy_staged() {
+  local name="$1" remote="$2"
+  if [[ ! -f "${DEPLOY}/${name}" ]]; then
+    if scp -q -o ConnectTimeout=10 -o BatchMode=yes \
+        "${CONVERT_HOST}:${BUILD}/${remote}" "${DEPLOY}/${name}.part" 2>/dev/null; then
+      # Rename only after a complete transfer: a half-copied .hbm staged under
+      # the real name would be indistinguishable from a good one next run.
+      mv -f "${DEPLOY}/${name}.part" "${DEPLOY}/${name}"
+      printf '  %-46s staged from %s\n' "$name" "${CONVERT_HOST}"
+    else
+      rm -f "${DEPLOY}/${name}.part"
+      printf '  %-46s MISSING (%s:%s/%s)\n' "$name" "${CONVERT_HOST}" "${BUILD}" "$remote"
+      return
+    fi
+  fi
+  copy "${DEPLOY}/${name}"
+}
+
 echo ">> fetching models into ${DEST}"
 # OCR — PP-OCRv5 (converted offline from ccdl ONNX)
 copy "${DEPLOY}/ppocrv5_server_det_960x960.hbm"
@@ -58,4 +86,15 @@ copy "${LAS2_DIR}/las2_m_crop_nashm.hbm"
 # Board-shipped: DFL det (yolov8) + semantic seg (deeplabv3plus)
 copy "${HOBOT}/yolov8_640x640_nv12.hbm"
 copy "${HOBOT}/deeplabv3plus_dilation1248_1024x2048_nv12.hbm"
+# M6 open-vocab (YOLOE) + M8 promptable seg (EdgeSAM) — self-healing from the
+# convert host (see copy_staged above). (M9's rtmpose_m_body is deliberately NOT
+# fetched: that milestone was shelved and its decoder removed from the repo, so
+# nothing here uses the model.)
+copy_staged yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm \
+            yoloe/yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm
+copy_staged yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm \
+            yoloe/yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm
+copy_staged edge_sam_encoder_nashm.hbm     edgesam/enc_out/edge_sam_encoder_nashm.hbm
+copy_staged edge_sam_decoder_sp1_nashm.hbm edgesam/dec_out/edge_sam_decoder_sp1_nashm.hbm
+copy_staged edge_sam_decoder_bp2_nashm.hbm edgesam/dec_bp_out/edge_sam_decoder_bp2_nashm.hbm
 echo ">> done. ($(ls -1 "${DEST}"/*.hbm 2>/dev/null | wc -l) models)"

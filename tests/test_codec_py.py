@@ -222,3 +222,55 @@ def test_video_encode_decode():
     # A decoded frame is timing/buffering dependent, but the encoder MUST have
     # emitted a non-empty H.264 stream over 8 frames — assert that for real.
     assert total_encoded > 0, "VideoEncoder produced no bytes over 8 frames"
+
+
+@pytest.mark.parametrize("codec", ["H264", "H265"])
+def test_video_encode_decoupled(codec):
+    """feed/receive/flush on the encoder, both codecs.
+
+    H.265 encode had NO coverage before the media_codec migration — the old
+    hbVPVideoEncode path was only ever exercised as H.264.
+    """
+    if not _have("VideoEncoder", "vp_image_from_nv12"):
+        pytest.skip("video codec bindings not exposed")
+    w, h = 256, 128
+    cfg = bcdl.VideoEncConfig()
+    cfg.type = getattr(bcdl.VideoType, codec)
+    cfg.width, cfg.height = w, h
+    cfg.format = bcdl.ImageFormat.NV12
+    enc = bcdl.VideoEncoder(cfg)
+
+    packets = []
+
+    def drain(timeout_ms=0):
+        while True:
+            pkt = enc.receive(timeout_ms)
+            if pkt is None:
+                return
+            packets.append(pkt)
+
+    rng = np.random.default_rng(7)
+    for i in range(8):
+        nv12 = rng.integers(0, 256, size=(h * 3 // 2, w), dtype=np.uint8)
+        frame = bcdl.vp_image_from_nv12(nv12, w, h)
+        # Input queue full => drain and retry, never treat as fatal.
+        for _ in range(100):
+            if enc.feed(frame, i * 33333):
+                break
+            drain(5)
+        else:
+            pytest.fail("encoder never accepted frame %d" % i)
+        drain()
+
+    while True:
+        pkt = enc.flush()
+        if pkt is None:
+            break
+        packets.append(pkt)
+
+    assert packets, "encoder produced no packets"
+    stream = b"".join(packets)
+    # First NAL of an elementary stream is a start code; the first payload byte
+    # is SPS (0x67) for H.264 and VPS (0x40) for H.265.
+    assert stream[:4] == b"\x00\x00\x00\x01", stream[:8].hex()
+    assert stream[4] == (0x40 if codec == "H265" else 0x67), hex(stream[4])

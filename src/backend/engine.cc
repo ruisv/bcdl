@@ -15,6 +15,25 @@ constexpr int64_t kBpuStrideAlign = 32;
 inline int64_t alignUp(int64_t v, int64_t a) { return (v + (a - 1)) & ~(a - 1); }
 }  // namespace
 
+std::vector<std::string> Engine::modelNames(const std::string& hbm_path) {
+  hbDNNPackedHandle_t packed = nullptr;
+  const char* files[] = {hbm_path.c_str()};
+  BCDL_CHECK(hbDNNInitializeFromFiles(&packed, files, 1));
+  std::vector<std::string> out;
+  try {
+    const char** names = nullptr;
+    int name_count = 0;
+    BCDL_CHECK(hbDNNGetModelNameList(&names, &name_count, packed));
+    out.reserve(static_cast<std::size_t>(name_count));
+    for (int i = 0; i < name_count; ++i) out.emplace_back(names[i]);
+  } catch (...) {
+    hbDNNRelease(packed);
+    throw;
+  }
+  hbDNNRelease(packed);
+  return out;
+}
+
 Engine::Engine(const std::string& hbm_path, const std::string& model_name) {
   const char* files[] = {hbm_path.c_str()};
   BCDL_CHECK(hbDNNInitializeFromFiles(&packed_, files, 1));

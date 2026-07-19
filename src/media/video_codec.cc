@@ -6,7 +6,6 @@
 #include <thread>
 
 #include "bcdl/core/status.h"
-#include "bcdl/core/task.h"
 #include "hb_media_codec.h"  // media_codec (hb_mm_mc_*) streaming decode API
 #include "hobot/hb_ucp.h"
 
@@ -25,16 +24,54 @@ bool isSupportedVideoFormat(hbVPImageFormat f) {
   }
 }
 
-// CBR rate-control mode for the given video type.
-hbVPVideoRcMode cbrModeFor(hbVPVideoType type) {
-  return type == HB_VP_VIDEO_TYPE_H265 ? HB_VP_VIDEO_RC_MODE_H265_CBR
-                                       : HB_VP_VIDEO_RC_MODE_H264_CBR;
-}
-
 constexpr uint32_t kDecInBufAlign = 1024;
 constexpr uint32_t kDecInBufDefault = 10u * 1024u * 1024u;  // 10 MiB, per header
 
 uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1u) / a * a; }
+
+using Clock = std::chrono::steady_clock;
+
+constexpr int kStatusPollUs = 200;  // how often to re-read the codec's status
+constexpr int kReadyWaitMs = 3;     // dequeue wait once status says a buffer exists
+
+// True once the codec reports at least one output buffer ready, waiting until
+// `deadline`.
+//
+// Why not just block inside the dequeue: a dequeue that finds nothing prints an
+// ERROR line — on STDOUT ("Component vdec_render isn't ready!"). A drain-to-empty
+// cadence ends every input with exactly such a call, so a clean 1385-frame decode
+// emitted 1385 error lines. Polling this status counter is silent. Shared by both
+// codecs so the two can't drift apart on a lesson this expensive to relearn.
+bool waitForOutput(media_codec_context_t& ctx, Clock::time_point deadline) {
+  for (;;) {
+    mc_inter_status_t st{};
+    if (hb_mm_mc_get_status(&ctx, &st) != 0) return true;  // can't tell: let dequeue decide
+    if (st.cur_output_buf_cnt > 0) return true;
+    if (Clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::microseconds(kStatusPollUs));
+  }
+}
+
+// Give every output buffer the codec still holds back to it, then stop/release.
+// Destroying mid-stream is legal, but both hb_mm_mc_stop() and hb_mm_mc_flush()
+// block until the codec's internal components have emptied their output port —
+// and only the application can empty it. Skip this and the destructor hangs
+// forever. Bounded: the codec can only hold what its queued inputs produced.
+void drainAndRelease(media_codec_context_t& ctx, int poll_ms) {
+  media_codec_buffer_t ob{};
+  media_codec_output_buffer_info_t info{};
+  for (int empty_polls = 0; empty_polls < 3;) {
+    if (waitForOutput(ctx, Clock::now() + std::chrono::milliseconds(poll_ms)) &&
+        hb_mm_mc_dequeue_output_buffer(&ctx, &ob, &info, kReadyWaitMs) == 0) {
+      hb_mm_mc_queue_output_buffer(&ctx, &ob, 0);
+      empty_polls = 0;
+    } else {
+      ++empty_polls;
+    }
+  }
+  hb_mm_mc_stop(&ctx);  // best-effort; never throw from a destructor
+  hb_mm_mc_release(&ctx);
+}
 
 }  // namespace
 
@@ -42,11 +79,216 @@ uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1u) / a * a; }
 // VideoEncoder
 // ---------------------------------------------------------------------------
 
+namespace {
+constexpr int kEncInTimeoutMs = 1000;  // dequeue/queue an input buffer
+constexpr int kEncodeWaitMs = 40;      // encode(): wait for one ready packet
+constexpr int kEncFlushWaitMs = 300;   // flush(): drain the tail
+constexpr int kEncDrainPollMs = 20;    // ~Impl: poll for buffers the codec holds
+constexpr uint32_t kEncOutBufMin = 64u * 1024u;  // codec-enforced floor
+}  // namespace
+
+// media_codec-backed decoupled encoder. Mirrors VideoDecoder::Impl: inputs are
+// queued and compressed packets are dequeued independently, so a rate controller
+// that buffers a frame (or any GOP with lookahead) can't deadlock the caller.
+struct VideoEncoder::Impl {
+  media_codec_context_t ctx{};
+  bool started = false;
+  bool eos_fed = false;
+  int width = 0;
+  int height = 0;
+
+  explicit Impl(const VideoEncConfig& cfg) : width(cfg.width), height(cfg.height) {
+    const media_codec_id_t id =
+        (cfg.type == HB_VP_VIDEO_TYPE_H265) ? MEDIA_CODEC_ID_H265 : MEDIA_CODEC_ID_H264;
+    // Populate a valid default context first, THEN override — same reason as the
+    // decoder: without it the fields we set are layered onto zeroed internals and
+    // the codec runs on its own defaults.
+    std::memset(&ctx, 0, sizeof(ctx));
+    BCDL_CHECK(hb_mm_mc_get_default_context(id, /*encoder=*/true, &ctx));
+    ctx.encoder = true;
+    ctx.codec_id = id;
+
+    mc_video_codec_enc_params_t* p = &ctx.video_enc_params;
+    p->width = cfg.width;
+    p->height = cfg.height;
+    p->pix_fmt = MC_PIXEL_FORMAT_NV12;
+    // Worst case a packet can't exceed one uncompressed frame; the vendor sizes
+    // the bitstream buffer at exactly that, 1 KiB-aligned. The codec also
+    // enforces a 64 KiB floor, which a small frame (256x128 = 48 KiB) falls
+    // under — clamp, or hb_mm_mc_configure rejects the whole context.
+    p->bitstream_buf_size =
+        std::max(kEncOutBufMin,
+                 alignUp(static_cast<uint32_t>(cfg.width) * cfg.height * 3u / 2u,
+                         kDecInBufAlign));
+    p->bitstream_buf_count = 5;
+    // Internal input frame buffers: feed() copies the caller's NV12 into one of
+    // these. The external_frame_buf path (hand the codec our VpImage's phys+virt
+    // addresses, zero copy) works too — sunrise_camera uses it — but it makes the
+    // caller's buffer codec-owned until the packet pops out, which is the same
+    // borrowed-buffer lifetime problem as Step 1h. Left for that work.
+    p->external_frame_buf = false;
+    p->frame_buf_count = 5;
+    p->rot_degree = MC_CCW_0;
+    p->mir_direction = MC_DIRECTION_NONE;
+    p->frame_cropping_flag = false;
+    p->enable_user_pts = 1;
+
+    // Streaming GOP: IDR refresh, no B-frames, single reference. The vendor code
+    // notes the wave521 encoder supports neither B-frames nor multi-frame
+    // reference, restricting presets to 1 and 9; 9 is the IPPP low-delay preset
+    // both vendor apps use.
+    p->gop_params.decoding_refresh_type = 2;
+    p->gop_params.gop_preset_idx = 9;
+
+    // CBR rate control. The h264/h265 CBR structs are field-for-field identical
+    // but they are DISTINCT union members — write through the one that matches
+    // the selected mode rather than aliasing, so this stays correct if the SDK
+    // ever changes one of them.
+    if (id == MEDIA_CODEC_ID_H265) {
+      p->rc_params.mode = MC_AV_RC_MODE_H265CBR;
+      mc_h265_cbr_params_t& rc = p->rc_params.h265_cbr_params;
+      rc.intra_period = static_cast<uint32_t>(cfg.intra_period);
+      rc.intra_qp = 30;
+      rc.bit_rate = static_cast<uint32_t>(cfg.bitrate_kbps);
+      rc.frame_rate = static_cast<uint32_t>(cfg.framerate);
+      rc.initial_rc_qp = 20;
+      rc.vbv_buffer_size = 20;
+      rc.ctu_level_rc_enalbe = 1;
+      rc.min_qp_I = 8;  rc.max_qp_I = 50;
+      rc.min_qp_P = 8;  rc.max_qp_P = 50;
+      rc.min_qp_B = 8;  rc.max_qp_B = 50;
+      rc.hvs_qp_enable = 1;
+      rc.hvs_qp_scale = 2;
+      rc.max_delta_qp = 10;
+      rc.qp_map_enable = 0;
+    } else {
+      p->rc_params.mode = MC_AV_RC_MODE_H264CBR;
+      mc_h264_cbr_params_t& rc = p->rc_params.h264_cbr_params;
+      rc.intra_period = static_cast<uint32_t>(cfg.intra_period);
+      rc.intra_qp = 30;
+      rc.bit_rate = static_cast<uint32_t>(cfg.bitrate_kbps);
+      rc.frame_rate = static_cast<uint32_t>(cfg.framerate);
+      rc.initial_rc_qp = 20;
+      rc.vbv_buffer_size = 20;
+      rc.mb_level_rc_enalbe = 1;
+      rc.min_qp_I = 8;  rc.max_qp_I = 50;
+      rc.min_qp_P = 8;  rc.max_qp_P = 50;
+      rc.min_qp_B = 8;  rc.max_qp_B = 50;
+      rc.hvs_qp_enable = 1;
+      rc.hvs_qp_scale = 2;
+      rc.max_delta_qp = 10;
+      rc.qp_map_enable = 0;
+    }
+
+    BCDL_CHECK(hb_mm_mc_initialize(&ctx));
+    BCDL_CHECK(hb_mm_mc_configure(&ctx));
+    mc_av_codec_startup_params_t su{};
+    su.video_enc_startup_params.receive_frame_number = 0;  // unbounded
+    BCDL_CHECK(hb_mm_mc_start(&ctx, &su));
+    started = true;
+  }
+
+  ~Impl() {
+    if (started) drainAndRelease(ctx, kEncDrainPollMs);
+  }
+
+  // Queue one NV12 frame (eos=false) or an end-of-stream marker (eos=true).
+  bool feedFrame(const VpImage* frame, uint64_t pts_us, bool eos) {
+    media_codec_buffer_t in{};
+    in.type = MC_VIDEO_FRAME_BUFFER;
+    if (hb_mm_mc_dequeue_input_buffer(&ctx, &in, kEncInTimeoutMs) != 0) return false;
+
+    if (eos) {
+      in.vframe_buf.size = 0;
+      in.vframe_buf.frame_end = true;
+      return hb_mm_mc_queue_input_buffer(&ctx, &in, kEncInTimeoutMs) == 0;
+    }
+
+    // The codec's internal frame buffer is packed NV12: `height` rows of `width`
+    // luma, then height/2 rows of interleaved chroma. The source VpImage has its
+    // own strides, so copy row-wise rather than as one blob (the vendor's flat
+    // memcpy silently assumes stride == width).
+    const std::size_t need =
+        static_cast<std::size_t>(width) * height * 3u / 2u;
+    if (in.vframe_buf.size < need) {
+      in.vframe_buf.size = 0;
+      hb_mm_mc_queue_input_buffer(&ctx, &in, kEncInTimeoutMs);
+      throw Error(-1, "BCDL: VideoEncoder codec input buffer smaller than one NV12 frame");
+    }
+
+    const hbVPImage& src = frame->raw();
+    auto* y_dst = in.vframe_buf.vir_ptr[0];
+    {
+      const auto* sp = static_cast<const uint8_t*>(src.dataVirAddr);
+      for (int y = 0; y < height; ++y)
+        std::memcpy(y_dst + static_cast<std::size_t>(y) * width,
+                    sp + static_cast<std::size_t>(y) * src.stride,
+                    static_cast<std::size_t>(width));
+    }
+    // Chroma follows luma in the same allocation unless the codec handed us a
+    // separate plane pointer.
+    {
+      auto* uv_dst = in.vframe_buf.vir_ptr[1] != nullptr
+                         ? in.vframe_buf.vir_ptr[1]
+                         : y_dst + static_cast<std::size_t>(width) * height;
+      const auto* sp = static_cast<const uint8_t*>(src.uvVirAddr);
+      for (int y = 0; y < height / 2; ++y)
+        std::memcpy(uv_dst + static_cast<std::size_t>(y) * width,
+                    sp + static_cast<std::size_t>(y) * src.uvStride,
+                    static_cast<std::size_t>(width));
+    }
+
+    in.vframe_buf.width = width;
+    in.vframe_buf.height = height;
+    in.vframe_buf.pix_fmt = MC_PIXEL_FORMAT_NV12;
+    in.vframe_buf.stride = width;
+    in.vframe_buf.vstride = height;
+    in.vframe_buf.size = static_cast<uint32_t>(need);
+    in.vframe_buf.pts = pts_us;
+    in.vframe_buf.frame_end = false;
+    return hb_mm_mc_queue_input_buffer(&ctx, &in, kEncInTimeoutMs) == 0;
+  }
+
+  // Dequeue one compressed packet. Returns false on timeout / EOS marker.
+  bool recv(std::vector<uint8_t>& out, int timeout_ms) {
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+    media_codec_buffer_t ob{};
+    media_codec_output_buffer_info_t info{};
+    for (;;) {
+      if (!waitForOutput(ctx, deadline)) return false;
+      // The counter goes positive slightly before the buffer reaches the output
+      // port, so give the dequeue a couple of ms; the packet is known to exist.
+      if (hb_mm_mc_dequeue_output_buffer(&ctx, &ob, &info, kReadyWaitMs) == 0) break;
+      if (Clock::now() >= deadline) return false;
+    }
+
+    // media_codec_buffer_t is a union: only read vstream_buf once we know this
+    // IS a stream buffer. Reading it on a frame/status buffer reinterprets
+    // unrelated bytes as a pointer+size and the copy below walks off into the
+    // heap — the same trap the decoder hit on reorder/EOS buffers.
+    if (ob.type != MC_VIDEO_STREAM_BUFFER) {
+      hb_mm_mc_queue_output_buffer(&ctx, &ob, 0);
+      return false;
+    }
+    const mc_video_stream_buffer_info_t& sb = ob.vstream_buf;
+    if (sb.vir_ptr == nullptr || sb.size == 0) {
+      hb_mm_mc_queue_output_buffer(&ctx, &ob, 0);  // empty / stream_end marker
+      return false;
+    }
+    out.assign(sb.vir_ptr, sb.vir_ptr + sb.size);
+    hb_mm_mc_queue_output_buffer(&ctx, &ob, 0);  // return the buffer to the codec
+    return true;
+  }
+};
+
 VideoEncoder::VideoEncoder(const VideoEncConfig& cfg) : cfg_(cfg) {
   if (!isSupportedVideoFormat(cfg.format)) {
     throw Error(-1, "BCDL: VideoEncoder format must be NV12 or YUV420");
   }
-  // Dimensions are fixed for the lifetime of the BPU/VPU context, so we REQUIRE
+  if (cfg.format != HB_VP_IMAGE_FORMAT_NV12) {
+    throw Error(-1, "BCDL: VideoEncoder currently only supports NV12 input");
+  }
+  // Dimensions are fixed for the lifetime of the VPU context, so we REQUIRE
   // pre-aligned dims rather than silently aligning up (which would change the
   // pixel geometry the caller intends).
   if (cfg.width < 256 || cfg.width > 8192 || (cfg.width % 32) != 0) {
@@ -61,72 +303,45 @@ VideoEncoder::VideoEncoder(const VideoEncConfig& cfg) : cfg_(cfg) {
   if (cfg.framerate < 1 || cfg.framerate > 240) {
     throw Error(-1, "BCDL: VideoEncoder framerate must be in [1, 240]");
   }
-  if (cfg.intra_period > 2047) {
+  if (cfg.intra_period < 0 || cfg.intra_period > 2047) {
     throw Error(-1, "BCDL: VideoEncoder intra_period must be in [0, 2047]");
   }
-
-  hbVPVideoEncParam param{};
-  // The header requires videoType to be set BEFORE querying defaults.
-  param.videoType = cfg.type;
-  BCDL_CHECK(hbVPGetDefaultVideoEncParam(&param));
-
-  param.pixelFormat = static_cast<uint8_t>(cfg.format);
-  param.width = cfg.width;
-  param.height = cfg.height;
-  param.outBufCount = 5;  // header-recommended default
-  param.backend = HB_UCP_VPU_CORE_0;
-
-  // CBR rate control. hbVPVideoH265Cbr is a typedef of hbVPVideoH264Cbr, so the
-  // h264Cbr union member has the right layout for both; selecting the H265_CBR
-  // mode is what routes it to the H.265 path.
-  param.rcParam.mode = cbrModeFor(cfg.type);
-  param.rcParam.h264Cbr.intraPeriod = static_cast<uint32_t>(cfg.intra_period);
-  param.rcParam.h264Cbr.bitRate = static_cast<uint32_t>(cfg.bitrate_kbps);
-  param.rcParam.h264Cbr.frameRate = static_cast<uint32_t>(cfg.framerate);
-  param.rcParam.h264Cbr.initialRcQp = 63;  // > 51 => let the VPU pick the initial QP
-
-  // Standard streaming GOP: IDR refresh, consecutive-P preset.
-  param.gopParam.decodingRefreshType = 2;
-  param.gopParam.gopPresetIdx = 2;
-
-  BCDL_CHECK(hbVPCreateVideoEncContext(&ctx_, &param));
+  impl_ = std::make_unique<Impl>(cfg);
 }
 
-VideoEncoder::~VideoEncoder() {
-  if (ctx_) {
-    // best-effort release; never throw from a destructor
-    hbVPReleaseVideoEncContext(ctx_);
-    ctx_ = nullptr;
+VideoEncoder::~VideoEncoder() = default;
+
+bool VideoEncoder::feed(const VpImage& frame, uint64_t pts_us) {
+  if (frame.format() != cfg_.format) {
+    throw Error(-1, "BCDL: VideoEncoder.feed source format != encoder format");
+  }
+  if (frame.width() != cfg_.width || frame.height() != cfg_.height) {
+    throw Error(-1, "BCDL: VideoEncoder.feed source size != encoder size");
+  }
+  return impl_->feedFrame(&frame, pts_us, /*eos=*/false);
+}
+
+bool VideoEncoder::receive(std::vector<uint8_t>& out, int timeout_ms) {
+  return impl_->recv(out, timeout_ms);
+}
+
+bool VideoEncoder::flush(std::vector<uint8_t>& out) {
+  feedEndOfStream();
+  return impl_->recv(out, kEncFlushWaitMs);
+}
+
+void VideoEncoder::feedEndOfStream() {
+  if (!impl_->eos_fed) {
+    impl_->feedFrame(nullptr, 0, /*eos=*/true);
+    impl_->eos_fed = true;
   }
 }
 
 std::vector<uint8_t> VideoEncoder::encode(const VpImage& frame) {
-  if (frame.format() != cfg_.format) {
-    throw Error(-1, "BCDL: VideoEncoder.encode source format != encoder format");
-  }
-  if (frame.width() != cfg_.width || frame.height() != cfg_.height) {
-    throw Error(-1, "BCDL: VideoEncoder.encode source size != encoder size");
-  }
-
-  // The CPU wrote the source pixels; flush so the VPU reads fresh data.
-  frame.cleanCache();
-
-  // Task owns the codec output buffer; it is freed when the task is released, so
-  // we must copy the compressed bytes out before this Task goes out of scope.
-  Task task;
-  BCDL_CHECK(hbVPVideoEncode(task.addr(), &frame.raw(), ctx_));
-  task.submit();
-  task.wait();
-
-  hbVPArray out{};
-  BCDL_CHECK(hbVPGetVideoEncOutputBuffer(&out, task.get()));
-
-  std::vector<uint8_t> bytes;
-  if (out.virAddr && out.size > 0) {
-    const auto* p = static_cast<const uint8_t*>(out.virAddr);
-    bytes.assign(p, p + out.size);
-  }
-  return bytes;  // empty => frame buffered, nothing emitted this call
+  std::vector<uint8_t> out;
+  if (!feed(frame)) return out;
+  impl_->recv(out, kEncodeWaitMs);
+  return out;  // empty => frame buffered, nothing emitted this call
 }
 
 // ---------------------------------------------------------------------------
@@ -138,8 +353,6 @@ constexpr int kDecInTimeoutMs = 1000;  // dequeue/queue an input buffer
 constexpr int kDecodeWaitMs = 40;      // decode(): wait for one ready frame
 constexpr int kFlushWaitMs = 300;      // flush(): drain reorder tail
 constexpr int kDrainPollMs = 20;       // ~Impl: poll for buffers the codec holds
-constexpr int kStatusPollUs = 200;     // recv(): how often to re-read the codec's status
-constexpr int kReadyWaitMs = 3;        // recv(): dequeue wait once status says a frame exists
 }  // namespace
 
 // media_codec-backed decoupled decoder. hb_mm_mc_* separates input queueing from
@@ -206,29 +419,7 @@ struct VideoDecoder::Impl {
   }
 
   ~Impl() {
-    if (started) {
-      // Destroying mid-stream (AUs fed, frames never drained) is legal, but both
-      // hb_mm_mc_stop() and hb_mm_mc_flush() block until the codec's internal
-      // components (`vdec_render`) have emptied their output port — and only the
-      // application can empty it. Give every decoded buffer back first, or the
-      // destructor hangs forever. Bounded: the codec can only hold as many
-      // frames as its already-queued inputs produce.
-      media_codec_buffer_t ob{};
-      media_codec_output_buffer_info_t info{};
-      for (int empty_polls = 0; empty_polls < 3;) {
-        // Gate on the status counter here too — a dequeue that finds nothing
-        // prints an ERROR line, and this loop ends on exactly such calls.
-        if (waitForFrame(Clock::now() + std::chrono::milliseconds(kDrainPollMs)) &&
-            hb_mm_mc_dequeue_output_buffer(&ctx, &ob, &info, kReadyWaitMs) == 0) {
-          hb_mm_mc_queue_output_buffer(&ctx, &ob, 0);
-          empty_polls = 0;
-        } else {
-          ++empty_polls;
-        }
-      }
-      hb_mm_mc_stop(&ctx);      // best-effort; never throw from a destructor
-      hb_mm_mc_release(&ctx);
-    }
+    if (started) drainAndRelease(ctx, kDrainPollMs);
   }
 
   // Queue one AU (eos=false) or an end-of-stream marker (eos=true).
@@ -252,35 +443,16 @@ struct VideoDecoder::Impl {
     return hb_mm_mc_queue_input_buffer(&ctx, &in, kDecInTimeoutMs) == 0;
   }
 
-  using Clock = std::chrono::steady_clock;
-
-  // True once the codec reports at least one decoded frame queued, waiting until
-  // `deadline`. Polls the codec's status counter, which is silent, instead of
-  // blocking inside a dequeue, which is not.
-  bool waitForFrame(Clock::time_point deadline) {
-    for (;;) {
-      mc_inter_status_t st{};
-      if (hb_mm_mc_get_status(&ctx, &st) != 0) return true;  // can't tell: let dequeue decide
-      if (st.cur_output_buf_cnt > 0) return true;
-      if (Clock::now() >= deadline) return false;
-      std::this_thread::sleep_for(std::chrono::microseconds(kStatusPollUs));
-    }
-  }
-
   // Dequeue one decoded frame (display order). Returns false on timeout / EOS
   // marker; copies a valid frame into `out` and returns the codec buffer.
   bool recv(VpImage& out, int timeout_ms) {
-    // A dequeue that finds no frame makes the codec print an ERROR line on stdout
-    // ("Component vdec_render isn't ready!"). A drain-to-empty cadence ends every
-    // AU with exactly such a call, so a clean 1385-frame decode emitted 1385 error
-    // lines. Ask the codec how many frames are ready instead, and dequeue only
-    // when there is one — never blocking inside the dequeue, which is what logs.
-    // Semantics are unchanged: timeout_ms == 0 still never waits.
+    // Gate on the status counter, never block inside the dequeue — see
+    // waitForOutput(). Semantics unchanged: timeout_ms == 0 still never waits.
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
     media_codec_buffer_t ob{};
     media_codec_output_buffer_info_t info{};
     for (;;) {
-      if (!waitForFrame(deadline)) return false;
+      if (!waitForOutput(ctx, deadline)) return false;
       // The counter is incremented before the frame reaches the output port, so a
       // zero-timeout dequeue right after it turns positive still misses ~1% of the
       // time — and a missed dequeue is exactly what prints. Give it a couple of

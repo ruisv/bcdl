@@ -26,6 +26,15 @@ class Engine {
 
   const std::string& modelName() const noexcept { return model_name_; }
 
+  /// Every model name packed into `hbm_path`, without building an Engine.
+  ///
+  /// A `.hbm` is a PACKAGE and may hold several models — the official SigLIP
+  /// encoders, for instance, expose a global-embedding submodel and a patch-
+  /// feature submodel from one file. The constructor's `model_name` selects one
+  /// (empty = the first), but there was no way to find out what to pass short of
+  /// running `hrt_model_exec model_info` by hand. This is that.
+  static std::vector<std::string> modelNames(const std::string& hbm_path);
+
   int numInputs() const noexcept { return static_cast<int>(inputs_.size()); }
   int numOutputs() const noexcept { return static_cast<int>(outputs_.size()); }
 

@@ -166,3 +166,29 @@ def test_all_tasks_have_a_model_or_skip():
     have = [k for k in keys if bm.available(k)]
     print(f"\nrunnable board tasks: {have}")
     assert isinstance(have, list)
+
+
+def test_engine_model_names_lists_packed_models():
+    """Engine.model_names() enumerates an .hbm package without loading it.
+
+    A .hbm is a PACKAGE: the official SigLIP encoders ship a global-embedding
+    submodel and a patch-feature submodel in one file, and Engine(path,
+    model_name) needs a name to pick one. Before this there was no way to
+    discover the names short of running `hrt_model_exec model_info` by hand.
+    """
+    if not bm.available("det"):
+        pytest.skip("no detection model on this board")
+    path = bm.model_path(bm.TASKS["det"]["model"])
+
+    names = bcdl.Engine.model_names(path)
+    assert isinstance(names, list) and names, "package reported no models"
+    assert all(isinstance(n, str) and n for n in names)
+
+    # The name the Engine actually resolves to must be one it advertised, and
+    # the default (empty model_name) must be the first entry.
+    eng = bcdl.Engine(path)
+    assert eng.model_name in names
+    assert eng.model_name == names[0]
+
+    # Selecting that name explicitly gives the same model.
+    assert bcdl.Engine(path, names[0]).model_name == names[0]

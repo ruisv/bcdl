@@ -6,6 +6,56 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`VideoEncoder` decoupled API + H.265 encode.** `feed(frame, pts_us)` /
+  `receive(timeout_ms)` / `flush()` / `feed_end_of_stream()`, bound to Python
+  alongside the existing `encode()`. H.265 encoding now works and is covered by
+  `tests/test_codec_py.py::test_video_encode_decoupled` (parametrized over both
+  codecs); previously the encoder was only ever exercised as H.264.
+- **`Engine::modelNames(path)` / `bcdl.Engine.model_names(path)`** — list every
+  model packed into an `.hbm` without loading it. A `.hbm` is a *package* and may
+  hold several models (the official SigLIP encoders ship a global-embedding and a
+  patch-feature submodel in one file). The constructor could already select one
+  by name; there was no way to discover the names.
+
+### Changed
+- **`VideoEncoder` rewritten on the `media_codec` (`hb_mm_mc_*`) streaming API**,
+  replacing `hbVPVideoEncode` + an immediate `hbVPGetVideoEncOutputBuffer(task)`
+  — the same "one frame in, that frame's output back from the same task" model
+  that timed out on real HEVC decode, and equally wrong for an encoder whose rate
+  controller may buffer a frame and emit nothing. Inputs are queued and packets
+  drained independently. `encode()` keeps its signature and meaning (feed + short
+  wait, may return empty).
+
+  Validated H.264 and H.265 at 640×384 and 1920×1088, worst Y MAE 0.09–0.16 grey
+  levels against the source pattern; the 1080p HEVC stream verified externally
+  with `ffprobe`, keyframes matching the configured `intra_period`.
+
+  **Callers must drain**: a packet does not necessarily come out per frame fed
+  in, and on a `false` from `feed()` (input queue momentarily full — easy to hit
+  at 1080p, where generating a frame is far cheaper than encoding one) the right
+  response is to drain and retry, not to treat it as fatal. The tail needs
+  `flush()`. `examples/video_roundtrip.cc` and `examples/video_det_demo.py` show
+  the cadence; the latter previously assumed one packet per frame and so dropped
+  frames under load and lost the tail.
+
+### Fixed
+- **Encoder `bitstream_buf_size` clamped to the codec's 64 KiB floor.** It was
+  sized as `w*h*3/2`, so a small frame (256×128 = 48 KiB) made
+  `hb_mm_mc_configure` reject the entire context.
+- **Two 1080p codec contexts do not fit in one process.** With an encoder alive
+  (5 frame buffers) a decoder (8) never obtained buffers at 1920×1088: it
+  produced no frame, its input queue filled, and `feed()` began returning false.
+  This is a capacity limit, not a concurrency one — at 640×384 both fit, which
+  hid it. `examples/video_roundtrip.cc` destroys the encoder before building the
+  decoder; a real transcoder should size `frame_buf_count` deliberately rather
+  than assume both defaults fit.
+- **`scripts/fetch_models.sh` is self-healing.** Five models were missing from it
+  and had never been staged onto the board either, so "re-run this to repopulate"
+  was false. It now uses the board-local copy when present and otherwise pulls
+  from the convert host and stages it for next time, via a `.part` temporary name
+  so a truncated transfer cannot masquerade as a good model.
+
 ## [0.3.1] — 2026-07
 
 Packaging fix. No library or binding changes.

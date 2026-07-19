@@ -12,7 +12,7 @@
 namespace bcdl {
 
 /// Configuration for VideoEncoder. Mirrors the CBR fields the VPU H264/H265
-/// encoder needs; everything else is taken from hbVPGetDefaultVideoEncParam.
+/// encoder needs; everything else is taken from the codec's default context.
 struct VideoEncConfig {
   hbVPVideoType type = HB_VP_VIDEO_TYPE_H264;
   int width = 0;                                  ///< must be a multiple of 32, [256, 8192]
@@ -23,21 +23,41 @@ struct VideoEncConfig {
   hbVPImageFormat format = HB_VP_IMAGE_FORMAT_NV12;
 };
 
-/// Hardware H.264/H.265 encoder running on the VPU (HB_UCP_VPU_CORE_0).
+/// Hardware H.264/H.265 encoder running on the VPU, built on the `media_codec`
+/// (`hb_mm_mc_*`) streaming API — the same DECOUPLED feed/drain model as
+/// VideoDecoder, and for the same reason.
 ///
-/// One context is created up-front for a fixed (type, width, height, format,
+/// The previous implementation used `hbVPVideoEncode` + an immediate
+/// `hbVPGetVideoEncOutputBuffer(task)`: submit one frame, expect that frame's
+/// packet back from the same task. That is the exact model that timed out
+/// (-800005) on real HEVC *decode*, and it is just as wrong here — a rate
+/// controller is free to buffer a frame and emit nothing, and any GOP with
+/// lookahead or reorder decouples "frame N went in" from "a packet came out".
+/// Here frames are queued and compressed packets are drained independently.
+///
+/// One context is created up-front for a fixed (type, width, height,
 /// rate-control) and reused for every frame; create a new encoder if those
-/// change.
+/// change. Input must be NV12 (the only planar-YUV layout VpImage can back).
 ///
-/// Lifetime note on output buffers: the codec allocates the compressed byte
-/// buffer internally and frees it when the task is released. encode() therefore
-/// copies the bytes into a caller-owned std::vector before releasing its task,
-/// so the returned vector is always safe to keep. The first IDR frame's bytes
-/// typically carry SPS/PPS (H264) or VPS/SPS/PPS (H265); the full elementary
-/// stream is the concatenation of successive encode() results.
+/// THREADING: one thread must own the encoder, exactly as for VideoDecoder —
+/// a blocking dequeue holds the codec's internal lock, so a feed thread racing
+/// a receive thread stalls whenever the encoder has no packet to give.
 ///
-/// Cache discipline: the source VpImage is CPU-written, so encode() flushes it
-/// (cleanCache) before the VPU reads it.
+/// Two interfaces:
+///  - encode(frame): convenience — feed one frame then wait briefly for a
+///    packet. Returns empty if the encoder buffered the frame and emitted
+///    nothing yet; the trailing packets need flush().
+///  - feed()/receive()/flush(): the decoupled path. Feed frames, drain ready
+///    packets non-blockingly, then flush() the tail at end-of-stream.
+///
+/// The full elementary stream is the concatenation of the packets, in order;
+/// the first IDR carries SPS/PPS (H.264) or VPS/SPS/PPS (H.265). Packet bytes
+/// are always copied into the caller's vector before the codec buffer is
+/// returned, so what you get back is safe to keep.
+///
+/// Cache discipline: the CPU copies the source frame into the codec's own input
+/// buffer, so a CPU-written VpImage needs no flush. If the frame was written by
+/// a device (GDC, decoder), invalidateCache() it before feeding.
 class VideoEncoder {
  public:
   explicit VideoEncoder(const VideoEncConfig& cfg);
@@ -46,11 +66,33 @@ class VideoEncoder {
   VideoEncoder(const VideoEncoder&) = delete;
   VideoEncoder& operator=(const VideoEncoder&) = delete;
 
-  /// Encode one NV12/YUV420 frame to compressed bytes (copied out of the
-  /// codec-internal buffer; the encode task is released before returning).
-  /// Returns the bytes produced for THIS frame, which may be empty if the
-  /// encoder buffered the frame and emitted nothing yet.
+  /// Feed one frame, then wait up to a short internal timeout for one packet.
+  /// Returns the bytes produced by THIS call, which may be empty if the encoder
+  /// buffered the frame and emitted nothing yet. Trailing packets need flush().
   std::vector<uint8_t> encode(const VpImage& frame);
+
+  /// Queue one NV12 frame for encoding (does not wait for output). Blocks
+  /// briefly if the codec's input queue is full. Returns false on error.
+  ///
+  /// CADENCE (the same rule as VideoDecoder::feed, and the same trap): drain
+  /// ready packets after every feed, and if this returns false because the input
+  /// queue is momentarily full, drain and RETRY rather than treat it as fatal.
+  /// A caller that feeds faster than the encoder runs — trivial to do at 1080p,
+  /// where generating a frame is far cheaper than encoding one — exhausts the
+  /// codec's input buffers and gets a false here. See examples/video_roundtrip.cc.
+  bool feed(const VpImage& frame, uint64_t pts_us = 0);
+
+  /// Drain one compressed packet. `timeout_ms == 0` is non-blocking (returns
+  /// false immediately if none ready). Returns true + fills `out` on a packet,
+  /// false on timeout / no-packet / end-of-stream marker.
+  bool receive(std::vector<uint8_t>& out, int timeout_ms = 0);
+
+  /// After the last feed(): signal end-of-stream once, then drain the remaining
+  /// buffered packets — call repeatedly until it returns false.
+  bool flush(std::vector<uint8_t>& out);
+
+  /// Queue an end-of-stream marker WITHOUT draining. Idempotent.
+  void feedEndOfStream();
 
   hbVPVideoType type() const noexcept { return cfg_.type; }
   int width() const noexcept { return cfg_.width; }
@@ -58,8 +100,9 @@ class VideoEncoder {
   hbVPImageFormat format() const noexcept { return cfg_.format; }
 
  private:
-  hbVPVideoContext ctx_ = nullptr;
   VideoEncConfig cfg_;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 /// Configuration for VideoDecoder.

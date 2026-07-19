@@ -102,6 +102,10 @@ NB_MODULE(bcdl_py, m) {
       .def(nb::init<const std::string&, const std::string&>(), "hbm_path"_a,
            "model_name"_a = "")
       .def_prop_ro("model_name", &bcdl::Engine::modelName)
+      .def_static("model_names", &bcdl::Engine::modelNames, "hbm_path"_a,
+                  "List every model name packed into an .hbm (a package may "
+                  "hold several — e.g. SigLIP's global-embedding and patch-"
+                  "feature submodels). Pass one to Engine(path, model_name).")
       .def_prop_ro("num_inputs", &bcdl::Engine::numInputs)
       .def_prop_ro("num_outputs", &bcdl::Engine::numOutputs)
       .def("input_shape", &bcdl::Engine::inputShape, "index"_a)
@@ -464,8 +468,37 @@ NB_MODULE(bcdl_py, m) {
             return nb::bytes(reinterpret_cast<const char*>(b.data()), b.size());
           },
           "frame"_a,
-          "Encode one NV12/YUV420 frame to compressed bytes (may be empty if "
-          "the encoder buffered the frame).")
+          "Feed one NV12 frame and wait briefly for a packet; returns bytes "
+          "(may be empty if the encoder buffered the frame).")
+      .def(
+          "feed",
+          [](bcdl::VideoEncoder& e, const bcdl::VpImage& frame, uint64_t pts_us) {
+            return e.feed(frame, pts_us);
+          },
+          "frame"_a, nb::arg("pts_us") = 0,
+          "Queue one NV12 frame for encoding (does not wait for output). "
+          "Returns False if the codec's input queue is full — drain with "
+          "receive() and retry rather than treating it as fatal.")
+      .def(
+          "receive",
+          [](bcdl::VideoEncoder& e, int timeout_ms) -> std::optional<nb::bytes> {
+            std::vector<uint8_t> b;
+            if (!e.receive(b, timeout_ms)) return std::nullopt;
+            return nb::bytes(reinterpret_cast<const char*>(b.data()), b.size());
+          },
+          nb::arg("timeout_ms") = 0,
+          "Drain one compressed packet, or None if none ready.")
+      .def(
+          "flush",
+          [](bcdl::VideoEncoder& e) -> std::optional<nb::bytes> {
+            std::vector<uint8_t> b;
+            if (!e.flush(b)) return std::nullopt;
+            return nb::bytes(reinterpret_cast<const char*>(b.data()), b.size());
+          },
+          "Signal end-of-stream, then drain the remaining packets; call until "
+          "it returns None.")
+      .def("feed_end_of_stream", &bcdl::VideoEncoder::feedEndOfStream,
+           "Queue an end-of-stream marker without draining. Idempotent.")
       .def_prop_ro("type", &bcdl::VideoEncoder::type)
       .def_prop_ro("width", &bcdl::VideoEncoder::width)
       .def_prop_ro("height", &bcdl::VideoEncoder::height)

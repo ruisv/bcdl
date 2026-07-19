@@ -19,6 +19,16 @@ class Engine:
     def __init__(self, hbm_path: str, model_name: str = ""):
         self._e = bcdl_py.Engine(hbm_path, model_name)
 
+    @staticmethod
+    def model_names(hbm_path: str) -> list[str]:
+        """Every model name packed into an ``.hbm``, without loading it.
+
+        A ``.hbm`` is a package and may hold several models (e.g. SigLIP's
+        global-embedding and patch-feature submodels). Pass one of these as
+        ``model_name``; the default picks the first.
+        """
+        return bcdl_py.Engine.model_names(hbm_path)
+
     @property
     def model_name(self) -> str:
         return self._e.model_name

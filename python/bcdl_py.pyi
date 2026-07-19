@@ -434,8 +434,24 @@ class VideoEncoder:
 
     def encode(self, frame: VpImage) -> bytes:
         """
-        Encode one NV12/YUV420 frame to compressed bytes (may be empty if the encoder buffered the frame).
+        Feed one NV12 frame and wait briefly for a packet; returns bytes (may be empty if the encoder buffered the frame).
         """
+
+    def feed(self, frame: VpImage, pts_us: int = 0) -> bool:
+        """
+        Queue one NV12 frame for encoding (does not wait for output). Returns False if the codec's input queue is full — drain with receive() and retry rather than treating it as fatal.
+        """
+
+    def receive(self, timeout_ms: int = 0) -> bytes | None:
+        """Drain one compressed packet, or None if none ready."""
+
+    def flush(self) -> bytes | None:
+        """
+        Signal end-of-stream, then drain the remaining packets; call until it returns None.
+        """
+
+    def feed_end_of_stream(self) -> None:
+        """Queue an end-of-stream marker without draining. Idempotent."""
 
     @property
     def type(self) -> VideoType: ...
