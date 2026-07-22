@@ -9,6 +9,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -32,10 +33,16 @@
 #endif
 #include "bcdl/tasks/classification.h"
 #include "bcdl/tasks/depth.h"
+#include "bcdl/tasks/embedding.h"
 #include "bcdl/tasks/detection.h"
+#include "bcdl/tasks/face.h"
+#include "bcdl/tasks/wholebody.h"
+#include "bcdl/tasks/features.h"
+#include "bcdl/tasks/superres.h"
 #include "bcdl/tasks/instance_seg.h"
 #include "bcdl/tasks/mono3d.h"
 #include "bcdl/tasks/obb.h"
+#include "bcdl/tasks/panoptic_drive.h"
 #include "bcdl/tasks/ocr.h"
 #include "bcdl/tasks/open_vocab.h"
 #include "bcdl/tasks/pose.h"
@@ -112,6 +119,23 @@ NB_MODULE(bcdl_py, m) {
       .def("output_shape", &bcdl::Engine::outputShape, "index"_a)
       .def("input_bytes",
            [](bcdl::Engine& e, int i) { return e.inputBytes(i); }, "index"_a)
+      .def("input_packed_bytes",
+           [](bcdl::Engine& e, int i) { return e.inputPackedBytes(i); }, "index"_a,
+           "Byte size of input[i] as a contiguous row-major array. Smaller than "
+           "input_bytes() when the model pads a dimension.")
+      .def("input_stride", &bcdl::Engine::inputStride, "index"_a,
+           "Resolved byte strides of input[i], innermost last.")
+      .def("output_stride", &bcdl::Engine::outputStride, "index"_a,
+           "Resolved byte strides of output[i], innermost last. Outputs are "
+           "padded too — reshape output_bytes() flat and you shear the tensor.")
+      .def(
+          "input_buffer_bytes",
+          [](bcdl::Engine& e, int i) {
+            return nb::bytes(static_cast<const char*>(e.inputData(i)), e.inputBytes(i));
+          },
+          "index"_a,
+          "Input[i]'s device buffer in the device layout — how set_input() "
+          "actually laid the data out.")
       .def("input_dtype",
            [](bcdl::Engine& e, int i) { return dtypeName(e.inputType(i)); }, "index"_a)
       .def("output_dtype",
@@ -827,6 +851,452 @@ NB_MODULE(bcdl_py, m) {
       .def_prop_ro("config", &bcdl::Classifier::config);
 
   // ===========================================================================
+  // Face detection (5 landmarks) + alignment
+  // ===========================================================================
+  nb::class_<bcdl::FaceDetection>(m, "FaceDetection")
+      .def_ro("x1", &bcdl::FaceDetection::x1)
+      .def_ro("y1", &bcdl::FaceDetection::y1)
+      .def_ro("x2", &bcdl::FaceDetection::x2)
+      .def_ro("y2", &bcdl::FaceDetection::y2)
+      .def_ro("score", &bcdl::FaceDetection::score)
+      .def_ro("landmarks", &bcdl::FaceDetection::landmarks)
+      .def("__repr__", [](const bcdl::FaceDetection& f) {
+        char b[128];
+        std::snprintf(b, sizeof(b), "FaceDetection(%.0f,%.0f-%.0f,%.0f score=%.3f)",
+                      f.x1, f.y1, f.x2, f.y2, f.score);
+        return std::string(b);
+      });
+
+  nb::class_<bcdl::FaceDetectConfig>(m, "FaceDetectConfig")
+      .def(nb::init<>())
+      .def_rw("conf_thresh", &bcdl::FaceDetectConfig::conf_thresh)
+      .def_rw("iou_thresh", &bcdl::FaceDetectConfig::iou_thresh)
+      .def_rw("max_faces", &bcdl::FaceDetectConfig::max_faces)
+      .def_rw("strides", &bcdl::FaceDetectConfig::strides)
+      .def_rw("num_anchors", &bcdl::FaceDetectConfig::num_anchors);
+
+  m.def("decode_scrfd",
+        [](std::vector<nb::ndarray<const float, nb::c_contig>> score,
+           std::vector<nb::ndarray<const float, nb::c_contig>> bbox,
+           std::vector<nb::ndarray<const float, nb::c_contig>> kps,
+           const bcdl::FaceDetectConfig& cfg, const bcdl::LetterboxInfo& lb) {
+          std::vector<const float*> s, b, k;
+          std::vector<int> counts;
+          for (auto& a : score) { s.push_back(a.data()); counts.push_back(static_cast<int>(a.size())); }
+          for (auto& a : bbox) b.push_back(a.data());
+          for (auto& a : kps) k.push_back(a.data());
+          return bcdl::decodeScrfd(s, b, k, counts, cfg, lb);
+        },
+        "score"_a, "bbox"_a, "kps"_a, "config"_a, "letterbox"_a,
+        "Decode SCRFD score/bbox/kps tensors into faces with 5 landmarks.");
+
+  m.def("arcface_template", &bcdl::arcFaceTemplate,
+        "The canonical 112x112 five-point template used for face alignment.");
+
+  m.def("similarity_transform", &bcdl::similarityTransform, "src"_a, "dst"_a,
+        "Closed-form Umeyama similarity transform (rot+uniform scale+translation) "
+        "as {a,b,tx,c,d,ty}.");
+
+  m.def("align_face",
+        [](nb::ndarray<const uint8_t, nb::c_contig> bgr,
+           const std::vector<std::pair<float, float>>& landmarks, int size) {
+          if (bgr.ndim() != 3 || bgr.shape(2) != 3) {
+            throw std::invalid_argument("align_face: expected an HxWx3 uint8 BGR image");
+          }
+          const int h = static_cast<int>(bgr.shape(0));
+          const int w = static_cast<int>(bgr.shape(1));
+          std::vector<uint8_t> out = bcdl::alignFace(bgr.data(), w, h, w * 3,
+                                                     landmarks, size);
+          auto* held = new std::vector<uint8_t>(std::move(out));
+          nb::capsule owner(held, [](void* p) noexcept {
+            delete static_cast<std::vector<uint8_t>*>(p);
+          });
+          const size_t shape[3] = {static_cast<size_t>(size),
+                                   static_cast<size_t>(size), 3};
+          return nb::ndarray<nb::numpy, uint8_t>(held->data(), 3, shape, owner);
+        },
+        "bgr"_a, "landmarks"_a, "size"_a = 112,
+        "Warp a face into a size x size aligned BGR crop from its 5 landmarks.");
+
+  nb::class_<bcdl::FaceDetector>(m, "FaceDetector")
+      .def(nb::init<bcdl::Engine&, bcdl::FaceDetectConfig, int>(), "engine"_a,
+           "config"_a = bcdl::FaceDetectConfig{}, "output_base"_a = 0,
+           nb::keep_alive<1, 2>())
+      .def("postprocess", &bcdl::FaceDetector::postprocess, "letterbox"_a)
+      .def_prop_ro("config", &bcdl::FaceDetector::config);
+
+  // ===========================================================================
+  // ViTPose whole-body 133-keypoint head (top-down heatmaps)
+  // ===========================================================================
+  nb::class_<bcdl::WholeBodyCrop>(m, "WholeBodyCrop")
+      .def(nb::init<>())
+      .def_rw("x1", &bcdl::WholeBodyCrop::x1)
+      .def_rw("y1", &bcdl::WholeBodyCrop::y1)
+      .def_rw("pad_left", &bcdl::WholeBodyCrop::pad_left)
+      .def_rw("pad_top", &bcdl::WholeBodyCrop::pad_top)
+      .def_rw("padded_w", &bcdl::WholeBodyCrop::padded_w)
+      .def_rw("padded_h", &bcdl::WholeBodyCrop::padded_h);
+
+  nb::class_<bcdl::WholeBodyConfig>(m, "WholeBodyConfig")
+      .def(nb::init<>())
+      .def_rw("kpt_thresh", &bcdl::WholeBodyConfig::kpt_thresh)
+      .def_rw("blur_kernel", &bcdl::WholeBodyConfig::blur_kernel)
+      .def_rw("box_pad", &bcdl::WholeBodyConfig::box_pad)
+      .def_prop_rw(
+          "mean",
+          [](const bcdl::WholeBodyConfig& c) {
+            return std::vector<float>(c.mean, c.mean + 3);
+          },
+          [](bcdl::WholeBodyConfig& c, const std::vector<float>& v) {
+            if (v.size() != 3) throw std::invalid_argument("mean must have 3 values (RGB)");
+            std::copy(v.begin(), v.end(), c.mean);
+          })
+      .def_prop_rw(
+          "std",
+          [](const bcdl::WholeBodyConfig& c) {
+            return std::vector<float>(c.std, c.std + 3);
+          },
+          [](bcdl::WholeBodyConfig& c, const std::vector<float>& v) {
+            if (v.size() != 3) throw std::invalid_argument("std must have 3 values (RGB)");
+            std::copy(v.begin(), v.end(), c.std);
+          });
+
+  // wholebody_preprocess(): returns (input, crop) — the NCHW float array to feed
+  // the model and the geometry decode_wholebody() needs to invert.
+  m.def(
+      "wholebody_preprocess",
+      [](nb::ndarray<const uint8_t, nb::c_contig> bgr, float x1, float y1, float x2, float y2,
+         int in_w, int in_h, const bcdl::WholeBodyConfig& cfg) {
+        if (bgr.ndim() != 3 || bgr.shape(2) != 3) {
+          throw std::invalid_argument(
+              "wholebody_preprocess: expected an HxWx3 uint8 BGR image");
+        }
+        const int h = static_cast<int>(bgr.shape(0));
+        const int w = static_cast<int>(bgr.shape(1));
+        std::vector<float> out;
+        bcdl::WholeBodyCrop crop = bcdl::wholeBodyPreprocess(
+            bgr.data(), w, h, w * 3, x1, y1, x2, y2, in_w, in_h, cfg, out);
+        auto* held = new std::vector<float>(std::move(out));
+        nb::capsule owner(held, [](void* p) noexcept {
+          delete static_cast<std::vector<float>*>(p);
+        });
+        const size_t shape[4] = {1, 3, static_cast<size_t>(in_h), static_cast<size_t>(in_w)};
+        return nb::make_tuple(nb::ndarray<nb::numpy, float>(held->data(), 4, shape, owner),
+                              crop);
+      },
+      "bgr"_a, "x1"_a, "y1"_a, "x2"_a, "y2"_a, "in_w"_a = 192, "in_h"_a = 256,
+      "config"_a = bcdl::WholeBodyConfig{},
+      "Crop a person box to the model's canvas: widen by box_pad, zero-pad to the "
+      "3:4 aspect, resize, /255, ImageNet z-score, NCHW RGB. Returns (input, crop).");
+
+  // decode_wholebody(): numpy path — pass the [K,H,W] (or [1,K,H,W]) heatmap.
+  m.def(
+      "decode_wholebody",
+      [](nb::ndarray<const float, nb::c_contig> hm, const bcdl::WholeBodyCrop& crop,
+         const bcdl::WholeBodyConfig& cfg) {
+        int k, h, w;
+        if (hm.ndim() == 4) {
+          if (hm.shape(0) != 1) {
+            throw std::invalid_argument("decode_wholebody: batch must be 1");
+          }
+          k = static_cast<int>(hm.shape(1));
+          h = static_cast<int>(hm.shape(2));
+          w = static_cast<int>(hm.shape(3));
+        } else if (hm.ndim() == 3) {
+          k = static_cast<int>(hm.shape(0));
+          h = static_cast<int>(hm.shape(1));
+          w = static_cast<int>(hm.shape(2));
+        } else {
+          throw std::invalid_argument("decode_wholebody: expected a [K,H,W] heatmap");
+        }
+        return bcdl::decodeWholeBody(hm.data(), k, h, w, crop, cfg);
+      },
+      "heatmaps"_a, "crop"_a, "config"_a = bcdl::WholeBodyConfig{},
+      "Decode channel-first heatmaps into keypoints in original-image pixels "
+      "(argmax + DARK-UDP sub-pixel refinement).");
+
+  nb::class_<bcdl::WholeBodyEstimator>(m, "WholeBodyEstimator")
+      .def(nb::init<bcdl::Engine&, bcdl::WholeBodyConfig, int>(), "engine"_a,
+           "config"_a = bcdl::WholeBodyConfig{}, "output_index"_a = 0,
+           nb::keep_alive<1, 2>())
+      .def("postprocess", &bcdl::WholeBodyEstimator::postprocess, "crop"_a)
+      .def_prop_ro("config", &bcdl::WholeBodyEstimator::config);
+
+  // ===========================================================================
+  // XFeat sparse local features + mutual-NN matching
+  // ===========================================================================
+  nb::class_<bcdl::Feature>(m, "Feature")
+      .def_ro("x", &bcdl::Feature::x)
+      .def_ro("y", &bcdl::Feature::y)
+      .def_ro("score", &bcdl::Feature::score);
+
+  nb::class_<bcdl::FeatureMatch>(m, "FeatureMatch")
+      .def_ro("a", &bcdl::FeatureMatch::a)
+      .def_ro("b", &bcdl::FeatureMatch::b)
+      .def_ro("score", &bcdl::FeatureMatch::score);
+
+  nb::class_<bcdl::XfeatConfig>(m, "XfeatConfig")
+      .def(nb::init<>())
+      .def_rw("detection_thresh", &bcdl::XfeatConfig::detection_thresh)
+      .def_rw("nms_kernel", &bcdl::XfeatConfig::nms_kernel)
+      .def_rw("top_k", &bcdl::XfeatConfig::top_k);
+
+  // FeatureSet's descriptors come back as one (N, dim) float array rather than
+  // per-feature lists: matching is a dense dot product, so callers want the
+  // matrix, and copying N x 64 floats per frame into Python objects would cost
+  // more than the decode.
+  nb::class_<bcdl::FeatureSet>(m, "FeatureSet")
+      .def_ro("keypoints", &bcdl::FeatureSet::keypoints)
+      .def_ro("dim", &bcdl::FeatureSet::dim)
+      // rv_policy::move, not the property default: these arrays already carry
+      // their own capsule owner, and reference_internal cannot be applied on top.
+      .def_prop_ro(
+          "descriptors",
+          [](const bcdl::FeatureSet& f) {
+            auto* held = new std::vector<float>(f.descriptors);
+            nb::capsule owner(held, [](void* p) noexcept {
+              delete static_cast<std::vector<float>*>(p);
+            });
+            const size_t shape[2] = {f.size(), static_cast<size_t>(f.dim)};
+            return nb::ndarray<nb::numpy, float>(held->data(), 2, shape, owner);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "xy",
+          [](const bcdl::FeatureSet& f) {
+            auto* held = new std::vector<float>(f.size() * 2);
+            for (size_t i = 0; i < f.size(); ++i) {
+              (*held)[2 * i] = f.keypoints[i].x;
+              (*held)[2 * i + 1] = f.keypoints[i].y;
+            }
+            nb::capsule owner(held, [](void* p) noexcept {
+              delete static_cast<std::vector<float>*>(p);
+            });
+            const size_t shape[2] = {f.size(), 2};
+            return nb::ndarray<nb::numpy, float>(held->data(), 2, shape, owner);
+          },
+          nb::rv_policy::move)
+      .def("__len__", [](const bcdl::FeatureSet& f) { return f.size(); });
+
+  m.def(
+      "xfeat_preprocess",
+      [](nb::ndarray<const uint8_t, nb::c_contig> bgr, int in_w, int in_h) {
+        if (bgr.ndim() != 3 || bgr.shape(2) != 3) {
+          throw std::invalid_argument("xfeat_preprocess: expected an HxWx3 uint8 BGR image");
+        }
+        const int h = static_cast<int>(bgr.shape(0));
+        const int w = static_cast<int>(bgr.shape(1));
+        std::vector<float> out;
+        float sx = 1.0f, sy = 1.0f;
+        bcdl::xfeatPreprocess(bgr.data(), w, h, w * 3, in_w, in_h, out, &sx, &sy);
+        auto* held = new std::vector<float>(std::move(out));
+        nb::capsule owner(held, [](void* p) noexcept {
+          delete static_cast<std::vector<float>*>(p);
+        });
+        const size_t shape[4] = {1, 1, static_cast<size_t>(in_h), static_cast<size_t>(in_w)};
+        return nb::make_tuple(nb::ndarray<nb::numpy, float>(held->data(), 4, shape, owner),
+                              sx, sy);
+      },
+      "bgr"_a, "in_w"_a = 640, "in_h"_a = 480,
+      "Grayscale (channel MEAN, not luma) + resize + InstanceNorm into the "
+      "model's [1,1,H,W] input. Returns (input, scale_x, scale_y).");
+
+  m.def(
+      "decode_xfeat",
+      [](nb::ndarray<const float, nb::c_contig> feats,
+         nb::ndarray<const float, nb::c_contig> kpts,
+         nb::ndarray<const float, nb::c_contig> heat, const bcdl::XfeatConfig& cfg,
+         float scale_x, float scale_y) {
+        auto dims = [](const auto& a) {
+          return a.ndim() == 4 ? std::array<int, 3>{static_cast<int>(a.shape(1)),
+                                                    static_cast<int>(a.shape(2)),
+                                                    static_cast<int>(a.shape(3))}
+                               : std::array<int, 3>{static_cast<int>(a.shape(0)),
+                                                    static_cast<int>(a.shape(1)),
+                                                    static_cast<int>(a.shape(2))};
+        };
+        if (feats.ndim() < 3 || kpts.ndim() < 3 || heat.ndim() < 3) {
+          throw std::invalid_argument("decode_xfeat: expected [C,H,W] or [1,C,H,W] maps");
+        }
+        const auto f = dims(feats), k = dims(kpts), r = dims(heat);
+        if (f[0] != 64 || k[0] != 65 || r[0] != 1) {
+          throw std::invalid_argument(
+              "decode_xfeat: channel counts must be 64 / 65 / 1 (feats/keypoints/heatmap)");
+        }
+        if (k[1] != f[1] || k[2] != f[2] || r[1] != f[1] || r[2] != f[2]) {
+          throw std::invalid_argument("decode_xfeat: the three maps must share (H,W)");
+        }
+        return bcdl::decodeXfeat(feats.data(), kpts.data(), heat.data(), f[1], f[2],
+                                 f[1] * 8, f[2] * 8, cfg, scale_x, scale_y);
+      },
+      "feats"_a, "keypoints"_a, "heatmap"_a, "config"_a = bcdl::XfeatConfig{},
+      "scale_x"_a = 1.0f, "scale_y"_a = 1.0f,
+      "Decode the three XFeat maps into sparse features (softmax -> NMS -> top-k "
+      "-> bilinear descriptor sampling), in original-image pixels.");
+
+  m.def("match_features", &bcdl::matchFeatures, "a"_a, "b"_a, "min_cossim"_a = 0.82f,
+        "Mutual nearest-neighbour matching with a cosine floor. O(|a|*|b|*dim).");
+
+  nb::class_<bcdl::FeatureExtractor>(m, "FeatureExtractor")
+      .def(nb::init<bcdl::Engine&, bcdl::XfeatConfig, int>(), "engine"_a,
+           "config"_a = bcdl::XfeatConfig{}, "output_base"_a = 0, nb::keep_alive<1, 2>())
+      .def(
+          "extract",
+          [](bcdl::FeatureExtractor& e, nb::ndarray<const uint8_t, nb::c_contig> bgr,
+             int timeout_ms) {
+            if (bgr.ndim() != 3 || bgr.shape(2) != 3) {
+              throw std::invalid_argument("extract: expected an HxWx3 uint8 BGR image");
+            }
+            const int h = static_cast<int>(bgr.shape(0));
+            const int w = static_cast<int>(bgr.shape(1));
+            return e.extract(bgr.data(), w, h, w * 3, timeout_ms);
+          },
+          "bgr"_a, "timeout_ms"_a = 0)
+      .def("postprocess", &bcdl::FeatureExtractor::postprocess, "scale_x"_a = 1.0f,
+           "scale_y"_a = 1.0f)
+      .def_prop_ro("config", &bcdl::FeatureExtractor::config);
+
+  // ===========================================================================
+  // Super-resolution (tiled)
+  // ===========================================================================
+  nb::class_<bcdl::SuperResConfig>(m, "SuperResConfig")
+      .def(nb::init<>())
+      .def_rw("overlap", &bcdl::SuperResConfig::overlap);
+
+  nb::class_<bcdl::TilePlacement>(m, "TilePlacement")
+      .def_ro("x", &bcdl::TilePlacement::x)
+      .def_ro("y", &bcdl::TilePlacement::y);
+
+  m.def("plan_tiles", &bcdl::planTiles, "width"_a, "height"_a, "tile_w"_a, "tile_h"_a,
+        "overlap"_a,
+        "Tile origins covering an image; the last tile on each axis is flush "
+        "with the far edge, so the real overlap can exceed the requested one.");
+
+  m.def("tile_weight", &bcdl::tileWeight, "i"_a, "len"_a, "ramp"_a,
+        "Cross-fade weight along a tile axis. Always > 0, which is why the "
+        "blend can normalize instead of special-casing image borders.");
+
+  nb::class_<bcdl::SuperResolver>(m, "SuperResolver")
+      .def(nb::init<bcdl::Engine&, bcdl::SuperResConfig, int, int>(), "engine"_a,
+           "config"_a = bcdl::SuperResConfig{}, "input_index"_a = 0,
+           "output_index"_a = 0, nb::keep_alive<1, 2>())
+      .def(
+          "upscale",
+          [](bcdl::SuperResolver& s, nb::ndarray<const uint8_t, nb::c_contig> bgr,
+             int timeout_ms) {
+            if (bgr.ndim() != 3 || bgr.shape(2) != 3) {
+              throw std::invalid_argument("upscale: expected an HxWx3 uint8 BGR image");
+            }
+            const int h = static_cast<int>(bgr.shape(0));
+            const int w = static_cast<int>(bgr.shape(1));
+            bcdl::SrImage out = s.upscale(bgr.data(), w, h, w * 3, timeout_ms);
+            auto* held = new std::vector<uint8_t>(std::move(out.data));
+            nb::capsule owner(held, [](void* p) noexcept {
+              delete static_cast<std::vector<uint8_t>*>(p);
+            });
+            const size_t shape[3] = {static_cast<size_t>(out.height),
+                                     static_cast<size_t>(out.width), 3};
+            return nb::ndarray<nb::numpy, uint8_t>(held->data(), 3, shape, owner);
+          },
+          "bgr"_a, "timeout_ms"_a = 0)
+      .def_prop_ro("scale", &bcdl::SuperResolver::scale)
+      .def_prop_ro("tile", &bcdl::SuperResolver::tile)
+      .def_prop_ro("last_tile_count", &bcdl::SuperResolver::lastTileCount)
+      .def_prop_ro("config", &bcdl::SuperResolver::config);
+
+  // ===========================================================================
+  // Anchor-based YOLOv5 detection head (panoptic driving models)
+  // ===========================================================================
+  nb::class_<bcdl::Anchor>(m, "Anchor")
+      .def(nb::init<>())
+      .def("__init__", [](bcdl::Anchor* a, float w, float h) { new (a) bcdl::Anchor{w, h}; },
+           "w"_a, "h"_a)
+      .def_rw("w", &bcdl::Anchor::w)
+      .def_rw("h", &bcdl::Anchor::h);
+
+  nb::class_<bcdl::AnchorDetectConfig>(m, "AnchorDetectConfig")
+      .def(nb::init<>())
+      .def_rw("num_classes", &bcdl::AnchorDetectConfig::num_classes)
+      .def_rw("conf_thresh", &bcdl::AnchorDetectConfig::conf_thresh)
+      .def_rw("iou_thresh", &bcdl::AnchorDetectConfig::iou_thresh)
+      .def_rw("max_dets", &bcdl::AnchorDetectConfig::max_dets)
+      .def_rw("strides", &bcdl::AnchorDetectConfig::strides)
+      .def_rw("anchors", &bcdl::AnchorDetectConfig::anchors);
+
+  m.def("decode_yolov5_anchor",
+        [](std::vector<nb::ndarray<const float, nb::c_contig>> raw,
+           const bcdl::AnchorDetectConfig& cfg, const bcdl::LetterboxInfo& lb) {
+          std::vector<const float*> ptrs;
+          std::vector<std::pair<int, int>> grid;
+          ptrs.reserve(raw.size());
+          grid.reserve(raw.size());
+          for (auto& r : raw) {
+            if (r.ndim() < 3) {
+              throw std::invalid_argument(
+                  "decode_yolov5_anchor: each raw head needs >= 3 dims "
+                  "([C,H,W] or [1,C,H,W])");
+            }
+            ptrs.push_back(r.data());
+            grid.emplace_back(static_cast<int>(r.shape(r.ndim() - 2)),
+                              static_cast<int>(r.shape(r.ndim() - 1)));
+          }
+          return bcdl::decodeYoloV5Anchor(ptrs, grid, cfg, lb);
+        },
+        "raw"_a, "config"_a, "letterbox"_a,
+        "Decode raw anchor-based head tensors ([1,na*(5+nc),H,W] per scale, "
+        "unactivated) into Detections in original-image pixels.");
+
+  nb::class_<bcdl::AnchorDetector>(m, "AnchorDetector")
+      .def(nb::init<bcdl::Engine&, bcdl::AnchorDetectConfig, int>(), "engine"_a,
+           "config"_a = bcdl::AnchorDetectConfig{}, "output_base"_a = 0,
+           nb::keep_alive<1, 2>())
+      .def("postprocess", &bcdl::AnchorDetector::postprocess, "letterbox"_a)
+      .def_prop_ro("config", &bcdl::AnchorDetector::config);
+
+  // ===========================================================================
+  // Embeddings (retrieval, zero-shot classification)
+  // ===========================================================================
+  nb::class_<bcdl::EmbedConfig>(m, "EmbedConfig")
+      .def(nb::init<>())
+      .def_rw("l2_normalize", &bcdl::EmbedConfig::l2_normalize);
+
+  nb::class_<bcdl::EmbedMatch>(m, "EmbedMatch")
+      .def_ro("index", &bcdl::EmbedMatch::index)
+      .def_ro("score", &bcdl::EmbedMatch::score)
+      .def_ro("label", &bcdl::EmbedMatch::label)
+      .def("__repr__", [](const bcdl::EmbedMatch& r) {
+        char b[128];
+        std::snprintf(b, sizeof(b), "EmbedMatch(idx=%d score=%.4f label='%s')",
+                      r.index, r.score, r.label.c_str());
+        return std::string(b);
+      });
+
+  m.def("decode_embedding",
+        [](nb::ndarray<float, nb::c_contig> arr, const bcdl::EmbedConfig& cfg) {
+          return bcdl::decodeEmbedding(arr.data(), static_cast<int>(arr.size()), cfg);
+        },
+        "data"_a, "config"_a = bcdl::EmbedConfig{},
+        "Read a flat float array as an embedding (L2-normalized by default).");
+
+  nb::class_<bcdl::EmbeddingBank>(m, "EmbeddingBank")
+      .def(nb::init<>())
+      .def("add", &bcdl::EmbeddingBank::add, "vec"_a, "label"_a = std::string(),
+           "Append one entry; the vector is L2-normalized into the bank.")
+      .def("search", &bcdl::EmbeddingBank::search, "query"_a, "k"_a = 5,
+           "Top-k cosine matches against the bank, most similar first.")
+      .def("label", &bcdl::EmbeddingBank::label, "index"_a)
+      .def("__len__", &bcdl::EmbeddingBank::size)
+      .def_prop_ro("dim", &bcdl::EmbeddingBank::dim);
+
+  nb::class_<bcdl::ImageEmbedder>(m, "ImageEmbedder")
+      .def(nb::init<bcdl::Engine&, bcdl::EmbedConfig, int>(), "engine"_a,
+           "config"_a = bcdl::EmbedConfig{}, "output_index"_a = 0,
+           nb::keep_alive<1, 2>())
+      .def("postprocess", &bcdl::ImageEmbedder::postprocess)
+      .def_prop_ro("dim", &bcdl::ImageEmbedder::dim)
+      .def_prop_ro("config", &bcdl::ImageEmbedder::config);
+
+  // ===========================================================================
   // Pose (keypoints)
   // ===========================================================================
   nb::class_<bcdl::Keypoint>(m, "Keypoint")
@@ -1281,18 +1751,116 @@ NB_MODULE(bcdl_py, m) {
         return std::string(b);
       });
 
+  // --- ReID crop preprocessing ------------------------------------------------
+  // Bound rather than reimplemented in numpy so there is exactly ONE definition
+  // of what a ReID crop is; a Python-side copy would be free to drift from the
+  // C++ TrackingPipeline's, and the two must feed the model identical pixels.
+  nb::class_<bcdl::ReidConfig>(m, "ReidConfig")
+      .def(nb::init<>())
+      .def_prop_rw(
+          "mean",
+          [](const bcdl::ReidConfig& c) {
+            return std::vector<float>(c.mean, c.mean + 3);
+          },
+          [](bcdl::ReidConfig& c, const std::vector<float>& v) {
+            if (v.size() != 3) throw std::invalid_argument("mean must have 3 values (RGB)");
+            std::copy(v.begin(), v.end(), c.mean);
+          })
+      .def_prop_rw(
+          "std",
+          [](const bcdl::ReidConfig& c) {
+            return std::vector<float>(c.std, c.std + 3);
+          },
+          [](bcdl::ReidConfig& c, const std::vector<float>& v) {
+            if (v.size() != 3) throw std::invalid_argument("std must have 3 values (RGB)");
+            std::copy(v.begin(), v.end(), c.std);
+          });
+
+  m.def(
+      "reid_crop_preprocess",
+      [](nb::ndarray<const uint8_t, nb::c_contig> bgr, float x1, float y1, float x2,
+         float y2, int in_w, int in_h, const bcdl::ReidConfig& cfg) {
+        if (bgr.ndim() != 3 || bgr.shape(2) != 3) {
+          throw std::invalid_argument(
+              "reid_crop_preprocess: expected an HxWx3 uint8 BGR image");
+        }
+        const int h = static_cast<int>(bgr.shape(0));
+        const int w = static_cast<int>(bgr.shape(1));
+        std::vector<float> out;
+        bcdl::reidPreprocess(bgr.data(), w, h, w * 3, x1, y1, x2, y2, in_w, in_h, cfg,
+                             out);
+        auto* held = new std::vector<float>(std::move(out));
+        nb::capsule owner(held, [](void* p) noexcept {
+          delete static_cast<std::vector<float>*>(p);
+        });
+        const size_t shape[4] = {1, 3, static_cast<size_t>(in_h),
+                                 static_cast<size_t>(in_w)};
+        return nb::ndarray<nb::numpy, float>(held->data(), 4, shape, owner);
+      },
+      "bgr"_a, "x1"_a, "y1"_a, "x2"_a, "y2"_a, "in_w"_a = 128, "in_h"_a = 256,
+      "config"_a = bcdl::ReidConfig{},
+      "Cut a detection box out of a BGR frame into the ReID model's input: "
+      "squashing resize to in_w x in_h (NOT a letterbox), BGR->RGB, /255, "
+      "ImageNet z-score, NCHW float32.");
+
+  nb::class_<bcdl::BoostConfig>(m, "BoostConfig")
+      .def(nb::init<>())
+      .def_rw("rich_similarity", &bcdl::BoostConfig::rich_similarity)
+      .def_rw("soft_biou", &bcdl::BoostConfig::soft_biou)
+      .def_rw("boost_detections", &bcdl::BoostConfig::boost_detections)
+      .def_rw("lambda_iou", &bcdl::BoostConfig::lambda_iou)
+      .def_rw("lambda_mhd", &bcdl::BoostConfig::lambda_mhd)
+      .def_rw("lambda_shape", &bcdl::BoostConfig::lambda_shape)
+      .def_rw("min_iou", &bcdl::BoostConfig::min_iou)
+      .def_rw("dlo_alpha", &bcdl::BoostConfig::dlo_alpha)
+      .def_rw("vt_start", &bcdl::BoostConfig::vt_start)
+      .def_rw("vt_end", &bcdl::BoostConfig::vt_end)
+      .def_rw("vt_steps", &bcdl::BoostConfig::vt_steps)
+      .def_rw("duo", &bcdl::BoostConfig::duo)
+      .def_rw("duo_iou", &bcdl::BoostConfig::duo_iou);
+
   nb::class_<bcdl::ByteTrackConfig>(m, "ByteTrackConfig")
       .def(nb::init<>())
       .def_rw("track_thresh", &bcdl::ByteTrackConfig::track_thresh)
       .def_rw("high_thresh", &bcdl::ByteTrackConfig::high_thresh)
       .def_rw("match_thresh", &bcdl::ByteTrackConfig::match_thresh)
       .def_rw("track_buffer", &bcdl::ByteTrackConfig::track_buffer)
-      .def_rw("frame_rate", &bcdl::ByteTrackConfig::frame_rate);
+      .def_rw("frame_rate", &bcdl::ByteTrackConfig::frame_rate)
+      .def_rw("proximity_thresh", &bcdl::ByteTrackConfig::proximity_thresh)
+      .def_rw("appearance_thresh", &bcdl::ByteTrackConfig::appearance_thresh)
+      .def_rw("ema_alpha", &bcdl::ByteTrackConfig::ema_alpha)
+      .def_rw("boost", &bcdl::ByteTrackConfig::boost);
+
+  using TrackerUpdate =
+      std::vector<bcdl::Track> (bcdl::ByteTracker::*)(const std::vector<bcdl::Detection>&);
+  using TrackerUpdateReid = std::vector<bcdl::Track> (bcdl::ByteTracker::*)(
+      const std::vector<bcdl::Detection>&, const std::vector<std::vector<float>>&);
 
   nb::class_<bcdl::ByteTracker>(m, "ByteTracker")
       .def(nb::init<bcdl::ByteTrackConfig>(), "config"_a = bcdl::ByteTrackConfig{})
-      .def("update", &bcdl::ByteTracker::update, "detections"_a,
+      .def("update", static_cast<TrackerUpdate>(&bcdl::ByteTracker::update),
+           "detections"_a,
            "Advance one frame with this frame's detections; returns active Tracks.")
+      .def("update", static_cast<TrackerUpdateReid>(&bcdl::ByteTracker::update),
+           "detections"_a, "embeddings"_a,
+           "Advance one frame with detections AND their ReID embeddings (one "
+           "entry per detection, parallel lists; an empty entry means 'no "
+           "appearance for this detection'). Enables BoT-SORT appearance "
+           "association: cost = min(IoU distance, gated cosine distance).")
+      .def(
+          "apply_camera_motion",
+          [](bcdl::ByteTracker& t, nb::ndarray<const float, nb::c_contig> affine) {
+            if (affine.size() != 6) {
+              throw std::runtime_error(
+                  "apply_camera_motion expects a 2x3 affine (6 floats), as "
+                  "returned by cv2.estimateAffinePartial2D");
+            }
+            t.applyCameraMotion(affine.data());
+          },
+          "affine"_a,
+          "Warp every tracklet by a camera-motion 2x3 affine mapping the "
+          "PREVIOUS frame to this one, before the next update(). Only needed "
+          "when the camera moves.")
       .def("reset", &bcdl::ByteTracker::reset)
       .def_prop_ro("config", &bcdl::ByteTracker::config);
 
@@ -1332,10 +1900,26 @@ NB_MODULE(bcdl_py, m) {
       .def("infer_per_frame", &bcdl::StageProfile::inferPerFrame)
       .def("postproc_per_frame", &bcdl::StageProfile::postprocPerFrame);
 
+  nb::class_<bcdl::TrackingReidConfig>(m, "TrackingReidConfig")
+      .def(nb::init<>())
+      .def_rw("min_score", &bcdl::TrackingReidConfig::min_score)
+      .def_rw("max_crops", &bcdl::TrackingReidConfig::max_crops)
+      .def_rw("crop", &bcdl::TrackingReidConfig::crop);
+
   nb::class_<bcdl::TrackingPipeline>(m, "TrackingPipeline")
       .def(nb::init<bcdl::Engine&, bcdl::PipelineConfig, bcdl::ByteTrackConfig>(),
            "engine"_a, "det_config"_a = bcdl::PipelineConfig{},
            "track_config"_a = bcdl::ByteTrackConfig{}, nb::keep_alive<1, 2>())
+      // Appearance overload: keep_alive on BOTH engines — the pipeline holds
+      // them by reference, so either being collected first is a use-after-free.
+      .def(nb::init<bcdl::Engine&, bcdl::Engine&, bcdl::PipelineConfig,
+                    bcdl::ByteTrackConfig, bcdl::TrackingReidConfig>(),
+           "engine"_a, "reid_engine"_a, "det_config"_a = bcdl::PipelineConfig{},
+           "track_config"_a = bcdl::ByteTrackConfig{},
+           "reid_config"_a = bcdl::TrackingReidConfig{}, nb::keep_alive<1, 2>(),
+           nb::keep_alive<1, 3>())
+      .def_prop_ro("has_reid", &bcdl::TrackingPipeline::hasReid)
+      .def_prop_ro("last_embed_count", &bcdl::TrackingPipeline::lastEmbedCount)
       .def(
           "process",
           [](bcdl::TrackingPipeline& p, nb::ndarray<const uint8_t, nb::c_contig> bgr) {

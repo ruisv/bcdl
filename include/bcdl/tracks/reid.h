@@ -6,6 +6,35 @@
 
 namespace bcdl {
 
+/// Crop preprocessing parameters for a ReID model. Defaults are the torchreid
+/// convention (RGB, /255, ImageNet mean/std) that OSNet and its relatives were
+/// trained with; a model trained otherwise needs its own numbers.
+struct ReidConfig {
+  float mean[3] = {0.485f, 0.456f, 0.406f};
+  float std[3] = {0.229f, 0.224f, 0.225f};
+};
+
+/// Cut a detection box out of a BGR frame and turn it into the model's input:
+/// `[1,3,in_h,in_w]` float32 NCHW, RGB, normalized, written to `out`.
+///
+/// **This is a squashing resize, deliberately NOT a letterbox.** Person-ReID
+/// models are trained on crops squashed to a fixed 2:1 shape from whatever
+/// aspect the box happened to have, so preserving aspect would feed them
+/// padding bars they have never seen. An embedding has no coordinates, so
+/// unlike the detection path there is no geometry to invert afterwards — which
+/// is why this returns nothing.
+///
+/// `bgr`     : interleaved HxWx3 uint8, `stride` bytes per row.
+/// `bx*/by*` : the detection box in ORIGINAL-image pixels; it is clipped to the
+///             frame, so a box hanging off the edge is fine.
+/// Sampling uses the OpenCV pixel-center convention, matching
+/// cv::resize(INTER_LINEAR) and the Python `bcdl.reid_preprocess`.
+///
+/// Throws Error(-1) on bad dimensions or a box that is empty after clipping.
+void reidPreprocess(const uint8_t* bgr, int width, int height, int stride,
+                    float bx1, float by1, float bx2, float by2, int in_w, int in_h,
+                    const ReidConfig& cfg, std::vector<float>& out);
+
 // ===========================================================================
 // ReID appearance embeddings (BoT-SORT / StrongSORT association)
 // ===========================================================================

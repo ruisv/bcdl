@@ -14,6 +14,12 @@ class Engine:
     @property
     def model_name(self) -> str: ...
 
+    @staticmethod
+    def model_names(hbm_path: str) -> list[str]:
+        """
+        List every model name packed into an .hbm (a package may hold several — e.g. SigLIP's global-embedding and patch-feature submodels). Pass one to Engine(path, model_name).
+        """
+
     @property
     def num_inputs(self) -> int: ...
 
@@ -25,6 +31,24 @@ class Engine:
     def output_shape(self, index: int) -> list[int]: ...
 
     def input_bytes(self, index: int) -> int: ...
+
+    def input_packed_bytes(self, index: int) -> int:
+        """
+        Byte size of input[i] as a contiguous row-major array. Smaller than input_bytes() when the model pads a dimension.
+        """
+
+    def input_stride(self, index: int) -> list[int]:
+        """Resolved byte strides of input[i], innermost last."""
+
+    def output_stride(self, index: int) -> list[int]:
+        """
+        Resolved byte strides of output[i], innermost last. Outputs are padded too — reshape output_bytes() flat and you shear the tensor.
+        """
+
+    def input_buffer_bytes(self, index: int) -> bytes:
+        """
+        Input[i]'s device buffer in the device layout — how set_input() actually laid the data out.
+        """
 
     def input_dtype(self, index: int) -> str: ...
 
@@ -812,6 +836,416 @@ class Classifier:
     @property
     def config(self) -> ClsConfig: ...
 
+class FaceDetection:
+    @property
+    def x1(self) -> float: ...
+
+    @property
+    def y1(self) -> float: ...
+
+    @property
+    def x2(self) -> float: ...
+
+    @property
+    def y2(self) -> float: ...
+
+    @property
+    def score(self) -> float: ...
+
+    @property
+    def landmarks(self) -> list[tuple[float, float]]: ...
+
+    def __repr__(self) -> str: ...
+
+class FaceDetectConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def conf_thresh(self) -> float: ...
+
+    @conf_thresh.setter
+    def conf_thresh(self, arg: float, /) -> None: ...
+
+    @property
+    def iou_thresh(self) -> float: ...
+
+    @iou_thresh.setter
+    def iou_thresh(self, arg: float, /) -> None: ...
+
+    @property
+    def max_faces(self) -> int: ...
+
+    @max_faces.setter
+    def max_faces(self, arg: int, /) -> None: ...
+
+    @property
+    def strides(self) -> list[int]: ...
+
+    @strides.setter
+    def strides(self, arg: Sequence[int], /) -> None: ...
+
+    @property
+    def num_anchors(self) -> int: ...
+
+    @num_anchors.setter
+    def num_anchors(self, arg: int, /) -> None: ...
+
+def decode_scrfd(score: Sequence[Annotated[NDArray[numpy.float32], dict(order='C', writable=False)]], bbox: Sequence[Annotated[NDArray[numpy.float32], dict(order='C', writable=False)]], kps: Sequence[Annotated[NDArray[numpy.float32], dict(order='C', writable=False)]], config: FaceDetectConfig, letterbox: LetterboxInfo) -> list[FaceDetection]:
+    """Decode SCRFD score/bbox/kps tensors into faces with 5 landmarks."""
+
+def arcface_template() -> list[tuple[float, float]]:
+    """The canonical 112x112 five-point template used for face alignment."""
+
+def similarity_transform(src: Sequence[tuple[float, float]], dst: Sequence[tuple[float, float]]) -> list[float]:
+    """
+    Closed-form Umeyama similarity transform (rot+uniform scale+translation) as {a,b,tx,c,d,ty}.
+    """
+
+def align_face(bgr: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)], landmarks: Sequence[tuple[float, float]], size: int = 112) -> NDArray[numpy.uint8]:
+    """Warp a face into a size x size aligned BGR crop from its 5 landmarks."""
+
+class FaceDetector:
+    def __init__(self, engine: Engine, config: FaceDetectConfig = ..., output_base: int = 0) -> None: ...
+
+    def postprocess(self, letterbox: LetterboxInfo) -> list[FaceDetection]: ...
+
+    @property
+    def config(self) -> FaceDetectConfig: ...
+
+class WholeBodyCrop:
+    def __init__(self) -> None: ...
+
+    @property
+    def x1(self) -> int: ...
+
+    @x1.setter
+    def x1(self, arg: int, /) -> None: ...
+
+    @property
+    def y1(self) -> int: ...
+
+    @y1.setter
+    def y1(self, arg: int, /) -> None: ...
+
+    @property
+    def pad_left(self) -> int: ...
+
+    @pad_left.setter
+    def pad_left(self, arg: int, /) -> None: ...
+
+    @property
+    def pad_top(self) -> int: ...
+
+    @pad_top.setter
+    def pad_top(self, arg: int, /) -> None: ...
+
+    @property
+    def padded_w(self) -> int: ...
+
+    @padded_w.setter
+    def padded_w(self, arg: int, /) -> None: ...
+
+    @property
+    def padded_h(self) -> int: ...
+
+    @padded_h.setter
+    def padded_h(self, arg: int, /) -> None: ...
+
+class WholeBodyConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def kpt_thresh(self) -> float: ...
+
+    @kpt_thresh.setter
+    def kpt_thresh(self, arg: float, /) -> None: ...
+
+    @property
+    def blur_kernel(self) -> int: ...
+
+    @blur_kernel.setter
+    def blur_kernel(self, arg: int, /) -> None: ...
+
+    @property
+    def box_pad(self) -> int: ...
+
+    @box_pad.setter
+    def box_pad(self, arg: int, /) -> None: ...
+
+    @property
+    def mean(self) -> list[float]: ...
+
+    @mean.setter
+    def mean(self, arg: Sequence[float], /) -> None: ...
+
+    @property
+    def std(self) -> list[float]: ...
+
+    @std.setter
+    def std(self, arg: Sequence[float], /) -> None: ...
+
+def wholebody_preprocess(bgr: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)], x1: float, y1: float, x2: float, y2: float, in_w: int = 192, in_h: int = 256, config: WholeBodyConfig = ...) -> tuple:
+    """
+    Crop a person box to the model's canvas: widen by box_pad, zero-pad to the 3:4 aspect, resize, /255, ImageNet z-score, NCHW RGB. Returns (input, crop).
+    """
+
+def decode_wholebody(heatmaps: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)], crop: WholeBodyCrop, config: WholeBodyConfig = ...) -> list[Keypoint]:
+    """
+    Decode channel-first heatmaps into keypoints in original-image pixels (argmax + DARK-UDP sub-pixel refinement).
+    """
+
+class WholeBodyEstimator:
+    def __init__(self, engine: Engine, config: WholeBodyConfig = ..., output_index: int = 0) -> None: ...
+
+    def postprocess(self, crop: WholeBodyCrop) -> list[Keypoint]: ...
+
+    @property
+    def config(self) -> WholeBodyConfig: ...
+
+class Feature:
+    @property
+    def x(self) -> float: ...
+
+    @property
+    def y(self) -> float: ...
+
+    @property
+    def score(self) -> float: ...
+
+class FeatureMatch:
+    @property
+    def a(self) -> int: ...
+
+    @property
+    def b(self) -> int: ...
+
+    @property
+    def score(self) -> float: ...
+
+class XfeatConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def detection_thresh(self) -> float: ...
+
+    @detection_thresh.setter
+    def detection_thresh(self, arg: float, /) -> None: ...
+
+    @property
+    def nms_kernel(self) -> int: ...
+
+    @nms_kernel.setter
+    def nms_kernel(self, arg: int, /) -> None: ...
+
+    @property
+    def top_k(self) -> int: ...
+
+    @top_k.setter
+    def top_k(self, arg: int, /) -> None: ...
+
+class FeatureSet:
+    @property
+    def keypoints(self) -> list[Feature]: ...
+
+    @property
+    def dim(self) -> int: ...
+
+    @property
+    def descriptors(self) -> NDArray[numpy.float32]: ...
+
+    @property
+    def xy(self) -> NDArray[numpy.float32]: ...
+
+    def __len__(self) -> int: ...
+
+def xfeat_preprocess(bgr: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)], in_w: int = 640, in_h: int = 480) -> tuple:
+    """
+    Grayscale (channel MEAN, not luma) + resize + InstanceNorm into the model's [1,1,H,W] input. Returns (input, scale_x, scale_y).
+    """
+
+def decode_xfeat(feats: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)], keypoints: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)], heatmap: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)], config: XfeatConfig = ..., scale_x: float = 1.0, scale_y: float = 1.0) -> FeatureSet:
+    """
+    Decode the three XFeat maps into sparse features (softmax -> NMS -> top-k -> bilinear descriptor sampling), in original-image pixels.
+    """
+
+def match_features(a: FeatureSet, b: FeatureSet, min_cossim: float = 0.8199999928474426) -> list[FeatureMatch]:
+    """Mutual nearest-neighbour matching with a cosine floor. O(|a|*|b|*dim)."""
+
+class FeatureExtractor:
+    def __init__(self, engine: Engine, config: XfeatConfig = ..., output_base: int = 0) -> None: ...
+
+    def extract(self, bgr: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)], timeout_ms: int = 0) -> FeatureSet: ...
+
+    def postprocess(self, scale_x: float = 1.0, scale_y: float = 1.0) -> FeatureSet: ...
+
+    @property
+    def config(self) -> XfeatConfig: ...
+
+class SuperResConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def overlap(self) -> int: ...
+
+    @overlap.setter
+    def overlap(self, arg: int, /) -> None: ...
+
+class TilePlacement:
+    @property
+    def x(self) -> int: ...
+
+    @property
+    def y(self) -> int: ...
+
+def plan_tiles(width: int, height: int, tile_w: int, tile_h: int, overlap: int) -> list[TilePlacement]:
+    """
+    Tile origins covering an image; the last tile on each axis is flush with the far edge, so the real overlap can exceed the requested one.
+    """
+
+def tile_weight(i: int, len: int, ramp: int) -> float:
+    """
+    Cross-fade weight along a tile axis. Always > 0, which is why the blend can normalize instead of special-casing image borders.
+    """
+
+class SuperResolver:
+    def __init__(self, engine: Engine, config: SuperResConfig = ..., input_index: int = 0, output_index: int = 0) -> None: ...
+
+    def upscale(self, bgr: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)], timeout_ms: int = 0) -> NDArray[numpy.uint8]: ...
+
+    @property
+    def scale(self) -> int: ...
+
+    @property
+    def tile(self) -> int: ...
+
+    @property
+    def last_tile_count(self) -> int: ...
+
+    @property
+    def config(self) -> SuperResConfig: ...
+
+class Anchor:
+    @overload
+    def __init__(self) -> None: ...
+
+    @overload
+    def __init__(self, w: float, h: float) -> None: ...
+
+    @property
+    def w(self) -> float: ...
+
+    @w.setter
+    def w(self, arg: float, /) -> None: ...
+
+    @property
+    def h(self) -> float: ...
+
+    @h.setter
+    def h(self, arg: float, /) -> None: ...
+
+class AnchorDetectConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def num_classes(self) -> int: ...
+
+    @num_classes.setter
+    def num_classes(self, arg: int, /) -> None: ...
+
+    @property
+    def conf_thresh(self) -> float: ...
+
+    @conf_thresh.setter
+    def conf_thresh(self, arg: float, /) -> None: ...
+
+    @property
+    def iou_thresh(self) -> float: ...
+
+    @iou_thresh.setter
+    def iou_thresh(self, arg: float, /) -> None: ...
+
+    @property
+    def max_dets(self) -> int: ...
+
+    @max_dets.setter
+    def max_dets(self, arg: int, /) -> None: ...
+
+    @property
+    def strides(self) -> list[int]: ...
+
+    @strides.setter
+    def strides(self, arg: Sequence[int], /) -> None: ...
+
+    @property
+    def anchors(self) -> list[list[Anchor]]: ...
+
+    @anchors.setter
+    def anchors(self, arg: Sequence[Sequence[Anchor]], /) -> None: ...
+
+def decode_yolov5_anchor(raw: Sequence[Annotated[NDArray[numpy.float32], dict(order='C', writable=False)]], config: AnchorDetectConfig, letterbox: LetterboxInfo) -> list[Detection]:
+    """
+    Decode raw anchor-based head tensors ([1,na*(5+nc),H,W] per scale, unactivated) into Detections in original-image pixels.
+    """
+
+class AnchorDetector:
+    def __init__(self, engine: Engine, config: AnchorDetectConfig = ..., output_base: int = 0) -> None: ...
+
+    def postprocess(self, letterbox: LetterboxInfo) -> list[Detection]: ...
+
+    @property
+    def config(self) -> AnchorDetectConfig: ...
+
+class EmbedConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def l2_normalize(self) -> bool: ...
+
+    @l2_normalize.setter
+    def l2_normalize(self, arg: bool, /) -> None: ...
+
+class EmbedMatch:
+    @property
+    def index(self) -> int: ...
+
+    @property
+    def score(self) -> float: ...
+
+    @property
+    def label(self) -> str: ...
+
+    def __repr__(self) -> str: ...
+
+def decode_embedding(data: Annotated[NDArray[numpy.float32], dict(order='C')], config: EmbedConfig = ...) -> list[float]:
+    """Read a flat float array as an embedding (L2-normalized by default)."""
+
+class EmbeddingBank:
+    def __init__(self) -> None: ...
+
+    def add(self, vec: Sequence[float], label: str = '') -> None:
+        """Append one entry; the vector is L2-normalized into the bank."""
+
+    def search(self, query: Sequence[float], k: int = 5) -> list[EmbedMatch]:
+        """Top-k cosine matches against the bank, most similar first."""
+
+    def label(self, index: int) -> str: ...
+
+    def __len__(self) -> int: ...
+
+    @property
+    def dim(self) -> int: ...
+
+class ImageEmbedder:
+    def __init__(self, engine: Engine, config: EmbedConfig = ..., output_index: int = 0) -> None: ...
+
+    def postprocess(self) -> list[float]: ...
+
+    @property
+    def dim(self) -> int: ...
+
+    @property
+    def config(self) -> EmbedConfig: ...
+
 class Keypoint:
     @property
     def x(self) -> float: ...
@@ -1277,6 +1711,107 @@ class Track:
 
     def __repr__(self) -> str: ...
 
+class ReidConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def mean(self) -> list[float]: ...
+
+    @mean.setter
+    def mean(self, arg: Sequence[float], /) -> None: ...
+
+    @property
+    def std(self) -> list[float]: ...
+
+    @std.setter
+    def std(self, arg: Sequence[float], /) -> None: ...
+
+def reid_crop_preprocess(bgr: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)], x1: float, y1: float, x2: float, y2: float, in_w: int = 128, in_h: int = 256, config: ReidConfig = ...) -> NDArray[numpy.float32]:
+    """
+    Cut a detection box out of a BGR frame into the ReID model's input: squashing resize to in_w x in_h (NOT a letterbox), BGR->RGB, /255, ImageNet z-score, NCHW float32.
+    """
+
+class BoostConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def rich_similarity(self) -> bool: ...
+
+    @rich_similarity.setter
+    def rich_similarity(self, arg: bool, /) -> None: ...
+
+    @property
+    def soft_biou(self) -> bool: ...
+
+    @soft_biou.setter
+    def soft_biou(self, arg: bool, /) -> None: ...
+
+    @property
+    def boost_detections(self) -> bool: ...
+
+    @boost_detections.setter
+    def boost_detections(self, arg: bool, /) -> None: ...
+
+    @property
+    def lambda_iou(self) -> float: ...
+
+    @lambda_iou.setter
+    def lambda_iou(self, arg: float, /) -> None: ...
+
+    @property
+    def lambda_mhd(self) -> float: ...
+
+    @lambda_mhd.setter
+    def lambda_mhd(self, arg: float, /) -> None: ...
+
+    @property
+    def lambda_shape(self) -> float: ...
+
+    @lambda_shape.setter
+    def lambda_shape(self, arg: float, /) -> None: ...
+
+    @property
+    def min_iou(self) -> float: ...
+
+    @min_iou.setter
+    def min_iou(self, arg: float, /) -> None: ...
+
+    @property
+    def dlo_alpha(self) -> float: ...
+
+    @dlo_alpha.setter
+    def dlo_alpha(self, arg: float, /) -> None: ...
+
+    @property
+    def vt_start(self) -> float: ...
+
+    @vt_start.setter
+    def vt_start(self, arg: float, /) -> None: ...
+
+    @property
+    def vt_end(self) -> float: ...
+
+    @vt_end.setter
+    def vt_end(self, arg: float, /) -> None: ...
+
+    @property
+    def vt_steps(self) -> int: ...
+
+    @vt_steps.setter
+    def vt_steps(self, arg: int, /) -> None: ...
+
+    @property
+    def duo(self) -> bool: ...
+
+    @duo.setter
+    def duo(self, arg: bool, /) -> None: ...
+
+    @property
+    def duo_iou(self) -> float: ...
+
+    @duo_iou.setter
+    def duo_iou(self, arg: float, /) -> None: ...
+
 class ByteTrackConfig:
     def __init__(self) -> None: ...
 
@@ -1310,11 +1845,47 @@ class ByteTrackConfig:
     @frame_rate.setter
     def frame_rate(self, arg: int, /) -> None: ...
 
+    @property
+    def proximity_thresh(self) -> float: ...
+
+    @proximity_thresh.setter
+    def proximity_thresh(self, arg: float, /) -> None: ...
+
+    @property
+    def appearance_thresh(self) -> float: ...
+
+    @appearance_thresh.setter
+    def appearance_thresh(self, arg: float, /) -> None: ...
+
+    @property
+    def ema_alpha(self) -> float: ...
+
+    @ema_alpha.setter
+    def ema_alpha(self, arg: float, /) -> None: ...
+
+    @property
+    def boost(self) -> BoostConfig: ...
+
+    @boost.setter
+    def boost(self, arg: BoostConfig, /) -> None: ...
+
 class ByteTracker:
     def __init__(self, config: ByteTrackConfig = ...) -> None: ...
 
+    @overload
     def update(self, detections: Sequence[Detection]) -> list[Track]:
         """Advance one frame with this frame's detections; returns active Tracks."""
+
+    @overload
+    def update(self, detections: Sequence[Detection], embeddings: Sequence[Sequence[float]]) -> list[Track]:
+        """
+        Advance one frame with detections AND their ReID embeddings (one entry per detection, parallel lists; an empty entry means 'no appearance for this detection'). Enables BoT-SORT appearance association: cost = min(IoU distance, gated cosine distance).
+        """
+
+    def apply_camera_motion(self, affine: Annotated[NDArray[numpy.float32], dict(order='C', writable=False)]) -> None:
+        """
+        Warp every tracklet by a camera-motion 2x3 affine mapping the PREVIOUS frame to this one, before the next update(). Only needed when the camera moves.
+        """
 
     def reset(self) -> None: ...
 
@@ -1404,8 +1975,39 @@ class StageProfile:
 
     def postproc_per_frame(self) -> float: ...
 
+class TrackingReidConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def min_score(self) -> float: ...
+
+    @min_score.setter
+    def min_score(self, arg: float, /) -> None: ...
+
+    @property
+    def max_crops(self) -> int: ...
+
+    @max_crops.setter
+    def max_crops(self, arg: int, /) -> None: ...
+
+    @property
+    def crop(self) -> ReidConfig: ...
+
+    @crop.setter
+    def crop(self, arg: ReidConfig, /) -> None: ...
+
 class TrackingPipeline:
+    @overload
     def __init__(self, engine: Engine, det_config: PipelineConfig = ..., track_config: ByteTrackConfig = ...) -> None: ...
+
+    @overload
+    def __init__(self, engine: Engine, reid_engine: Engine, det_config: PipelineConfig = ..., track_config: ByteTrackConfig = ..., reid_config: TrackingReidConfig = ...) -> None: ...
+
+    @property
+    def has_reid(self) -> bool: ...
+
+    @property
+    def last_embed_count(self) -> int: ...
 
     def process(self, bgr: Annotated[NDArray[numpy.uint8], dict(order='C', writable=False)]) -> list[Track]:
         """Detect + track one HxWx3 uint8 BGR frame; returns list[Track]."""

@@ -105,14 +105,79 @@ void Engine::allocTensors() {
   }
 }
 
+std::size_t Engine::inputPackedBytes(int i) const {
+  if (i < 0 || i >= numInputs()) throw Error(-1, "BCDL: input index out of range");
+  const auto& p = inputs_[i].properties;
+  std::size_t n = elemSize(p.tensorType);
+  for (int d = 0; d < p.validShape.numDimensions; ++d) {
+    n *= static_cast<std::size_t>(p.validShape.dimensionSize[d]);
+  }
+  return n;
+}
+
+std::vector<std::int64_t> Engine::inputStride(int i) const {
+  if (i < 0 || i >= numInputs()) throw Error(-1, "BCDL: input index out of range");
+  const auto& p = inputs_[i].properties;
+  return {p.stride, p.stride + p.validShape.numDimensions};
+}
+
+std::vector<std::int64_t> Engine::outputStride(int i) const {
+  if (i < 0 || i >= numOutputs()) throw Error(-1, "BCDL: output index out of range");
+  const auto& p = outputs_[i].properties;
+  return {p.stride, p.stride + p.validShape.numDimensions};
+}
+
+namespace {
+/// Scatter a packed row-major array into a strided device buffer. Walks the
+/// outer dims recursively and memcpy's each innermost row, which is contiguous
+/// in both layouts (guaranteed by the caller's stride[nd-1] == elemSize check).
+void scatterStrided(uint8_t* dst, const uint8_t* src, const hbDNNTensorProperties& p, int dim,
+                    std::size_t row_bytes) {
+  const int nd = p.validShape.numDimensions;
+  if (dim == nd - 1) {
+    std::memcpy(dst, src, row_bytes);
+    return;
+  }
+  // Packed source advances by the sub-block size; the device by its stride.
+  std::size_t src_step = row_bytes;
+  for (int d = dim + 1; d < nd - 1; ++d) {
+    src_step *= static_cast<std::size_t>(p.validShape.dimensionSize[d]);
+  }
+  for (int k = 0; k < p.validShape.dimensionSize[dim]; ++k) {
+    scatterStrided(dst + static_cast<std::size_t>(p.stride[dim]) * k, src + src_step * k, p,
+                   dim + 1, row_bytes);
+  }
+}
+}  // namespace
+
 void Engine::setInput(int i, const void* data, std::size_t bytes) {
   if (i < 0 || i >= numInputs()) throw Error(-1, "BCDL: input index out of range");
-  if (bytes > input_mem_[i].size()) {
-    throw Error(-1, "BCDL: input " + std::to_string(i) + " too large (" +
-                        std::to_string(bytes) + " > " + std::to_string(input_mem_[i].size()) +
-                        ")");
+  const std::size_t device_bytes = input_mem_[i].size();
+  const std::size_t packed_bytes = inputPackedBytes(i);
+
+  if (bytes == device_bytes) {
+    // Already in the device layout (the common case — most RDK models are packed).
+    std::memcpy(input_mem_[i].data(), data, bytes);
+  } else if (bytes == packed_bytes) {
+    // Packed host array into a padded device buffer. Zero first: the pad columns
+    // are never written, and BPU reads them.
+    const auto& p = inputs_[i].properties;
+    const int nd = p.validShape.numDimensions;
+    const std::size_t elem = elemSize(p.tensorType);
+    if (nd < 1 || static_cast<std::size_t>(p.stride[nd - 1]) != elem) {
+      throw Error(-1, "BCDL: input " + std::to_string(i) +
+                          " has a non-contiguous innermost stride; feed it in the device "
+                          "layout (inputBytes()) instead");
+    }
+    const std::size_t row_bytes = elem * static_cast<std::size_t>(p.validShape.dimensionSize[nd - 1]);
+    std::memset(input_mem_[i].data(), 0, device_bytes);
+    scatterStrided(static_cast<uint8_t*>(input_mem_[i].data()), static_cast<const uint8_t*>(data),
+                   p, 0, row_bytes);
+  } else {
+    throw Error(-1, "BCDL: input " + std::to_string(i) + " size mismatch: got " +
+                        std::to_string(bytes) + ", expected " + std::to_string(packed_bytes) +
+                        " (packed) or " + std::to_string(device_bytes) + " (device layout)");
   }
-  std::memcpy(input_mem_[i].data(), data, bytes);
   input_mem_[i].cleanCache();
 }
 

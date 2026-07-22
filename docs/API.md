@@ -97,6 +97,9 @@ outs = engine.infer([x])                     # outs[i] reshaped to output_shape(
 | `num_inputs / num_outputs -> int` | Tensor counts. |
 | `input_shape(i) / output_shape(i) -> list[int]` | Tensor shape. |
 | `input_bytes(i) -> int` | Allocated device-buffer size for input `i` (after BPU stride alignment). |
+| `input_packed_bytes(i) -> int` | Size of input `i` as a contiguous row-major array. Smaller than `input_bytes(i)` when the model pads a dimension. |
+| `input_stride(i) -> list[int]` | Resolved byte strides of input `i`, innermost last. |
+| `output_stride(i) -> list[int]` | Resolved byte strides of output `i`. Outputs pad too — reshaping the raw buffer flat shears the tensor. |
 | `input_dtype(i) / output_dtype(i) -> str` | NumPy dtype string (e.g. `"float32"`, `"float16"`, `"int8"`). |
 | `infer(inputs, timeout_ms=0) -> list[np.ndarray]` | Copy inputs into device buffers, run, return one array per output. `timeout_ms=0` blocks. |
 
@@ -249,6 +252,87 @@ for p in est.detect([y_plane, uv_plane], lb):
 - **`decode_pose(cls, box, kpt, config, letterbox) -> list[PoseDetection]`** — numpy
   path; `cls/box/kpt` are lists of per-stride `[H,W,1]` / `[H,W,4]` / `[H,W,K*3]`
   float arrays.
+
+## Whole-body pose (133 keypoints)
+
+TOP-DOWN, unlike `PoseEstimator`: one inference per PERSON on a crop, so it needs
+a detector in front of it and its cost scales with the head count. In exchange it
+resolves feet, a 68-point face and both hands.
+
+```python
+est = bcdl.WholeBodyEstimator(engine)
+for box in person_boxes:                     # from any detector above
+    kpts = est.estimate(bgr, box)            # 133 keypoints, original-image px
+    print(sum(k.score > 0.2 for k in kpts), "visible")
+```
+
+Keypoint layout (COCO-WholeBody): `0-16` body, `17-22` feet, `23-90` face,
+`91-111` left hand, `112-132` right hand.
+
+- **`WholeBodyConfig`** — `kpt_thresh`, `blur_kernel` (DARK modulation, odd),
+  `box_pad`, `mean`, `std` (RGB, applied after scaling to `[0,1]`).
+- **`WholeBodyCrop`** — `x1, y1, pad_left, pad_top, padded_w, padded_h`: how a
+  person box became the model canvas, and what inverts it.
+- **`WholeBodyEstimator(engine, config=None, output_index=0)`** —
+  `.estimate(bgr, box, timeout_ms=0)`, `.postprocess(crop)`, `.config`.
+- **`wholebody_preprocess(bgr, x1, y1, x2, y2, in_w=192, in_h=256, config=None)`**
+  → `(input, crop)`. Takes **BGR** like the rest of this API and flips to the RGB
+  the model wants. The box is widened by `box_pad`, zero-padded to the model's
+  3:4 aspect and resized — not the mmpose center/scale affine.
+- **`decode_wholebody(heatmaps, crop, config=None) -> list[Keypoint]`** — numpy
+  path; `heatmaps` is a channel-first `[K,H,W]` (or `[1,K,H,W]`) float array.
+
+## Super-resolution (tiled)
+
+The model upscales one fixed tile; an arbitrary image is cut into overlapping
+tiles and cross-faded back together.
+
+```python
+sr = bcdl.SuperResolver(engine)          # scale and tile come from the model
+big = sr.upscale(img)                    # BGR in, BGR out, sr.scale x larger
+print(sr.last_tile_count, "tiles")
+```
+
+- **`SuperResConfig`** — `overlap` (input pixels; also the cross-fade width).
+- **`SuperResolver(engine, config=None, input_index=0, output_index=0)`** —
+  `.upscale(bgr, timeout_ms=0)`, `.scale`, `.tile`, `.last_tile_count`.
+- **`plan_tiles(width, height, tile_w, tile_h, overlap)`** → tile origins. The
+  last tile on each axis is flush with the far edge, so the real overlap there
+  can exceed the requested one.
+- **`tile_weight(i, len, ramp)`** — the cross-fade weight, always > 0 so the
+  normalized blend needs no border special-casing.
+
+> Tile size is a deployment decision, not just a memory one: the compiled
+> `.hbm` scales with tile AREA (256x256 → 148 MB, 128x128 → 37 MB for the same
+> network) at identical per-pixel throughput.
+
+## Sparse local features (XFeat)
+
+Repeatable keypoints with L2-normalized 64-d descriptors, plus mutual-NN
+matching. Only the convolutional trunk is on the BPU (~1.0 ms); the input
+normalization and all of the softmax / NMS / top-k / sampling run on the CPU.
+
+```python
+ext = bcdl.FeatureExtractor(engine)
+fa, fb = ext.extract(img_a), ext.extract(img_b)
+for m in bcdl.match_features(fa, fb, min_cossim=0.82):
+    print(fa.xy[m.a], "->", fb.xy[m.b], m.score)
+```
+
+- **`XfeatConfig`** — `detection_thresh`, `nms_kernel` (odd), `top_k`.
+- **`FeatureSet`** — `keypoints: list[Feature]`, `descriptors` as an `(N, 64)`
+  array, `xy` as an `(N, 2)` array, `dim`, `len()`.
+- **`Feature`** — `x, y, score`. **`FeatureMatch`** — `a, b, score`.
+- **`FeatureExtractor(engine, config=None, output_base=0)`** —
+  `.extract(bgr, timeout_ms=0)`, `.postprocess(scale_x, scale_y)`, `.config`.
+- **`xfeat_preprocess(bgr, in_w=640, in_h=480)`** → `(input, scale_x, scale_y)`.
+  Grayscale is the plain CHANNEL MEAN, not a luma weighting.
+- **`decode_xfeat(feats, keypoints, heatmap, config=None, scale_x=1, scale_y=1)`**
+  — numpy path; the three maps are `[C,H,W]` (or `[1,C,H,W]`) float arrays with
+  64 / 65 / 1 channels.
+- **`match_features(a, b, min_cossim=0.82)`** — mutual nearest neighbours.
+  **Cost is `O(|a|*|b|*64)`**: about 130 ms per pair at the default `top_k` of
+  4096, 8 ms at 1024. Lower `top_k` before anything else if matching dominates.
 
 ## Instance segmentation
 
@@ -429,10 +513,70 @@ for frame in stream:
 ```
 
 - **`ByteTrackConfig`** — `track_thresh`, `high_thresh`, `match_thresh`,
-  `track_buffer`, `frame_rate`.
+  `track_buffer`, `frame_rate`; appearance: `proximity_thresh`,
+  `appearance_thresh`, `ema_alpha`; `boost` (`BoostConfig`).
 - **`Track`** — `track_id`, `x1, y1, x2, y2`, `score`, `class_id`; `__repr__`.
 - **`ByteTracker(config=None)`** — `.update(detections) -> list[Track]`,
-  `.reset()`, `.config`.
+  `.update(detections, embeddings) -> list[Track]`,
+  `.apply_camera_motion(affine)`, `.reset()`, `.config`.
+
+### Appearance (ReID)
+
+Passing one embedding per detection switches on appearance association: the cost
+becomes `min(IoU distance, gated cosine distance)`, so appearance can only
+**rescue** a match geometry was about to miss — it can never break one geometry
+already had. An **empty** entry means "no appearance for this detection", which
+is how you skip the ReID model on cheap crops.
+
+```python
+reid = bcdl.ReIDExtractor(bcdl.Engine("osnet.hbm"))
+tracker = bcdl.ByteTracker(bcdl.ByteTrackConfig())
+for frame in stream:
+    dets = detector.detect(...)
+    embs = reid.embed_detections(frame, dets, min_score=0.5)   # parallel to dets
+    for t in tracker.update(dets, embs):
+        print(t.track_id)
+```
+
+- **`ReIDExtractor(engine, config=None, output_index=0)`** — `.dim`,
+  `.embed(model_input)`, `.embed_crop(crop_bgr)`,
+  `.embed_detections(frame_bgr, detections, min_score=0.0)`.
+- **`reid_preprocess(crop_bgr, width=128, height=256, config=None)`** and
+  **`reid_crop_preprocess(bgr, x1, y1, x2, y2, in_w, in_h, config)`** — a
+  **squashing** resize (not a letterbox: these models are trained on squashed
+  crops), BGR→RGB, ImageNet normalization, NCHW float32.
+- **`ReidConfig`** — `mean`, `std`.
+
+The model runs **once per crop**, so on a crowded frame it, not the detector,
+sets the frame time. Note that **int8 PTQ is not adequate for OSNet** — see the
+0.4.0 entry in `CHANGELOG.md`.
+
+### Camera motion
+
+`apply_camera_motion(affine)` warps every tracklet by a 2x3 transform mapping
+the previous frame onto the current one, before the next `update()`. Position
+and size are warped; velocity is not, because velocity describes the target in
+the world and a one-frame camera jolt is not the target accelerating. Skip the
+call entirely for a static camera rather than passing an identity.
+
+```python
+M, _ = cv2.estimateAffinePartial2D(prev_pts, cur_pts, method=cv2.RANSAC)
+tracker.apply_camera_motion(np.ascontiguousarray(M, np.float32))
+```
+
+### BoostConfig
+
+BoostTrack++ additions, **all off by default** — each is independently
+switchable so its contribution can be measured rather than assumed.
+
+- `rich_similarity` — add Mahalanobis and shape-agreement terms to the cost;
+  `lambda_iou`, `lambda_mhd`, `lambda_shape`, `min_iou`.
+- `soft_biou` — grow both boxes by `1 - tracklet confidence`, so a tracklet that
+  has been coasting searches a wider area.
+- `boost_detections` — raise the scores of detections the tracklets vouch for,
+  before the high/low split; `dlo_alpha`, `vt_start`, `vt_end`, `vt_steps`,
+  `duo`, `duo_iou`. **Situational**: it recovers real detections when the
+  detector is limited by misses, and manufactures false tracks when it is not.
 
 ## TrackingPipeline
 
@@ -450,8 +594,14 @@ print(pipe.last_detections)                   # pre-association dets of last fra
 - **`PipelineConfig`** — `input_w`, `input_h`, `detect` (`DetectConfig`),
   `output_index`, `pad_value`, `head` (`DetectHead`), `ltrb_strides`.
 - **`DetectHead`** enum — `Auto`, `SingleTensor`, `YoloLtrb`.
-- **`TrackingPipeline(engine, det_config=None, track_config=None)`** —
-  `.process(bgr) -> list[Track]`, `.last_detections`, `.reset()`.
+- **`TrackingPipeline(engine, det_config=None, track_config=None,
+  reid_engine=None, reid_config=None)`** — `.process(bgr) -> list[Track]`,
+  `.last_detections`, `.has_reid`, `.last_embed_count`, `.reset()`. Passing
+  `reid_engine` adds appearance to the native path; the crop size is read from
+  that model.
+- **`TrackingReidConfig`** — `min_score`, `max_crops`, `crop` (`ReidConfig`).
+  Both are cost knobs: the ReID model runs once per qualifying crop, and
+  `last_embed_count` reports how many that was.
 
 ## AsyncDetectionPipeline
 

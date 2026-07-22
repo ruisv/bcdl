@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(bcdl LANGUAGES CXX VERSION 0.3.1)
+project(bcdl LANGUAGES CXX VERSION 0.4.0)
 
 # --- Guard: this project only builds on the aarch64 RDK board ----------------
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
@@ -85,11 +85,19 @@ add_library(bcdl SHARED
   src/tasks/ocr.cc
   src/tasks/depth.cc
   src/tasks/segmentation.cc
+  src/tasks/embedding.cc
+  src/tasks/panoptic_drive.cc
+  src/tasks/face.cc
+  src/tasks/wholebody.cc
+  src/tasks/features.cc
+  src/tasks/superres.cc
   src/pipeline/detection_pipeline.cc
+  src/pipeline/tracking_pipeline.cc
   src/pipeline/async_detection_pipeline.cc
   src/pipeline/async_video_detection_pipeline.cc
   src/pipeline/stereo_pipeline.cc
-  src/tracks/byte_tracker.cc)
+  src/tracks/byte_tracker.cc
+  src/tracks/reid.cc)
 add_library(bcdl::bcdl ALIAS bcdl)
 
 # Version header generated from the project() version (single source of truth).
@@ -258,6 +266,13 @@ if(BCDL_BUILD_EXAMPLES)
     add_executable(ocr_demo examples/ocr_demo.cc)
     target_link_libraries(ocr_demo PRIVATE bcdl::bcdl ${OpenCV_LIBS})
     set_target_properties(ocr_demo PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+    # Image-embedding retrieval demo: embeds a gallery folder into an
+    # EmbeddingBank and ranks it against a query image.
+    add_executable(embed_demo examples/embed_demo.cc)
+    target_link_libraries(embed_demo PRIVATE bcdl::bcdl ${OpenCV_LIBS})
+    set_target_properties(embed_demo PROPERTIES
       BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
 
     # Detect-and-track demo: TrackingPipeline (DetectionPipeline + ByteTracker)

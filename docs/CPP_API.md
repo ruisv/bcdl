@@ -153,7 +153,11 @@ std::size_t obytes = engine.outputBytes(0);
 | `inputType(i)` / `outputType(i)` | `hbDNN` tensor type enum. |
 | `inputProperties(i)` / `outputProperties(i)` | Full `hbDNNTensorProperties` (dtype, quant, stride). |
 | `inputBytes(i)` / `outputBytes(i)` | Allocated device-buffer sizes. |
-| `setInput(i, data, bytes)` | Copy host bytes into input `i` and flush. |
+| `inputPackedBytes(i)` | Size of input `i` as a contiguous row-major array — smaller than `inputBytes(i)` when the model pads a dimension. |
+| `inputStride(i)` | Resolved byte strides of input `i`, innermost last. |
+| `outputStride(i)` | Resolved byte strides of output `i`. Outputs pad too; `outputAsFloat()` handles it, direct readers must not reshape flat. |
+| `setInput(i, data, bytes)` | Copy host bytes into input `i` and flush. `bytes` must be `inputPackedBytes(i)` (scattered into the device layout) or `inputBytes(i)` (taken as-is); anything else throws. |
+| `inputData(i)` | Read-only view of input `i`'s device buffer, in the device layout. |
 | `infer(timeout_ms=0)` | Run one inference (blocks; invalidates output caches). |
 | `outputData(i)` | Pointer to output `i` after `infer()` (honor the stride). |
 | `static elemSize(tensor_type)` | Byte size of an `hbDNN` tensor element type. |
@@ -298,6 +302,77 @@ auto poses = est.postprocess(lb);   // reads 3*strides.size() outputs
 ```
 
 `num_keypoints` is taken from the kpt tensor (last dim / 3), not trusted from cfg.
+
+## Whole-body pose (133 keypoints)
+
+`bcdl/tasks/wholebody.h` — TOP-DOWN: one inference per PERSON on a crop, so a
+detector runs in front of it and cost scales with the head count. One output,
+`[1,K,H,W]` channel-first heatmaps.
+
+```cpp
+struct WholeBodyCrop { int x1, y1, pad_left, pad_top, padded_w, padded_h; };
+struct WholeBodyConfig { float kpt_thresh; int blur_kernel, box_pad;
+                         float mean[3], std[3]; };
+
+std::vector<float> in;
+auto crop = bcdl::wholeBodyPreprocess(bgr, w, h, stride, x1, y1, x2, y2,
+                                      192, 256, cfg, in);   // BGR in, RGB out
+engine.setInput(0, in.data(), in.size() * sizeof(float));
+engine.infer();
+bcdl::WholeBodyEstimator est(engine, cfg);
+auto kpts = est.postprocess(crop);   // 133 Keypoints, original-image pixels
+// pure: decodeWholeBody(heatmaps, num_kpts, hm_h, hm_w, crop, cfg)
+```
+
+Layout: `0-16` body, `17-22` feet, `23-90` face, `91-111` left hand,
+`112-132` right hand. K/H/W come from the tensor, not from cfg. The crop is the
+reference's widen-pad-resize, NOT an mmpose affine, and sub-pixel refinement is
+DARK-UDP over a window around each peak.
+
+## Super-resolution (tiled)
+
+`bcdl/tasks/superres.h` — a fixed-tile upscaler applied over an arbitrary image
+by overlapping tiles and cross-fading.
+
+```cpp
+struct SuperResConfig { int overlap; };          // input pixels
+struct SrImage { int width, height; std::vector<uint8_t> data; };  // BGR
+
+bcdl::SuperResolver sr(engine, cfg);
+auto big = sr.upscale(bgr, w, h, stride);        // sr.scale() times larger
+// pure: planTiles(w, h, tile_w, tile_h, overlap), tileWeight(i, len, ramp)
+```
+
+`scale()` and `tile()` are read from the model's shapes, never configured. The
+blend accumulates `w * pixel` and `w` and divides, so image borders need no
+special case. Note that the compiled `.hbm` scales with tile AREA — the same
+network is 148 MB at a 256 tile and 37 MB at 128, for identical per-pixel
+throughput.
+
+## Sparse local features (XFeat)
+
+`bcdl/tasks/features.h` — keypoints + L2-normalized 64-d descriptors, and
+mutual-NN matching. Three outputs (`feats` 64ch, `keypoints` 65ch, `reliability`
+1ch) at 1/8 scale. The input's InstanceNorm and every data-dependent step
+(softmax / NMS / top-k / sampling) are on the CPU by design.
+
+```cpp
+struct Feature { float x, y, score; };
+struct FeatureSet { std::vector<Feature> keypoints;
+                    std::vector<float> descriptors; int dim; };
+struct XfeatConfig { float detection_thresh; int nms_kernel, top_k; };
+
+bcdl::FeatureExtractor ext(engine, cfg);
+auto a = ext.extract(bgr_a, w, h, stride);
+auto b = ext.extract(bgr_b, w, h, stride);
+auto m = bcdl::matchFeatures(a, b, /*min_cossim=*/0.82f);
+// pure: xfeatPreprocess(...) / decodeXfeat(feats, kpts, rel, fh, fw, ...)
+```
+
+Descriptors are sampled BICUBICALLY (the reference sampler's default) while the
+reliability map is bilinear. `matchFeatures` is `O(|a|*|b|*dim)` and OpenMP
+parallel — `XfeatConfig::top_k` is the knob that decides whether a pair costs
+130 ms or 8 ms.
 
 ## Instance segmentation
 
@@ -490,7 +565,10 @@ IoU association). Move-only.
 ```cpp
 struct Track { int track_id; float x1,y1,x2,y2,score; int class_id; };
 struct ByteTrackConfig { float track_thresh=0.5, high_thresh=0.6, match_thresh=0.8;
-                         int track_buffer=30, frame_rate=30; };
+                         int track_buffer=30, frame_rate=30;
+                         float proximity_thresh=0.5, appearance_thresh=0.25,
+                               ema_alpha=0.95;
+                         bcdl::BoostConfig boost; };
 
 bcdl::ByteTracker tracker(cfg);
 for (auto& frame : stream) {
@@ -501,6 +579,57 @@ tracker.reset();   // on a stream cut
 ```
 
 Detections must already be in original-image pixels (the detectors do this).
+
+### Appearance (ReID)
+
+`bcdl/tracks/reid.h`. Pass one embedding per detection and the first
+association's cost becomes `min(IoU distance, gated cosine distance)` — so
+appearance can only **rescue** a match geometry was about to miss, never break
+one it already had. An **empty** entry means "no appearance for this detection",
+which is how you skip the ReID model on the cheap crops.
+
+```cpp
+std::vector<std::vector<float>> embs(dets.size());
+for (size_t i = 0; i < dets.size(); ++i) {
+  if (dets[i].score < 0.5f) continue;                 // leave it empty
+  bcdl::reidPreprocess(bgr, w, h, w * 3, dets[i].x1, dets[i].y1,
+                       dets[i].x2, dets[i].y2, 128, 256, reid_cfg, crop);
+  reid_engine.setInput(0, crop.data(), crop.size() * sizeof(float));
+  reid_engine.infer();
+  embs[i] = embedder.postprocess();                   // bcdl::ImageEmbedder
+}
+std::vector<bcdl::Track> tracks = tracker.update(dets, embs);
+```
+
+`reidPreprocess()` does a **squashing** resize to the model's crop size (not a
+letterbox — these models are trained on squashed crops), BGR→RGB, ImageNet
+normalization, NCHW float32. Read-out reuses `ImageEmbedder`;
+`l2Normalize()` / `cosineSimilarity()` are the header-only primitives.
+
+Throws `Error(-1)` if `embeddings.size()` differs from `detections.size()` or if
+the embedding width changes mid-stream.
+
+### Camera motion
+
+```cpp
+float affine[6] = {1,0,dx, 0,1,dy};   // maps the PREVIOUS frame onto this one
+tracker.applyCameraMotion(affine);    // before the next update()
+```
+
+Position and size are warped; velocity is not, because velocity describes the
+target in the world and a one-frame camera jolt is not the target accelerating.
+The caller supplies the transform because this class only ever sees boxes.
+For a static camera, skip the call rather than passing an identity.
+
+### BoostConfig
+
+BoostTrack++ additions, **all off by default**, each independently switchable so
+its contribution can be measured rather than assumed:
+`rich_similarity` (Mahalanobis + shape terms, with `min_iou` guarding the
+result), `soft_biou` (grow both boxes by `1 - tracklet confidence`), and
+`boost_detections` (DLO/DUO score boosting before the high/low split).
+The last is **situational** — it recovers real detections when the detector is
+limited by misses and manufactures false tracks when it is not.
 
 ## DetectionPipeline
 
@@ -624,7 +753,18 @@ bcdl::TrackingPipeline pipe(engine, det_cfg /*=PipelineConfig*/,
 std::vector<bcdl::Track> tracks = pipe.process(bgr, width, height);
 const auto& dets = pipe.lastDetections();   // pre-association, for overlay
 pipe.reset();
+
+// With appearance: pass a ReID Engine (which must outlive the pipeline). The
+// crop size comes from that model, so switching models is a path change.
+bcdl::TrackingPipeline pipe2(engine, reid_engine, det_cfg, track_cfg,
+                             bcdl::TrackingReidConfig{});
+pipe2.hasReid();          // true
+pipe2.lastEmbedCount();   // crops embedded on the last frame
 ```
+
+`TrackingReidConfig{min_score, max_crops, crop}` are cost knobs: the ReID model
+runs **once per qualifying crop**, so on a crowded frame it, not the detector,
+sets the frame time.
 
 ## StereoPipeline
 

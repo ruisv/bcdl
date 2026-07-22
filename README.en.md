@@ -72,6 +72,19 @@ post-processing (CUDA kernels rewritten as CPU/NEON).
   - **Promptable segmentation** — **EdgeSAM** interactive segmentation (point / box
     prompts; RepViT image encoder → cached embedding → prompt decoder two-stage,
     `SamSession`).
+  - **Panoptic driving perception** — YOLOP emits three heads from one
+    inference: vehicle detection (anchor-based `AnchorDetector`) plus drivable
+    area and lane lines (both through `Segmenter`). Note that the published ONNX
+    bakes the anchor decode into the graph via ScatterND, and **that decode does
+    not survive BPU compilation** — the objectness/class columns are never
+    written, giving zero detections at any threshold — so the graph is cut before
+    it and `decodeYoloV5Anchor` runs the arithmetic on the CPU.
+  - **Image embeddings** — `ImageEmbedder` + `EmbeddingBank` (retrieval and
+    zero-shot classification: pooled read-out + L2 normalize + cosine top-k).
+    Note that an embedding `.hbm` commonly packs several submodels (a pooled
+    whole-image vector and a per-patch feature grid) — pick the pooled one with
+    `Engine::modelNames`; preprocessing is a **squashing resize, not a
+    letterbox** (these towers never saw padding bars).
   - **Multi-object tracking** — ByteTrack (Kalman + two-stage association); ReID
     appearance embeddings with L2-normalize + cosine similarity (BoT-SORT
     association primitives).
@@ -91,7 +104,7 @@ post-processing (CUDA kernels rewritten as CPU/NEON).
 
 ```
 python/    nanobind bindings (NumPy <-> tensors), GIL-released infer
-tasks/     det · cls · pose · seg · obb · semseg · depth · mono3d · ocr · open-vocab · sam
+tasks/     det · cls · pose · seg · obb · semseg · depth · mono3d · ocr · open-vocab · sam · embed · drive
 tracks/    ByteTrack multi-object tracker · ReID appearance embeddings
 pipeline/  sync / async detection · tracking · stereo  (JPU -> VP -> BPU -> CPU/VPU)
 media/     JpegCodec (JPU) · VideoCodec H.264/H.265 (VPU)
@@ -288,9 +301,12 @@ outputs for each row are in the [Gallery](#gallery).
 | seg    | yolo26n              | 640²        | 1.64  | 612  | 11.4  | 9.9  |
 | obb    | yolo26n              | 640²        | 1.15  | 872  | 1.65  | 5.8  |
 | semseg | deeplabv3plus        | 2048×1024   | 49.6  | 20   | 58.0  | 39.1 |
+| semseg_rt| PIDNet-S (1/8 output)| 2048×1024  | 4.52  | 221  | 4.70  | 19.0 |
 | depth  | depth-anything-v2    | 686×518     | 113   | 9    | 117   | 121.8|
 | stereo | las2-m (crop)        | 640×480     | 14.2  | 71   | 21.8  | 40.7 |
 | ocr    | PP-OCRv5 (det→cls→rec)| 960² / 48×320 | 20.2 | 50  | 137   | 35.3 |
+| embed  | SigLIP base/16       | 224²        | 19.3  | 52   | 20.2  | 129  |
+| drive  | YOLOP (det+drivable+lane)| 640²   | 2.80  | 358  | 5.44  | 12.0 |
 
 Streaming throughput on yolo26s @1280×720: synchronous **216 FPS**, async
 overlap **334 FPS** (1.55×). Hardware **JPEG** decode (JPU) is **≈3.6–5.3×**

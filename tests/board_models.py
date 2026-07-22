@@ -77,6 +77,12 @@ DOTA_NAMES = [
 SEMSEG_MODEL = os.environ.get(
     "BCDL_SEMSEG_MODEL",
     os.path.join(MODELS, "deeplabv3plus_dilation1248_1024x2048_nv12.hbm"))
+# "_v3": earlier builds of this model were calibrated on data that had not been
+# pre-normalized, which compiles cleanly and decodes to garbage on the board. The
+# version suffix is kept in the file name so it is obvious which build is loaded.
+SEMSEG_RT_MODEL = os.environ.get(
+    "BCDL_SEMSEG_RT_MODEL",
+    os.path.join(MODELS, "pidnet_s_nashm_1024x2048_nv12_v3.hbm"))
 DEPTH_MODEL = os.environ.get(
     "BCDL_DEPTH_MODEL",
     os.path.join(MODELS, "depth_any.hbm"))
@@ -110,6 +116,54 @@ OCR_DICT = os.environ.get("BCDL_OCR_DICT",
                           os.path.join(_REPO, "data", "ppocr_keys_v5_18385.txt"))
 OCR_IMAGE = os.environ.get("BCDL_OCR_IMAGE", "ocr.jpg")
 
+# --- whole-body pose: TOP-DOWN, so it needs a person detector in front of it ---
+WHOLEBODY_MODEL = os.environ.get(
+    "BCDL_WHOLEBODY_MODEL", os.path.join(MODELS, "vitpose_s_wholebody_nashm_256x192.hbm"))
+WHOLEBODY_DET = os.environ.get(
+    "BCDL_WHOLEBODY_DET", os.path.join(MODELS, "yolo26n_detect_nashm_640x640_nv12.hbm"))
+WHOLEBODY_IMAGE = os.environ.get("BCDL_WHOLEBODY_IMAGE", "zidane.jpg")
+
+# --- sparse local features (XFeat): a PAIR task — extract twice, then match ---
+FEATURES_MODEL = os.environ.get(
+    "BCDL_FEATURES_MODEL", os.path.join(MODELS, "xfeat_nashm_640x480.hbm"))
+# The stereo pair doubles as the feature pair: two real views of one scene, and
+# already in the repo.
+FEATURES_LEFT = os.environ.get("BCDL_FEATURES_LEFT", STEREO_LEFT)
+FEATURES_RIGHT = os.environ.get("BCDL_FEATURES_RIGHT", STEREO_RIGHT)
+
+# --- super-resolution: a x4 upscaler applied by tiling -----------------------
+# The 128 tile is deliberate. The compiled instruction stream scales with tile
+# AREA, so the same network at 256 is a 148 MB .hbm against 37 MB here, for
+# identical per-pixel throughput — and since the upscaler tiles in software
+# anyway, the smaller tile costs only a little extra overlap redundancy.
+#
+# Two upscalers ship, and they are NOT redundant — they were trained for
+# different inputs, which shows up as a clean split on the board:
+#   Compact (realesr-general): perceptual, trained on real-world degradations.
+#             Wins on blurred/compressed input; loses to bicubic on PSNR for a
+#             clean downscale because it sharpens and invents detail.
+#   SPAN:     fidelity-oriented. Beats bicubic on a clean downscale, is 6x
+#             smaller and ~2x faster, and gives ground to Compact on degraded
+#             input.
+# Both are driven by the same SuperResolver — scale and tile come from the
+# model — so switching is a path change and nothing else.
+SUPERRES_MODEL = os.environ.get(
+    "BCDL_SUPERRES_MODEL", os.path.join(MODELS, "realesr_general_x4v3_nashm_128.hbm"))
+SUPERRES_SPAN_MODEL = os.environ.get(
+    "BCDL_SUPERRES_SPAN_MODEL", os.path.join(MODELS, "spanx4_ch48_nashm_128.hbm"))
+SUPERRES_IMAGE = os.environ.get("BCDL_SUPERRES_IMAGE", "bus.jpg")
+
+# --- person ReID: the appearance half of tracking ---------------------------
+# Takes a DETECTION CROP, not a frame: the person detector above supplies the
+# boxes and this turns each crop into a 512-d vector, which ByteTracker's
+# two-argument update() associates on alongside geometry. Input is 256x128
+# (squashed, not letterboxed) and ImageNet-normalized — see bcdl.reid_preprocess.
+REID_MODEL = os.environ.get(
+    "BCDL_REID_MODEL", os.path.join(MODELS, "osnet_ain_qat_nashm_256x128.hbm"))
+REID_DET = os.environ.get(
+    "BCDL_REID_DET", os.path.join(MODELS, "yolo26n_detect_nashm_640x640_nv12.hbm"))
+REID_IMAGE = os.environ.get("BCDL_REID_IMAGE", "bus.jpg")
+
 
 def asset(name):
     return find_image(name)
@@ -126,6 +180,10 @@ TASKS = {
     "seg":  dict(model="yolo26n_seg_nashm_640x640_nv12.hbm",    image="bus.jpg",         wh=(640, 640),  kind="nv12",  names=COCO_NAMES),
     "obb":  dict(model="yolo26n_obb_nashm_640x640_nv12.hbm",    image=OBB_IMAGE,         wh=(640, 640),  kind="nv12",  names=DOTA_NAMES),
     "semseg": dict(model=SEMSEG_MODEL, image="segmentation.png", wh=(2048, 1024), kind="nv12", names=None),
+    # Real-time semseg at the same input size. Output is 1/8 resolution
+    # ([1,19,128,256]) rather than full-res, so the label map is 128x256 and the
+    # caller upsamples — everything else decodes through the same Segmenter.
+    "semseg_rt": dict(model=SEMSEG_RT_MODEL, image="segmentation.png", wh=(2048, 1024), kind="nv12", names=None),
     "depth":  dict(model=DEPTH_MODEL,  image="bus.jpg",          wh=(686, 518),   kind="depth", names=None),
     # --- SOTA additions (2026-07): open-vocab det/seg, transformer det ---------
     "yoloe_det": dict(model="yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm", image="bus.jpg", wh=(640, 640), kind="nv12", names=COCO_NAMES),
@@ -140,6 +198,18 @@ def available(task):
     if task == "stereo":
         have_model = os.path.exists(STEREO_CROP_MODEL) or os.path.exists(STEREO_RESIZE_MODEL)
         return have_model and os.path.exists(STEREO_LEFT) and os.path.exists(STEREO_RIGHT)
+    if task == "wholebody":
+        return all(os.path.exists(p) for p in
+                   (WHOLEBODY_MODEL, WHOLEBODY_DET, find_image(WHOLEBODY_IMAGE)))
+    if task == "reid":
+        return all(os.path.exists(p) for p in
+                   (REID_MODEL, REID_DET, find_image(REID_IMAGE)))
+    if task == "features":
+        return all(os.path.exists(p) for p in
+                   (FEATURES_MODEL, FEATURES_LEFT, FEATURES_RIGHT))
+    if task in ("superres", "superres_span"):
+        model = SUPERRES_MODEL if task == "superres" else SUPERRES_SPAN_MODEL
+        return os.path.exists(model) and os.path.exists(find_image(SUPERRES_IMAGE))
     s = TASKS[task]
     return os.path.exists(model_path(s["model"])) and os.path.exists(find_image(s["image"]))
 
@@ -246,6 +316,35 @@ def _draw_skeleton(vis, kpts, thr=0.5):
             cv2.circle(vis, (int(kp.x), int(kp.y)), 3, (0, 0, 255), -1, cv2.LINE_AA)
 
 
+# COCO-WholeBody 133-keypoint layout. The body block is COCO-17, so the same
+# skeleton edges apply; everything after it is dense point sets where bones would
+# be noise, drawn as coloured dots instead.
+WHOLEBODY_PARTS = (
+    ("body", slice(0, 17), (0, 0, 255)),
+    ("feet", slice(17, 23), (0, 200, 255)),
+    ("face", slice(23, 91), (255, 200, 0)),
+    ("lhand", slice(91, 112), (255, 0, 255)),
+    ("rhand", slice(112, 133), (0, 255, 255)),
+)
+
+
+def _draw_wholebody(vis, kpts, thr=0.2):
+    """Body bones + per-part coloured points for one 133-keypoint person."""
+    import cv2
+
+    pts = list(kpts)
+    for a, b in _COCO_SKELETON:
+        if a < len(pts) and b < len(pts) and pts[a].score > thr and pts[b].score > thr:
+            cv2.line(vis, (int(pts[a].x), int(pts[a].y)),
+                     (int(pts[b].x), int(pts[b].y)), (0, 255, 0), 2, cv2.LINE_AA)
+    for _, sl, color in WHOLEBODY_PARTS:
+        # Face and hands are dense and small; a 1-px dot keeps them readable.
+        r = 3 if sl.stop - sl.start <= 23 else 1
+        for kp in pts[sl]:
+            if kp.score > thr:
+                cv2.circle(vis, (int(kp.x), int(kp.y)), r, color, -1, cv2.LINE_AA)
+
+
 def _text_patch_into_box(canvas, box, text, color):
     """Render `text` to fill a (rotated) 4-point box and composite onto `canvas`
     (PaddleOCR draw_box_txt_fine-style). `box` is 4 (x,y) points TL,TR,BR,BL.
@@ -330,6 +429,9 @@ class Task:
         elif k == "semseg":
             cfg = b.SegConfig(); cfg.channels_first = False  # deeplabv3plus is NHWC [1,H,W,C]
             self.dec = b.Segmenter(self.engine, cfg)         # argmax over 19 channels
+        elif k == "semseg_rt":
+            cfg = b.SegConfig(); cfg.channels_first = True   # PIDNet is NCHW [1,C,H,W]
+            self.dec = b.Segmenter(self.engine, cfg)         # same decode, 19 channels
         elif k == "depth":
             self.dec = b.DepthEstimator(self.engine)
         else:
@@ -355,7 +457,7 @@ class Task:
             return self.dec.detect([self.y, self.uv], self.lb, self.orig_w, self.orig_h)
         if k == "cls":
             return self.dec.classify([self.y, self.uv])
-        if k == "semseg":          # 2-input NV12 -> feed both, then argmax decode
+        if k in ("semseg", "semseg_rt"):   # 2-input NV12 -> feed both, then argmax decode
             self.engine._e.set_input(0, self.y)
             self.engine._e.set_input(1, self.uv)
             self.engine._e.infer(0)
@@ -369,7 +471,7 @@ class Task:
         k = self.key
         if k in ("seg", "yoloe_seg"):
             return self.dec.postprocess(self.lb, self.orig_w, self.orig_h)
-        if k in ("cls", "semseg", "depth"):
+        if k in ("cls", "semseg", "semseg_rt", "depth"):
             return self.dec.postprocess()
         return self.dec.postprocess(self.lb)
 
@@ -384,7 +486,7 @@ class Task:
             return f"{len(results)} instance(s)"
         if k == "obb":
             return f"{len(results)} rotated box(es)"
-        if k == "semseg":
+        if k in ("semseg", "semseg_rt"):
             n = int(np.unique(np.asarray(results.labels)).size)
             return f"{results.width}x{results.height} seg, {n} classes"
         if k == "depth":
@@ -784,10 +886,415 @@ class StereoTask:
         return np.hstack(panels)
 
 
+class WholeBodyTask:
+    """ViTPose whole-body 133 keypoints, TOP-DOWN: a YOLO person detector feeds
+    one crop per person to the pose model. Duck-types the Task API so the bench /
+    test harness drives it like a single-model task, but note what the timings
+    mean here — infer() is ONE person, while decode() runs every person in the
+    frame, so end-to-end cost scales with the head count. That is inherent to
+    top-down and is the trade for resolving feet, face and hands."""
+
+    key = "wholebody"
+    names = None
+
+    def __init__(self, bcdl):
+        import cv2
+
+        self.bcdl = bcdl
+        self.model_file = WHOLEBODY_MODEL
+        self.image_file = asset(WHOLEBODY_IMAGE)
+        self.img = cv2.imread(self.image_file, cv2.IMREAD_COLOR)
+        if self.img is None:
+            raise RuntimeError(f"cannot read test image: {self.image_file}")
+        self.orig_h, self.orig_w = self.img.shape[:2]
+
+        # Stage 1: person boxes, once — they are the same every run, so keeping
+        # them out of decode() keeps the reported pose cost the pose cost.
+        self.det_engine = bcdl.Engine(WHOLEBODY_DET)
+        cfg = bcdl.YoloLtrbConfig()
+        cfg.num_classes = 80
+        cfg.conf_thresh = 0.5
+        cfg.strides = [8, 16, 32]
+        det = bcdl.YoloLtrbDetector(self.det_engine, cfg)
+        y, uv, lb = preprocess_nv12(bcdl, self.img, 640, 640)
+        self.boxes = [(d.x1, d.y1, d.x2, d.y2) for d in det.detect([y, uv], lb)
+                      if d.class_id == 0]
+
+        # Stage 2: the pose model itself.
+        self.engine = bcdl.Engine(self.model_file)
+        self.est = bcdl.WholeBodyEstimator(self.engine)
+        self.in_w, self.in_h = self.est.in_w, self.est.in_h
+        if self.boxes:
+            self.x, self.crop = bcdl.wholebody_preprocess(
+                self.img, *[float(v) for v in self.boxes[0]], self.in_w, self.in_h,
+                self.est.config)
+        else:
+            self.x = np.zeros((1, 3, self.in_h, self.in_w), np.float32)
+            self.crop = bcdl.WholeBodyCrop()
+
+    def feed(self):
+        self.engine._e.set_input(0, self.x)
+
+    def infer(self):
+        self.engine._e.infer(0)
+
+    def decode(self):
+        """Every person in the frame: preprocess + infer + decode, one at a time."""
+        return [self.est.estimate(self.img, b) for b in self.boxes]
+
+    def postprocess(self):
+        """Decode the engine's current output (after feed()+infer()) — person 0."""
+        return self.est.postprocess(self.crop)
+
+    def summarize(self, res):
+        if not res:
+            return "0 person(s)"
+        vis = [sum(1 for kp in person if kp.score > 0.2) for person in res]
+        return "%d person(s), %d keypoints, %s visible" % (
+            len(res), len(res[0]), "/".join(str(v) for v in vis))
+
+    def draw(self, res):
+        import cv2
+
+        vis = self.img.copy()
+        for person in res:
+            _draw_wholebody(vis, person)
+        legend_y = 26          # put_label anchors the label's bottom edge
+        for name, sl, color in WHOLEBODY_PARTS:
+            put_label(vis, "%s (%d)" % (name, sl.stop - sl.start), 8, legend_y, color, fh=16)
+            legend_y += 22
+        return vis
+
+
+class FeaturesTask:
+    """XFeat sparse features: extract from a PAIR of images and match them.
+
+    Duck-types the Task API, but note what the numbers mean: infer() is ONE
+    image, while decode() extracts both and matches, and matching is
+    O(|a|*|b|*64) — at the default 4096 features per side that dominates the
+    frame, which is why XfeatConfig.top_k is the knob worth reaching for."""
+
+    key = "features"
+    names = None
+
+    def __init__(self, bcdl):
+        import cv2
+
+        self.bcdl = bcdl
+        self.model_file = FEATURES_MODEL
+        self.image_file = FEATURES_LEFT
+        self.a = cv2.imread(FEATURES_LEFT, cv2.IMREAD_COLOR)
+        self.b = cv2.imread(FEATURES_RIGHT, cv2.IMREAD_COLOR)
+        if self.a is None or self.b is None:
+            raise RuntimeError("cannot read the feature image pair")
+        self.orig_h, self.orig_w = self.a.shape[:2]
+
+        self.engine = bcdl.Engine(self.model_file)
+        self.ext = bcdl.FeatureExtractor(self.engine)
+        self.in_w, self.in_h = self.ext.in_w, self.ext.in_h
+        self.x, _, _ = bcdl.xfeat_preprocess(self.a, self.in_w, self.in_h)
+
+    def feed(self):
+        self.engine._e.set_input(0, self.x)
+
+    def infer(self):
+        self.engine._e.infer(0)
+
+    def decode(self):
+        fa = self.ext.extract(self.a)
+        fb = self.ext.extract(self.b)
+        return fa, fb, self.bcdl.match_features(fa, fb, 0.82)
+
+    def postprocess(self):
+        """Decode the engine's current output (after feed()+infer()) — image A."""
+        sx = self.orig_w / self.in_w
+        sy = self.orig_h / self.in_h
+        return self.ext.postprocess(sx, sy)
+
+    def summarize(self, res):
+        fa, fb, m = res
+        s = f"{len(fa)}+{len(fb)} features, {len(m)} matches"
+        try:
+            import cv2
+
+            # A FUNDAMENTAL matrix, not a homography: these are two views of a
+            # scene with real depth (box, keyboard and desk at different
+            # distances), so no single plane explains the correspondences and a
+            # homography's inlier rate would read as a failure when nothing has
+            # failed. Epipolar geometry is the right constraint for any rigid
+            # scene, planar or not.
+            if len(m) >= 8:
+                pa = fa.xy[[x.a for x in m]]
+                pb = fb.xy[[x.b for x in m]]
+                _, inl = cv2.findFundamentalMat(pa, pb, cv2.USAC_MAGSAC, 2.0, 0.999, 10000)
+                if inl is not None:
+                    s += f"; {100.0 * inl.sum() / len(m):.0f}% epipolar-consistent"
+        except ImportError:
+            pass
+        return s
+
+    def draw(self, res):
+        """The two frames side by side with match lines drawn across the seam."""
+        import cv2
+
+        fa, fb, m = res
+        ha, wa = self.a.shape[:2]
+        hb, wb = self.b.shape[:2]
+        H = max(ha, hb)
+        vis = np.zeros((H, wa + wb, 3), np.uint8)
+        vis[:ha, :wa] = self.a
+        vis[:hb, wa:] = self.b
+
+        pa = fa.xy
+        pb = fb.xy
+        for kp in pa:
+            cv2.circle(vis, (int(kp[0]), int(kp[1])), 1, (0, 180, 255), -1)
+        for kp in pb:
+            cv2.circle(vis, (int(kp[0]) + wa, int(kp[1])), 1, (0, 180, 255), -1)
+
+        # Colour each line by its cosine so a weak match reads as weak.
+        shown = sorted(m, key=lambda x: -x.score)[:300]
+        for x in shown:
+            t = float(np.clip((x.score - 0.82) / 0.18, 0, 1))
+            color = (int(60 + 40 * t), int(80 + 175 * t), int(255 - 120 * t))
+            p, q = pa[x.a], pb[x.b]
+            cv2.line(vis, (int(p[0]), int(p[1])), (int(q[0]) + wa, int(q[1])),
+                     color, 1, cv2.LINE_AA)
+        put_label(vis, f"{len(fa)} + {len(fb)} features", 8, 26, (0, 180, 255), fh=18)
+        put_label(vis, f"{len(m)} mutual-NN matches ({len(shown)} drawn)", 8, 50,
+                  (80, 255, 135), fh=18)
+        return vis
+
+
+class SuperResTask:
+    """x4 super-resolution applied by tiling a fixed-size upscaler.
+
+    The LR input is a real image downscaled by the model's own scale factor, so
+    the original doubles as ground truth and the result can be scored honestly
+    rather than just looked at."""
+
+    names = None
+
+    def __init__(self, bcdl, key="superres"):
+        import cv2
+
+        self.bcdl = bcdl
+        self.key = key
+        self.model_file = SUPERRES_MODEL if key == "superres" else SUPERRES_SPAN_MODEL
+        self.image_file = asset(SUPERRES_IMAGE)
+        src = cv2.imread(self.image_file, cv2.IMREAD_COLOR)
+        if src is None:
+            raise RuntimeError(f"cannot read test image: {self.image_file}")
+
+        self.engine = bcdl.Engine(self.model_file)
+        self.sr = bcdl.SuperResolver(self.engine)
+        s = self.sr.scale
+        # Crop to a multiple of the scale so the downscale is exact and the
+        # ground truth lines up pixel for pixel.
+        h, w = (src.shape[0] // s) * s, (src.shape[1] // s) * s
+        self.hr = src[:h, :w]
+        self.img = cv2.resize(self.hr, (w // s, h // s), interpolation=cv2.INTER_AREA)
+        self.orig_h, self.orig_w = self.img.shape[:2]
+        self.in_w = self.in_h = self.sr.tile
+        self.x = np.ascontiguousarray(
+            np.zeros((1, 3, self.in_h, self.in_w), np.float32))
+
+    def feed(self):
+        self.engine._e.set_input(0, self.x)
+
+    def infer(self):
+        self.engine._e.infer(0)
+
+    def decode(self):
+        return self.sr.upscale(self.img)
+
+    def postprocess(self):
+        return self.decode()
+
+    @staticmethod
+    def _psnr(a, b):
+        mse = np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)
+        return 10 * np.log10(255.0 ** 2 / mse) if mse > 0 else float("inf")
+
+    @staticmethod
+    def _detail(img):
+        """Mean gradient magnitude — a stand-in for how much fine structure an
+        image actually carries."""
+        g = img.astype(np.float64).mean(axis=2)
+        return float(np.hypot(np.gradient(g)[0], np.gradient(g)[1]).mean())
+
+    def summarize(self, res):
+        import cv2
+
+        bic = cv2.resize(self.img, (self.hr.shape[1], self.hr.shape[0]),
+                         interpolation=cv2.INTER_CUBIC)
+        # BOTH numbers, because they disagree and the disagreement is the point:
+        # this is a perceptual, GAN-trained upscaler, so on a clean downscale a
+        # conservative blur wins PSNR while carrying visibly less detail.
+        d_hr = self._detail(self.hr)
+        return ("%dx%d -> %dx%d, %d tiles; PSNR %.1f dB (bicubic %.1f); "
+                "detail %.2fx of truth (bicubic %.2fx)"
+                % (self.orig_w, self.orig_h, res.shape[1], res.shape[0],
+                   self.sr.last_tile_count, self._psnr(res, self.hr),
+                   self._psnr(bic, self.hr), self._detail(res) / d_hr,
+                   self._detail(bic) / d_hr))
+
+    def draw(self, res):
+        """LR (nearest-enlarged) | model | bicubic | ground truth, on one crop —
+        a whole-frame view at this scale shows nothing useful."""
+        import cv2
+
+        s = self.sr.scale
+        cw = min(240, self.orig_w)
+        ch = min(160, self.orig_h)
+        x = (self.orig_w - cw) // 2
+        y = (self.orig_h - ch) // 2
+        lr = self.img[y:y + ch, x:x + cw]
+        panels = [
+            cv2.resize(lr, (cw * s, ch * s), interpolation=cv2.INTER_NEAREST),
+            res[y * s:(y + ch) * s, x * s:(x + cw) * s],
+            cv2.resize(lr, (cw * s, ch * s), interpolation=cv2.INTER_CUBIC),
+            self.hr[y * s:(y + ch) * s, x * s:(x + cw) * s],
+        ]
+        titles = ["input (nearest)", "model x%d" % s, "bicubic x%d" % s, "ground truth"]
+        out = []
+        for p, t in zip(panels, titles):
+            bar = np.zeros((28, p.shape[1], 3), np.uint8)
+            cv2.putText(bar, t, (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (255, 255, 255), 1, cv2.LINE_AA)
+            out.append(np.vstack([bar, p]))
+        return np.hstack(out)
+
+
+class ReidTask:
+    """Person ReID (OSNet): a YOLO detector supplies boxes, the ReID model turns
+    each crop into a 512-d appearance vector. Duck-types the Task API.
+
+    WHAT THE TIMINGS MEAN. infer() is ONE crop; decode() embeds every person in
+    the frame, so cost scales with the head count exactly like the top-down pose
+    task. In a tracker this runs on the high-score detections of every frame,
+    which is what makes it the expensive half of appearance tracking.
+
+    WHAT THE FIGURE SHOWS. An embedding has nothing to draw, so the check image
+    is the cross-similarity matrix between the people found: the diagonal is 1
+    by construction and the off-diagonal entries are what the tracker relies on
+    being small. A tower that has collapsed under quantization gives a matrix of
+    near-ones while still returning perfectly well-formed unit vectors.
+    """
+
+    key = "reid"
+    names = None
+
+    def __init__(self, bcdl):
+        import cv2
+
+        self.bcdl = bcdl
+        self.model_file = REID_MODEL
+        self.image_file = asset(REID_IMAGE)
+        self.img = cv2.imread(self.image_file, cv2.IMREAD_COLOR)
+        if self.img is None:
+            raise RuntimeError(f"cannot read test image: {self.image_file}")
+        self.orig_h, self.orig_w = self.img.shape[:2]
+
+        # Stage 1: person boxes, once — same every run, so keeping them out of
+        # decode() keeps the reported ReID cost the ReID cost.
+        self.det_engine = bcdl.Engine(REID_DET)
+        cfg = bcdl.YoloLtrbConfig()
+        cfg.num_classes = 80
+        cfg.conf_thresh = 0.5
+        cfg.strides = [8, 16, 32]
+        det = bcdl.YoloLtrbDetector(self.det_engine, cfg)
+        y, uv, lb = preprocess_nv12(bcdl, self.img, 640, 640)
+        self.dets = [d for d in det.detect([y, uv], lb) if d.class_id == 0]
+
+        # Stage 2: the ReID model.
+        self.engine = bcdl.Engine(self.model_file)
+        self.ex = bcdl.ReIDExtractor(self.engine)
+        self.in_w, self.in_h = 128, 256
+        self.x = (self._crop_input(self.dets[0]) if self.dets
+                  else np.zeros((1, 3, self.in_h, self.in_w), np.float32))
+
+    def _crop_input(self, d):
+        x1, y1 = max(0, int(d.x1)), max(0, int(d.y1))
+        x2, y2 = min(self.orig_w, int(d.x2)), min(self.orig_h, int(d.y2))
+        return self.bcdl.reid_preprocess(self.img[y1:y2, x1:x2])
+
+    def feed(self):
+        self.engine._e.set_input(0, self.x)
+
+    def infer(self):
+        self.engine._e.infer(0)
+
+    def decode(self):
+        """Every person in the frame: crop + preprocess + infer + read-out."""
+        return self.ex.embed_detections(self.img, self.dets)
+
+    def postprocess(self):
+        """Read the engine's current output (after feed()+infer()) — person 0."""
+        return self.ex.postprocess()
+
+    def summarize(self, res):
+        vecs = [np.asarray(v, np.float32) for v in res if len(v)]
+        if len(vecs) < 2:
+            return "%d person(s), %d-d embeddings" % (len(vecs), self.ex.dim)
+        sim = np.stack(vecs) @ np.stack(vecs).T
+        off = sim[~np.eye(len(vecs), dtype=bool)]
+        return "%d person(s), %d-d, cross-similarity max %.3f mean %.3f" % (
+            len(vecs), self.ex.dim, off.max(), off.mean())
+
+    def draw(self, res):
+        import cv2
+
+        vecs = [np.asarray(v, np.float32) for v in res if len(v)]
+        vis = self.img.copy()
+        for i, d in enumerate(self.dets[:len(vecs)]):
+            cv2.rectangle(vis, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)),
+                          (0, 200, 255), 2)
+            put_label(vis, "#%d" % i, int(d.x1), int(d.y1) - 4, (0, 200, 255))
+        if len(vecs) < 2:
+            return vis
+
+        # Similarity matrix panel, scaled to the frame height.
+        sim = np.stack(vecs) @ np.stack(vecs).T
+        n = len(vecs)
+        cell = max(40, min(90, self.orig_h // (n + 1)))
+        panel = np.full(((n + 1) * cell, (n + 1) * cell, 3), 30, np.uint8)
+        for i in range(n):
+            put_label(panel, "#%d" % i, 6, (i + 2) * cell - cell // 3, (0, 200, 255))
+            put_label(panel, "#%d" % i, (i + 1) * cell + 6, cell - cell // 3,
+                      (0, 200, 255))
+        for i in range(n):
+            for j in range(n):
+                v = float(sim[i, j])
+                # Green = distinct (what we want off-diagonal), red = alike.
+                color = (0, int(255 * (1 - max(0.0, v))), int(255 * max(0.0, v)))
+                y0, x0 = (i + 1) * cell, (j + 1) * cell
+                cv2.rectangle(panel, (x0 + 2, y0 + 2),
+                              (x0 + cell - 2, y0 + cell - 2), color, -1)
+                cv2.putText(panel, "%.2f" % v, (x0 + 6, y0 + cell // 2 + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1,
+                            cv2.LINE_AA)
+        h = max(vis.shape[0], panel.shape[0])
+        def _pad(a):
+            return np.vstack([a, np.full((h - a.shape[0], a.shape[1], 3), 30,
+                                         np.uint8)]) if a.shape[0] < h else a
+        return np.hstack([_pad(vis), _pad(panel)])
+
+
 def make_task(bcdl, key):
-    """Factory: OcrTask for 'ocr', StereoTask for 'stereo', else single-model Task."""
+    """Factory: OcrTask for 'ocr', StereoTask for 'stereo', WholeBodyTask for
+    'wholebody', FeaturesTask for 'features', SuperResTask for 'superres',
+    ReidTask for 'reid', else single-model Task."""
+    if key == "reid":
+        return ReidTask(bcdl)
+    if key == "features":
+        return FeaturesTask(bcdl)
+    if key in ("superres", "superres_span"):
+        return SuperResTask(bcdl, key)
     if key == "ocr":
         return OcrTask(bcdl)
     if key == "stereo":
         return StereoTask(bcdl)
+    if key == "wholebody":
+        return WholeBodyTask(bcdl)
     return Task(bcdl, key)

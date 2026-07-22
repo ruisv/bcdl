@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.join(_HERE, "..", "tests"))
 import board_models as bm  # noqa: E402
 
 TASK_ORDER = ["cls", "det", "det_dfl", "pose", "seg", "obb", "semseg", "depth", "stereo", "ocr",
-              "yoloe_det", "yoloe_seg"]
+              "yoloe_det", "yoloe_seg", "wholebody", "features", "superres",
+              "superres_span", "reid"]
 
 
 def read_rss_mb():
@@ -430,6 +431,41 @@ def run_child(key, figdir):
     return None
 
 
+# Tasks whose timing has been stable across every clean run, used to tell a
+# contended board from a real change. `det` is small and `depth` is large, so
+# between them they catch both per-call and sustained interference.
+CANARY_TASKS = ("det", "depth")
+CANARY_TOLERANCE = 1.4          # allow 40% over the recorded time before judging
+
+
+def check_contended(rows, reference_path):
+    """Return a complaint if the canary tasks ran much slower than they did in
+    the committed results, else None.
+
+    THE BOARD MAY BE SHARED, and nothing observable from inside this process
+    says so: load average is pinned near the core count by permanently
+    D-state kernel threads, a process check can land between bursts of someone
+    else's job, and `hrt_model_exec` is just as susceptible as this script is.
+    The only reliable signal found was the RESULT — timings for the same model
+    have varied 30x on this board depending on what else was running. So the
+    check is: did work we have measured many times suddenly get slower?
+    """
+    try:
+        with open(reference_path) as f:
+            ref = {r["task"]: r for r in json.load(f)["results"]}
+    except (OSError, ValueError, KeyError):
+        return None                      # no baseline yet; nothing to compare
+    got = {r["task"]: r for r in rows}
+    bad = []
+    for task in CANARY_TASKS:
+        if task in ref and task in got and ref[task]["infer_ms"] > 0:
+            ratio = got[task]["infer_ms"] / ref[task]["infer_ms"]
+            if ratio > CANARY_TOLERANCE:
+                bad.append("%s %.2fms vs %.2fms recorded (%.1fx)"
+                           % (task, got[task]["infer_ms"], ref[task]["infer_ms"], ratio))
+    return "; ".join(bad) if bad else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", help="bench a single task in-process (internal)")
@@ -437,6 +473,9 @@ def main():
     ap.add_argument("--track", action="store_true", help="generate tracking figure (internal)")
     ap.add_argument("--edgesam", action="store_true", help="run EdgeSAM two-stage bench (internal)")
     ap.add_argument("--figdir", default=None)
+    ap.add_argument("--retry-until-clean", type=int, default=0, metavar="N",
+                    help="re-run up to N times until the timings agree with the "
+                         "committed results.json (see check_contended)")
     args = ap.parse_args()
 
     outdir = os.environ.get("BCDL_BENCH_OUT", "benchmarks")
@@ -458,6 +497,31 @@ def main():
             print("EDGESAM_JSON:" + json.dumps(r))
         return
 
+    reference = os.path.join(outdir, "results.json")
+    for attempt in range(1, max(1, args.retry_until_clean + 1) + 1):
+        info, rows, decode_rows = run_all(figdir)
+        contended = check_contended(rows, reference)
+        if contended is None or attempt > args.retry_until_clean:
+            if contended is not None:
+                print("\n!! timings look contended (%s) — keeping the run anyway"
+                      % contended)
+            break
+        print("\n!! attempt %d looks contended (%s) — discarding and retrying"
+              % (attempt, contended))
+
+    if rows:
+        os.makedirs(outdir, exist_ok=True)
+        with open(os.path.join(outdir, "results.json"), "w") as f:
+            json.dump({"board": info, "results": rows, "decode": decode_rows}, f, indent=2)
+        write_md(rows, info, os.path.join(outdir, "RESULTS.md"), decode_rows)
+        print(f"\nwrote {outdir}/results.json + RESULTS.md + figures/")
+    else:
+        print("no tasks ran (no models found)")
+
+
+def run_all(figdir):
+    """One full pass: every task, plus the decode compare, tracking figure and
+    EdgeSAM bench, each in its own process."""
     info = board_info()
     rows = []
     for key in TASK_ORDER:
@@ -501,14 +565,7 @@ def main():
             print(f"{'edgesam':5s} enc {r['infer_ms']:6.2f}ms  e2e {r['e2e_ms']:6.2f}ms  "
                   f"mem {r['mem_mb']:5.1f}MB  model {r['model_mb']:5.1f}MB  -> {r['summary']}")
 
-    if rows:
-        os.makedirs(outdir, exist_ok=True)
-        with open(os.path.join(outdir, "results.json"), "w") as f:
-            json.dump({"board": info, "results": rows, "decode": decode_rows}, f, indent=2)
-        write_md(rows, info, os.path.join(outdir, "RESULTS.md"), decode_rows)
-        print(f"\nwrote {outdir}/results.json + RESULTS.md + figures/")
-    else:
-        print("no tasks ran (no models found)")
+    return info, rows, decode_rows
 
 
 if __name__ == "__main__":

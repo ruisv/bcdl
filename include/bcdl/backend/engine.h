@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -49,8 +50,35 @@ class Engine {
   /// Allocated byte size of input[i]'s device buffer (post stride-resolution).
   std::size_t inputBytes(int i) const { return input_mem_[i].size(); }
 
+  /// Byte size of input[i] as a PACKED (contiguous, row-major) host array —
+  /// product of the valid dims times the element size. Differs from
+  /// inputBytes(i) whenever the model pads a dimension; see setInput().
+  std::size_t inputPackedBytes(int i) const;
+
+  /// Resolved byte strides of input[i], innermost last (dynamic -1 strides are
+  /// resolved at load time). Anyone writing an input buffer directly instead of
+  /// through setInput() must honor these.
+  std::vector<std::int64_t> inputStride(int i) const;
+
+  /// Resolved byte strides of output[i], innermost last. Outputs are padded too
+  /// — a [1,133,64,48] F32 heatmap comes back with a 256-byte row stride, so a
+  /// flat reshape of outputData() shears every map. outputAsFloat() handles this;
+  /// anyone reading the buffer directly needs these.
+  std::vector<std::int64_t> outputStride(int i) const;
+
   /// Copy `bytes` of host data into input[i]'s device buffer and flush.
+  ///
+  /// `bytes` must be either inputPackedBytes(i) — a contiguous row-major array,
+  /// which is scattered row by row into the model's (possibly padded) layout —
+  /// or inputBytes(i), data already laid out in the device stride. Anything else
+  /// throws rather than being copied in as a short prefix: a model whose row
+  /// stride is padded (ArcFace R50: 112 f32 = 448 B/row padded to 512) would
+  /// silently take a packed array as garbage, shifting every row after the first.
   void setInput(int i, const void* data, std::size_t bytes);
+
+  /// Read-only view of input[i]'s device buffer, in the device layout. For
+  /// diagnostics — the way to see how setInput() laid a packed array out.
+  const void* inputData(int i) const { return input_mem_[i].data(); }
 
   /// Submit + wait + invalidate output caches. timeout_ms == 0 blocks forever.
   void infer(int timeout_ms = 0);

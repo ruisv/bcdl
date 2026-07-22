@@ -48,6 +48,27 @@ class Engine:
         """Allocated device-buffer size for input i (post BPU stride alignment)."""
         return self._e.input_bytes(i)
 
+    def input_packed_bytes(self, i: int) -> int:
+        """Size of input i as a contiguous row-major array.
+
+        Smaller than :meth:`input_bytes` when the model pads a dimension —
+        ArcFace R50's 112 f32 rows (448 B) are padded to 512 B, for instance.
+        """
+        return self._e.input_packed_bytes(i)
+
+    def input_stride(self, i: int) -> list[int]:
+        """Resolved byte strides of input i, innermost last."""
+        return self._e.input_stride(i)
+
+    def output_stride(self, i: int) -> list[int]:
+        """Resolved byte strides of output i, innermost last.
+
+        Outputs get padded as well: a ``[1,133,64,48]`` float heatmap comes back
+        with a 256-byte row stride, so reshaping ``output_bytes`` flat shears
+        every map. The task decoders already de-stride; direct readers need this.
+        """
+        return self._e.output_stride(i)
+
     def output_shape(self, i: int) -> list[int]:
         return self._e.output_shape(i)
 
@@ -182,6 +203,14 @@ class Detector:
         the model's input buffer layout."""
         self.engine._e.set_input(0, np.ascontiguousarray(model_input))
         self.engine._e.infer(timeout_ms)
+        return self._det.postprocess(lb)
+
+    def postprocess(self, lb: LetterboxInfo):
+        """Decode the Engine's current output (run engine.infer() first).
+
+        Needed for MULTI-HEAD models, where one inference feeds several decoders
+        — a panoptic driving model emits detection plus two segmentation masks,
+        and :meth:`detect` cannot express "infer once, decode three outputs"."""
         return self._det.postprocess(lb)
 
 
@@ -374,6 +403,301 @@ class Segmenter:
     def postprocess(self) -> "SegMask":
         """Post-process the Engine's current output (run engine.infer() first)."""
         return self._s.postprocess()
+
+
+# --- face: detection with 5 landmarks + alignment for recognition ----------
+# Recognition itself reuses the embedding task: an aligned crop goes through
+# ImageEmbedder and matching is EmbeddingBank. What is face-specific is the
+# landmark decode and the warp onto the canonical template — feeding a plain box
+# crop to a recognition model degrades embeddings badly without erroring.
+FaceDetection = bcdl_py.FaceDetection
+FaceDetectConfig = bcdl_py.FaceDetectConfig
+decode_scrfd = bcdl_py.decode_scrfd
+arcface_template = bcdl_py.arcface_template
+similarity_transform = bcdl_py.similarity_transform
+align_face = bcdl_py.align_face
+
+
+def face_letterbox(img: np.ndarray, size: int = 640):
+    """Preprocess for the SCRFD detector: scale to fit and pad BOTTOM-RIGHT.
+
+    This differs from :func:`letterbox_numpy`, which centres the content. The
+    reference SCRFD preprocessing puts the image at the top-left corner, so the
+    returned LetterboxInfo carries pad_x = pad_y = 0; passing a centred letterbox
+    to the decoder instead shifts every box and landmark by the pad."""
+    import cv2
+
+    h0, w0 = img.shape[:2]
+    r = min(size / w0, size / h0)
+    nw, nh = int(round(w0 * r)), int(round(h0 * r))
+    canvas = np.zeros((size, size, 3), np.uint8)
+    canvas[:nh, :nw] = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    lb = compute_letterbox(w0, h0, size, size, True)
+    lb.pad_x = 0.0
+    lb.pad_y = 0.0
+    lb.scale = r
+    return canvas, lb
+
+
+class FaceDetector:
+    """High-level SCRFD face detector: wraps an Engine + FaceDetectConfig,
+    returning boxes with five landmarks in original-image pixels. Pair with
+    :func:`face_letterbox` for preprocessing and :func:`align_face` before
+    embedding."""
+
+    def __init__(self, engine: "Engine", config: "FaceDetectConfig | None" = None,
+                 output_base: int = 0):
+        self.engine = engine
+        self.config = config if config is not None else FaceDetectConfig()
+        self._det = bcdl_py.FaceDetector(engine._e, self.config, output_base)
+
+    def detect(self, inputs: "list[np.ndarray]", lb: LetterboxInfo, timeout_ms: int = 0):
+        for i, arr in enumerate(inputs):
+            self.engine._e.set_input(i, np.ascontiguousarray(arr))
+        self.engine._e.infer(timeout_ms)
+        return self._det.postprocess(lb)
+
+    def postprocess(self, lb: LetterboxInfo):
+        """Decode the Engine's current output (run engine.infer() first)."""
+        return self._det.postprocess(lb)
+
+
+# --- whole-body pose: 133 keypoints, top-down -----------------------------
+# TOP-DOWN, unlike PoseEstimator: this runs once per PERSON on a crop, so it
+# needs a detector in front of it and its cost scales with the head count. In
+# exchange it resolves feet, face and hands, which a 17-joint bottom-up head
+# does not have at all.
+WholeBodyCrop = bcdl_py.WholeBodyCrop
+WholeBodyConfig = bcdl_py.WholeBodyConfig
+wholebody_preprocess = bcdl_py.wholebody_preprocess
+decode_wholebody = bcdl_py.decode_wholebody
+
+
+class WholeBodyEstimator:
+    """High-level ViTPose whole-body estimator: wraps an Engine, taking a BGR
+    frame plus one person box and returning 133 keypoints in original-image
+    pixels.
+
+    Keypoint layout (COCO-WholeBody): 0-16 body, 17-22 feet, 23-90 face,
+    91-111 left hand, 112-132 right hand.
+    """
+
+    def __init__(self, engine: "Engine", config: "WholeBodyConfig | None" = None,
+                 output_index: int = 0):
+        self.engine = engine
+        self.config = config if config is not None else WholeBodyConfig()
+        self._est = bcdl_py.WholeBodyEstimator(engine._e, self.config, output_index)
+        shape = engine.input_shape(0)          # [1,3,H,W]
+        self.in_h, self.in_w = int(shape[2]), int(shape[3])
+
+    def estimate(self, bgr: np.ndarray, box, timeout_ms: int = 0):
+        """Run one person: preprocess the crop, infer, decode."""
+        x, crop = wholebody_preprocess(bgr, float(box[0]), float(box[1]), float(box[2]),
+                                       float(box[3]), self.in_w, self.in_h, self.config)
+        self.engine._e.set_input(0, x)
+        self.engine._e.infer(timeout_ms)
+        return self._est.postprocess(crop)
+
+    def postprocess(self, crop: "WholeBodyCrop"):
+        """Decode the Engine's current output (run engine.infer() first)."""
+        return self._est.postprocess(crop)
+
+
+# --- sparse local features (XFeat) + matching ------------------------------
+# The detector/descriptor half of the geometric-vision layer, alongside stereo
+# and GDC. Only the convolutional trunk is on the BPU: the input's InstanceNorm
+# and everything after the three maps (softmax, NMS, top-k, sparse sampling) run
+# here, because they are data-dependent and would put dynamic control flow in a
+# graph that is otherwise straight-line.
+Feature = bcdl_py.Feature
+FeatureMatch = bcdl_py.FeatureMatch
+FeatureSet = bcdl_py.FeatureSet
+XfeatConfig = bcdl_py.XfeatConfig
+xfeat_preprocess = bcdl_py.xfeat_preprocess
+decode_xfeat = bcdl_py.decode_xfeat
+match_features = bcdl_py.match_features
+
+
+class FeatureExtractor:
+    """High-level XFeat extractor: a BGR frame in, keypoints + L2-normalized
+    64-d descriptors out, in original-image pixels.
+
+    Pair with :func:`match_features` for mutual-NN matching; descriptors are
+    unit-length, so a plain dot product is the cosine similarity.
+    """
+
+    def __init__(self, engine: "Engine", config: "XfeatConfig | None" = None,
+                 output_base: int = 0):
+        self.engine = engine
+        self.config = config if config is not None else XfeatConfig()
+        self._ext = bcdl_py.FeatureExtractor(engine._e, self.config, output_base)
+        shape = engine.input_shape(0)           # [1,1,H,W]
+        self.in_h, self.in_w = int(shape[2]), int(shape[3])
+
+    def extract(self, bgr: np.ndarray, timeout_ms: int = 0) -> "FeatureSet":
+        return self._ext.extract(bgr, timeout_ms)
+
+    def postprocess(self, scale_x: float = 1.0, scale_y: float = 1.0) -> "FeatureSet":
+        """Decode the Engine's current outputs (run engine.infer() first)."""
+        return self._ext.postprocess(scale_x, scale_y)
+
+
+# --- super-resolution (tiled) ---------------------------------------------
+# The model upscales one FIXED tile, so an arbitrary image is cut into
+# overlapping tiles and cross-faded back together. The overlap is not cosmetic:
+# pixels near a tile edge see a truncated receptive field, and butt-joining
+# tiles turns that into a visible straight-line seam.
+SuperResConfig = bcdl_py.SuperResConfig
+TilePlacement = bcdl_py.TilePlacement
+plan_tiles = bcdl_py.plan_tiles
+tile_weight = bcdl_py.tile_weight
+
+
+class SuperResolver:
+    """High-level tiled upscaler: a BGR image in, a `scale`x BGR image out.
+
+    ``scale`` and ``tile`` come from the model's own shapes, not from config.
+    """
+
+    def __init__(self, engine: "Engine", config: "SuperResConfig | None" = None,
+                 input_index: int = 0, output_index: int = 0):
+        self.engine = engine
+        self.config = config if config is not None else SuperResConfig()
+        self._sr = bcdl_py.SuperResolver(engine._e, self.config, input_index, output_index)
+
+    def upscale(self, bgr: np.ndarray, timeout_ms: int = 0) -> np.ndarray:
+        return self._sr.upscale(bgr, timeout_ms)
+
+    @property
+    def scale(self) -> int:
+        return self._sr.scale
+
+    @property
+    def tile(self) -> int:
+        return self._sr.tile
+
+    @property
+    def last_tile_count(self) -> int:
+        """Tiles the last upscale() ran — cost is linear in this."""
+        return self._sr.last_tile_count
+
+
+# --- anchor-based detection (panoptic driving heads) -----------------------
+# Anchor-BASED YOLOv5-style head, as distinct from the anchor-free LTRB/DFL
+# decoders above: a cell predicts an offset from its centre plus a multiplier on
+# a prior box, rather than distances to the box edges. Used by panoptic driving
+# models, whose published exports bake this decode into the graph via ScatterND
+# — which does not survive BPU compilation, so the graph is cut before it and
+# the arithmetic runs here.
+Anchor = bcdl_py.Anchor
+AnchorDetectConfig = bcdl_py.AnchorDetectConfig
+decode_yolov5_anchor = bcdl_py.decode_yolov5_anchor
+
+
+class AnchorDetector:
+    """High-level anchor-based detector: wraps an Engine + AnchorDetectConfig,
+    reading one raw head output per scale starting at ``output_base``.
+    Preprocessing is the caller's responsibility; pass the LetterboxInfo from
+    :func:`letterbox_numpy` so boxes come back in original-image pixels."""
+
+    def __init__(self, engine: "Engine", config: "AnchorDetectConfig | None" = None,
+                 output_base: int = 0):
+        self.engine = engine
+        self.config = config if config is not None else AnchorDetectConfig()
+        self._det = bcdl_py.AnchorDetector(engine._e, self.config, output_base)
+
+    def detect(self, inputs: "list[np.ndarray]", lb: LetterboxInfo, timeout_ms: int = 0):
+        """Set the model inputs in order (e.g. [Y, UV] for NV12), infer, and
+        decode to Detections in original-image pixels."""
+        for i, arr in enumerate(inputs):
+            self.engine._e.set_input(i, np.ascontiguousarray(arr))
+        self.engine._e.infer(timeout_ms)
+        return self._det.postprocess(lb)
+
+    def postprocess(self, lb: LetterboxInfo):
+        """Decode the Engine's current output (run engine.infer() first). This is
+        the entry point for a multi-head model, where one inference feeds this
+        detector plus separate segmentation decoders."""
+        return self._det.postprocess(lb)
+
+
+# --- embeddings: retrieval / zero-shot classification ----------------------
+EmbedConfig = bcdl_py.EmbedConfig
+EmbedMatch = bcdl_py.EmbedMatch
+EmbeddingBank = bcdl_py.EmbeddingBank
+decode_embedding = bcdl_py.decode_embedding
+
+
+def embed_preprocess(img: np.ndarray, size: int = 224, to_rgb: bool = True,
+                     scale: float = 1.0 / 127.5, shift: float = -1.0):
+    """Preprocess a BGR image for a dual-encoder image tower -> ``[1,3,size,size]``
+    float32 NCHW.
+
+    **This is a squashing resize, NOT a letterbox** — and that is deliberate. The
+    image towers of these models are trained on a direct resize to a square, so
+    an aspect-preserving letterbox feeds them grey bars they never saw and moves
+    the output vector enough to cost retrieval accuracy. There is no geometry to
+    invert on the way out (an embedding has no coordinates), so nothing is lost
+    by squashing.
+
+    Defaults implement the usual ``x/127.5 - 1`` normalization into [-1,1] on RGB
+    channel order. Pass ``scale``/``shift`` for a tower with a different
+    convention; check the model card before assuming.
+    """
+    import cv2
+
+    if img.ndim == 2:
+        img = img[:, :, None]
+    resized = cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
+    if resized.ndim == 2:
+        resized = resized[:, :, None]
+    # blobFromImage fuses uint8->f32 + scale + BGR->RGB + HWC->NCHW in one C pass.
+    nchw = cv2.dnn.blobFromImage(
+        resized, scalefactor=float(scale),
+        swapRB=bool(to_rgb and resized.shape[2] == 3), crop=False)
+    if shift:
+        nchw += np.float32(shift)
+    return nchw
+
+
+class ImageEmbedder:
+    """High-level image embedder: wraps an Engine + EmbedConfig, returning one
+    L2-normalized vector per image.
+
+    An embedding ``.hbm`` often packs several submodels (a pooled whole-image
+    vector and a per-patch feature grid). Pick the pooled one when constructing
+    the Engine — ``Engine.model_names(path)`` lists what is inside — and sanity-
+    check :attr:`dim` against the tower's documented width once at startup. A
+    patch-feature submodel flattens to ``num_patches * width`` instead, which
+    this class cannot tell apart from a very wide embedding.
+    """
+
+    def __init__(self, engine: "Engine", config: "EmbedConfig | None" = None,
+                 output_index: int = 0):
+        self.engine = engine
+        self.config = config if config is not None else EmbedConfig()
+        self._e = bcdl_py.ImageEmbedder(engine._e, self.config, output_index)
+
+    @property
+    def dim(self) -> int:
+        """Embedding width, from the bound output's shape."""
+        return self._e.dim
+
+    def embed(self, model_input: np.ndarray, timeout_ms: int = 0):
+        """Run inference on one preprocessed input (see :func:`embed_preprocess`)
+        and read out the embedding as a list of floats."""
+        self.engine._e.set_input(0, np.ascontiguousarray(model_input))
+        self.engine._e.infer(timeout_ms)
+        return self._e.postprocess()
+
+    def embed_image(self, img_bgr: np.ndarray, size: int = 224, timeout_ms: int = 0):
+        """One-call embed of an original BGR frame: :func:`embed_preprocess` then
+        :meth:`embed`."""
+        return self.embed(embed_preprocess(img_bgr, size), timeout_ms)
+
+    def postprocess(self):
+        """Read the Engine's current output as an embedding (infer() first)."""
+        return self._e.postprocess()
 
 
 # --- stereo: two-image disparity / depth (e.g. LAS2) -----------------------
@@ -683,9 +1007,109 @@ class Mono3dDetector:
         return self._d.postprocess(orig_w, orig_h, K)
 
 
+# --- ReID: appearance vectors for tracking ---------------------------------
+# A person-ReID model (OSNet and friends) turns a detection crop into a vector
+# that stays close to itself across frames and far from other identities. That
+# is what lets a tracker survive an occlusion or a crossing that pure motion
+# would lose. There is no new decode here: a ReID head IS an embedding head, so
+# the read-out is ImageEmbedder — what is ReID-specific is the crop geometry and
+# the normalization, both of which live in ReIDExtractor below.
+
+
+ReidConfig = bcdl_py.ReidConfig
+reid_crop_preprocess = bcdl_py.reid_crop_preprocess
+
+
+def reid_preprocess(crop_bgr: np.ndarray, width: int = 128, height: int = 256,
+                    config: "ReidConfig | None" = None):
+    """Preprocess one BGR person crop for a ReID model -> ``[1,3,height,width]``
+    float32 NCHW, ImageNet-normalized.
+
+    **Squashing resize, not a letterbox**, and the 1:2 target shape is not
+    arbitrary: person-ReID models are trained on 256x128 crops squashed from
+    whatever aspect the box had, so padding to preserve aspect feeds them bars
+    they never saw. Defaults are the torchreid convention (RGB, /255, ImageNet
+    mean/std); a model trained otherwise needs its own numbers.
+
+    This delegates to the C++ :func:`reid_crop_preprocess` (the whole crop as the
+    box) rather than repeating the arithmetic in numpy, so the Python path and
+    the C++ ``TrackingPipeline`` cannot drift into feeding the model different
+    pixels. Pass a frame and a box to that function directly to skip the slice.
+    """
+    arr = np.ascontiguousarray(crop_bgr)
+    h, w = arr.shape[:2]
+    return reid_crop_preprocess(arr, 0.0, 0.0, float(w), float(h), width, height,
+                                config if config is not None else ReidConfig())
+
+
+class ReIDExtractor:
+    """Per-detection appearance vectors, ready to hand to ``ByteTracker.update``.
+
+    Wraps an Engine holding a ReID ``.hbm``. The output is L2-normalized, so
+    cosine similarity between two vectors is a dot product — same convention as
+    :class:`EmbeddingBank`, which is what to use for a long-term gallery.
+
+    The model runs ONCE PER CROP, so this is the expensive half of appearance
+    tracking. :meth:`embed_detections` therefore takes a ``min_score``: crops
+    below it get an empty vector instead of an inference, and ByteTracker treats
+    an empty entry as "match this one on geometry alone". Low-score boxes are
+    exactly the occluded and blurred ones whose embeddings are least worth
+    paying for.
+    """
+
+    def __init__(self, engine: "Engine", config: "EmbedConfig | None" = None,
+                 output_index: int = 0):
+        self.engine = engine
+        self.config = config if config is not None else EmbedConfig()
+        self._e = bcdl_py.ImageEmbedder(engine._e, self.config, output_index)
+
+    @property
+    def dim(self) -> int:
+        """Embedding width, from the bound output's shape."""
+        return self._e.dim
+
+    def embed(self, model_input: np.ndarray, timeout_ms: int = 0):
+        """Run one preprocessed crop (see :func:`reid_preprocess`) and read out
+        the L2-normalized appearance vector."""
+        self.engine._e.set_input(0, np.ascontiguousarray(model_input))
+        self.engine._e.infer(timeout_ms)
+        return self._e.postprocess()
+
+    def embed_crop(self, crop_bgr: np.ndarray, timeout_ms: int = 0):
+        """One-call embed of a BGR person crop."""
+        return self.embed(reid_preprocess(crop_bgr), timeout_ms)
+
+    def embed_detections(self, frame_bgr: np.ndarray, detections,
+                         min_score: float = 0.0, timeout_ms: int = 0):
+        """Embed each detection's crop out of ``frame_bgr``.
+
+        Returns a list PARALLEL to ``detections`` — pass it straight to
+        ``ByteTracker.update(detections, embeddings)``. An entry is the empty
+        list when the detection scored below ``min_score`` or its box does not
+        enclose any pixels after clamping to the frame (a box can sit partly
+        outside the image, and an empty crop would otherwise crash the resize).
+        """
+        h, w = frame_bgr.shape[:2]
+        out = []
+        for d in detections:
+            if d.score < min_score:
+                out.append([])
+                continue
+            x1, y1 = max(0, int(d.x1)), max(0, int(d.y1))
+            x2, y2 = min(w, int(d.x2)), min(h, int(d.y2))
+            if x2 - x1 < 1 or y2 - y1 < 1:
+                out.append([])
+                continue
+            out.append(self.embed_crop(frame_bgr[y1:y2, x1:x2], timeout_ms))
+        return out
+
+
 # --- multi-object tracking (ByteTrack) -------------------------------------
 # Directly usable, no model: ByteTracker(cfg).update(list[Detection]) per frame.
+# Passing a parallel list of ReID vectors as a second argument switches on
+# BoT-SORT appearance association (see ReIDExtractor above).
 Track = bcdl_py.Track
+BoostConfig = bcdl_py.BoostConfig
 ByteTrackConfig = bcdl_py.ByteTrackConfig
 ByteTracker = bcdl_py.ByteTracker
 
@@ -699,17 +1123,35 @@ PipelineConfig = bcdl_py.PipelineConfig
 StageProfile = bcdl_py.StageProfile  # per-stage timing (DetectionPipeline / async)
 
 
+TrackingReidConfig = bcdl_py.TrackingReidConfig
+
+
 class TrackingPipeline:
     """Streaming detect-and-track. Wraps an Engine + (PipelineConfig, ByteTrackConfig)
     and tracks objects across frames with stable ids — all preprocessing happens
-    in the C++ core (no per-frame numpy letterbox)."""
+    in the C++ core (no per-frame numpy letterbox).
+
+    Pass ``reid_engine`` to add appearance: each qualifying detection's crop goes
+    through the ReID model and association uses both geometry and appearance,
+    which is what holds ids through occlusions and crossings. That runs the ReID
+    model ONCE PER CROP, so on a crowded frame it, not the detector, sets the
+    frame time — see :attr:`last_embed_count` and ``TrackingReidConfig``."""
 
     def __init__(self, engine: "Engine",
                  det_config: "PipelineConfig | None" = None,
-                 track_config: "ByteTrackConfig | None" = None):
+                 track_config: "ByteTrackConfig | None" = None,
+                 reid_engine: "Engine | None" = None,
+                 reid_config: "TrackingReidConfig | None" = None):
         self.det_config = det_config if det_config is not None else PipelineConfig()
         self.track_config = track_config if track_config is not None else ByteTrackConfig()
-        self._p = bcdl_py.TrackingPipeline(engine._e, self.det_config, self.track_config)
+        self.reid_config = reid_config if reid_config is not None else TrackingReidConfig()
+        if reid_engine is None:
+            self._p = bcdl_py.TrackingPipeline(engine._e, self.det_config,
+                                               self.track_config)
+        else:
+            self._p = bcdl_py.TrackingPipeline(engine._e, reid_engine._e,
+                                               self.det_config, self.track_config,
+                                               self.reid_config)
 
     def process(self, bgr: np.ndarray) -> list:
         """Detect + track one BGR frame (HxWx3 uint8). Returns this frame's Tracks
@@ -729,6 +1171,17 @@ class TrackingPipeline:
     def last_detections(self) -> list:
         """Detections from the most recent process(), pre-association."""
         return self._p.last_detections
+
+    @property
+    def has_reid(self) -> bool:
+        """True when this pipeline was built with a ReID engine."""
+        return self._p.has_reid
+
+    @property
+    def last_embed_count(self) -> int:
+        """Crops embedded on the most recent frame (0 without ReID) — the term
+        that makes frame time scale with how crowded the frame is."""
+        return self._p.last_embed_count
 
     def reset(self) -> None:
         self._p.reset()
@@ -873,6 +1326,46 @@ __all__ = [
     "compute_letterbox",
     "letterbox_numpy",
     "letterbox_chw_float",
+    "FaceDetection",
+    "FaceDetectConfig",
+    "FaceDetector",
+    "decode_scrfd",
+    "align_face",
+    "WholeBodyEstimator",
+    "WholeBodyConfig",
+    "WholeBodyCrop",
+    "wholebody_preprocess",
+    "decode_wholebody",
+    "FeatureExtractor",
+    "FeatureSet",
+    "Feature",
+    "FeatureMatch",
+    "XfeatConfig",
+    "xfeat_preprocess",
+    "decode_xfeat",
+    "match_features",
+    "SuperResolver",
+    "SuperResConfig",
+    "TilePlacement",
+    "plan_tiles",
+    "tile_weight",
+    "arcface_template",
+    "similarity_transform",
+    "face_letterbox",
+    "Anchor",
+    "AnchorDetectConfig",
+    "AnchorDetector",
+    "decode_yolov5_anchor",
+    "embed_preprocess",
+    "EmbedConfig",
+    "EmbedMatch",
+    "EmbeddingBank",
+    "decode_embedding",
+    "ImageEmbedder",
+    "ReIDExtractor",
+    "reid_preprocess",
+    "reid_crop_preprocess",
+    "ReidConfig",
     "decode",
     "nms",
     "iou",
@@ -963,6 +1456,8 @@ __all__ = [
     # multi-object tracking
     "Track",
     "ByteTrackConfig",
+    "BoostConfig",
+    "TrackingReidConfig",
     "ByteTracker",
     "DetectHead",
     "PipelineConfig",
