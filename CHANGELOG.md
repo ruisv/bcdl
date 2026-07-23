@@ -10,6 +10,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
      not published alongside it. Detail that cannot meet that bar belongs in the
      roadmap/design notes, not here. -->
 
+## [0.5.0] — 2026-07
+
+### Changed
+- **OCR now defaults to PP-OCRv6.** The detection and recognition defaults move
+  from PP-OCRv5 to PP-OCRv6 medium across the demo, the tests and the fetch
+  script. The change is small on purpose: the recogniser reads its CTC class
+  count from the model output and loads the character set from a file, so going
+  from 18385 to 18710 classes needed only a new dictionary
+  (`data/ppocr_keys_v6_18710.txt`) and the model paths — nothing in the
+  recognition code changed, and the preprocessing was already the
+  aspect-ratio-preserving pad PP-OCRv6 expects. PP-OCRv6 ships no textline
+  classifier, so the angle-classification stage keeps the v5 PP-LCNet model, and
+  the v5 detection/recognition builds remain available as a fallback.
+- **The default recogniser is the all-int16 build**, not the compiler's default
+  mixed-precision one. On the board a uniform int16 graph is both more accurate
+  (roughly half the character error) and faster (about 2×), because it carries no
+  int8/int16 requantisation on its layer boundaries. A 960-wide int16 build is
+  available for long text lines and is selectable through `BCDL_OCR_REC`. See
+  [`docs/MODELS.md`](docs/MODELS.md); conversion recipes for every build live in
+  the companion model-zoo repository.
+
 ## [0.4.0] — 2026-07
 
 ### Added

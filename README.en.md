@@ -252,26 +252,21 @@ python -c "import bcdl; print(bcdl.__version__)"
 
 Compiled BPU models (`.hbm`) are **not** committed (they are large) and BCDL does
 **not** redistribute any model weights — place them under [`models/`](models/)
-yourself (see [`models/README.md`](models/README.md)). Model conversion
-(ONNX → `.hbm`, PTQ calibration) is done **offline** with the D-Robotics
-**OpenExplorer** toolchain on an x86 host; BCDL only consumes the finished
-binaries. Each `.hbm` is compiled for a specific BPU **march**, so use one built
-for your board (the S100 / S100P share the Nash march; S600 is compiled for its
-own) — the BCDL runtime itself is the same across the S-series.
+yourself, populated by [`scripts/fetch_models.sh`](scripts/fetch_models.sh).
+Model conversion (ONNX → `.hbm`, PTQ calibration) is done **offline** with the
+D-Robotics **OpenExplorer** toolchain on an x86 host; BCDL only consumes the
+finished binaries. Each `.hbm` is compiled for a specific BPU **march**, so use
+one built for your board (the S100 / S100P share the Nash march; S600 is compiled
+for its own) — the BCDL runtime itself is the same across the S-series.
 
-The example/benchmark models come from third parties under **their own licenses** —
-check each before redistributing or using commercially:
-
-| model | used for | upstream license |
-|-------|----------|------------------|
-| PP-OCRv5 det/rec, PP-LCNet cls | OCR | **Apache-2.0** (PaddleOCR / PaddlePaddle) |
-| YOLO26 / YOLOv8 | det · cls · pose · seg · obb | **AGPL-3.0** (Ultralytics) — copyleft; commercial use needs their Enterprise license |
-| Depth-Anything-V2 | depth | **Apache-2.0** (Small) / **CC-BY-NC-4.0** (Base+) — verify the variant |
-| DeepLabV3+ | semantic seg | from the D-Robotics `rdk_model_zoo` (check its terms) |
-
-BCDL's own code (this repo) is independent of these — it's a generic runtime that
-can load any `.hbm`. The licenses above apply to the *weights you fetch*, not to
-BCDL.
+**What each model is, where it came from, which build to take, and its licence:
+[`docs/MODELS.md`](docs/MODELS.md).** The example/benchmark models come from
+third parties under **their own licenses** — notably the Ultralytics YOLO weights
+are **AGPL-3.0** (copyleft; commercial use needs their Enterprise license) and
+the insightface face weights are **academic / non-commercial**. Check each before
+redistributing or using commercially. BCDL's own code (this repo) is independent
+of these — it's a generic runtime that can load any `.hbm`, and those licenses
+apply to the *weights you fetch*, not to BCDL.
 
 ## Documentation
 
@@ -279,6 +274,7 @@ BCDL.
 |----------|----------------|
 | [`docs/API.md`](docs/API.md) | **Python API reference** — every class, config, and `decode_*` function, with a usage snippet per task. |
 | [`docs/CPP_API.md`](docs/CPP_API.md) | **C++ API reference** — the same surface in `namespace bcdl`, keyed to the headers. |
+| [`docs/MODELS.md`](docs/MODELS.md) | **Model catalogue** — every `.hbm` the examples and benchmarks use: origin, which build to take, and licence. |
 | [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) | Full on-board benchmark numbers + the annotated check images in the [Gallery](#gallery). |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to set up, build (on the board), test, and submit changes. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes (Keep a Changelog / SemVer). |
