@@ -93,7 +93,14 @@ copy_staged() {
 }
 
 echo ">> fetching models into ${DEST}"
-# OCR — PP-OCRv5 (converted offline from ccdl ONNX)
+# OCR — PP-OCRv6 (converted offline; recipes in bcdl-model-zoo). This is the
+# default stack for the demo and tests. The rec build is all-int16: faster and
+# more accurate than the compiler's default mixed-precision int8 (see
+# docs/MODELS.md). No v6 classifier exists, so the v5 PP-LCNet cls stays below.
+copy "${DEPLOY}/ppocrv6_medium_det_960x960.hbm"
+copy "${DEPLOY}/ppocrv6_medium_rec_int16_48x320.hbm"
+# PP-OCRv5 stack — kept as a fallback and for the wider textline classifier the
+# v6 line does not provide.
 copy "${DEPLOY}/ppocrv5_server_det_960x960.hbm"
 copy "${DEPLOY}/ppocrv5_server_rec_48x320.hbm"
 copy "${DEPLOY}/ppocrv5_lcnet_cls_80x160.hbm"

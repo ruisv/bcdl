@@ -105,15 +105,17 @@ def model_path(name):
 # OCR uses the LATEST PP-OCRv5 stack (converted offline from ccdl ONNX and
 # deployed to the board), all single-input F32 RGB NCHW featuremap
 # (normalisation done in preproc, not fused), env-overridable:
-#   det: PP-OCRv5_server_det   [1,3,960,960] -> prob map [1,1,960,960]
-#   rec: PP-OCRv5_server_rec   [1,3,48,320]  -> [1,T,18385] softmax (CTC)
-#   cls: PP-LCNet_x1_0_textline_ori [1,3,80,160] -> [1,2] (0°/180°)
-OCR_DET = os.environ.get("BCDL_OCR_DET", os.path.join(MODELS, "ppocrv5_server_det_960x960.hbm"))
-OCR_REC = os.environ.get("BCDL_OCR_REC", os.path.join(MODELS, "ppocrv5_server_rec_48x320.hbm"))
+#   det: PP-OCRv6 medium det   [1,3,960,960] -> prob map [1,1,960,960]
+#   rec: PP-OCRv6 medium rec (int16) [1,3,48,320] -> [1,T,18710] softmax (CTC)
+#   cls: PP-LCNet_x1_0_textline_ori [1,3,80,160] -> [1,2] (0°/180°) — still v5,
+#        PP-OCRv6 ships no classifier. The decoder reads the class count from the
+#        model, so v5→v6 needs only the model + dict swap, no code change.
+OCR_DET = os.environ.get("BCDL_OCR_DET", os.path.join(MODELS, "ppocrv6_medium_det_960x960.hbm"))
+OCR_REC = os.environ.get("BCDL_OCR_REC", os.path.join(MODELS, "ppocrv6_medium_rec_int16_48x320.hbm"))
 # Direction classifier — OPTIONAL: the pipeline skips the 180° flip when absent.
 OCR_CLS = os.environ.get("BCDL_OCR_CLS", os.path.join(MODELS, "ppocrv5_lcnet_cls_80x160.hbm"))
 OCR_DICT = os.environ.get("BCDL_OCR_DICT",
-                          os.path.join(_REPO, "data", "ppocr_keys_v5_18385.txt"))
+                          os.path.join(_REPO, "data", "ppocr_keys_v6_18710.txt"))
 OCR_IMAGE = os.environ.get("BCDL_OCR_IMAGE", "ocr.jpg")
 
 # --- whole-body pose: TOP-DOWN, so it needs a person detector in front of it ---

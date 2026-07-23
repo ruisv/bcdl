@@ -1,16 +1,18 @@
-// OCR end-to-end demo on the LATEST PP-OCRv5 .hbm models (converted offline from
-// ccdl ONNX). Three-stage PaddleOCR pipeline routed
+// OCR end-to-end demo on the LATEST PP-OCRv6 .hbm models (converted offline;
+// recipes in the companion bcdl-model-zoo). Three-stage PaddleOCR pipeline routed
 // through bcdl's task layer, so this runs the real models AND validates
 // bcdl::DbTextDetector / TextAngleClassifier / TextRecognizer end-to-end:
 //
-//   1. DET — PP-OCRv5_server_det (DBNet). Input: F32 RGB NCHW [1,3,960,960]
+//   1. DET — PP-OCRv6 medium det (DBNet). Input: F32 RGB NCHW [1,3,960,960]
 //      (ImageNet norm). Output: sigmoid prob map [1,1,960,960] -> bcdl::DbTextDetector
 //      -> rotated 4-point text boxes.
 //   2. CLS — PP-LCNet textline ori (OPTIONAL). Input [1,3,80,160] -> [1,2]; flips
-//      the crop 180° when it reads upside-down.
-//   3. REC — PP-OCRv5_server_rec (CRNN+CTC). Input F32 RGB NCHW [1,3,48,320]
-//      (0.5/0.5 norm). Output [1,40,18385] softmax -> CTC greedy text (18385-class
-//      v5 dict).
+//      the crop 180° when it reads upside-down. PP-OCRv6 ships no classifier, so
+//      this stays the v5 PP-LCNet model.
+//   3. REC — PP-OCRv6 medium rec (SVTR+CTC), all-int16 build. Input F32 RGB NCHW
+//      [1,3,48,320] (0.5/0.5 norm). Output [1,40,18710] softmax -> CTC greedy text
+//      (18710-class v6 dict). The decoder reads the class count from the model, so
+//      the v5→v6 dictionary change needs no code change.
 //
 // Preprocessing follows ccdl/PaddleOCR source (get_rotate_crop_image /
 // order_points_clockwise / resize_norm_img):
@@ -51,15 +53,23 @@
 
 namespace {
 
-// LATEST PP-OCRv5 stack (converted offline from ccdl ONNX). All single-input F32
-// RGB NCHW featuremap models; normalisation done in preproc here (det/cls
-// ImageNet, rec 0.5/0.5). Paths are repo-relative (run from the repo root, like
-// the dict) — models/ is populated by scripts/fetch_models.sh.
-constexpr const char* kDefDet = "models/ppocrv5_server_det_960x960.hbm";
-constexpr const char* kDefRec = "models/ppocrv5_server_rec_48x320.hbm";
-constexpr const char* kDefDict = "data/ppocr_keys_v5_18385.txt";
+// LATEST PP-OCRv6 stack (converted offline; recipes in bcdl-model-zoo). All
+// single-input F32 RGB NCHW featuremap models; normalisation done in preproc here
+// (det/cls ImageNet, rec 0.5/0.5). Paths are repo-relative (run from the repo
+// root, like the dict) — models/ is populated by scripts/fetch_models.sh.
+//
+// The rec default is the all-int16 320-wide build: on the S100P it is both more
+// accurate (roughly half the character error of the compiler's default mixed-
+// precision int8 build) and faster (2.17 vs 4.69 ms), because a uniform int16
+// graph has no int8↔int16 requant on its boundaries. For lines longer than
+// ~6.7:1, swap in the 960-wide build (ppocrv6_medium_rec_int16_48x960.hbm) via
+// the command-line rec argument.
+constexpr const char* kDefDet = "models/ppocrv6_medium_det_960x960.hbm";
+constexpr const char* kDefRec = "models/ppocrv6_medium_rec_int16_48x320.hbm";
+constexpr const char* kDefDict = "data/ppocr_keys_v6_18710.txt";
 // PP-LCNet textline direction classifier (80x160). OPTIONAL: the demo skips the
-// 180° flip stage when this model is absent.
+// 180° flip stage when this model is absent. PP-OCRv6 has no classifier of its
+// own, so this remains the v5 PP-LCNet model.
 constexpr const char* kDefCls = "models/ppocrv5_lcnet_cls_80x160.hbm";
 
 // PaddleOCR get_rotate_crop_image: order the 4 box corners as TL,TR,BR,BL,
