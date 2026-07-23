@@ -250,23 +250,26 @@ python -c "import bcdl; print(bcdl.__version__)"
 
 ### Models
 
-Compiled BPU models (`.hbm`) are **not** committed (they are large) and BCDL does
-**not** redistribute any model weights — place them under [`models/`](models/)
-yourself, populated by [`scripts/fetch_models.sh`](scripts/fetch_models.sh).
-Model conversion (ONNX → `.hbm`, PTQ calibration) is done **offline** with the
-D-Robotics **OpenExplorer** toolchain on an x86 host; BCDL only consumes the
-finished binaries. Each `.hbm` is compiled for a specific BPU **march**, so use
-one built for your board (the S100 / S100P share the Nash march; S600 is compiled
-for its own) — the BCDL runtime itself is the same across the S-series.
+Compiled BPU models (`.hbm`) are **not** committed (they are large) — place them
+under [`models/`](models/), populated by
+[`scripts/fetch_models.sh`](scripts/fetch_models.sh). Model conversion
+(ONNX → `.hbm`, PTQ calibration) is done **offline** with the D-Robotics
+**OpenExplorer** toolchain on an x86 host; the full conversion recipes — export,
+calibration, `hb_compile` config and each model's measured accuracy/latency —
+live in the companion [**bcdl-model-zoo**](https://github.com/ruisv/bcdl-model-zoo)
+repository. Each `.hbm` is compiled for a specific BPU **march**, so use one built
+for your board (the S100 / S100P share the Nash march; S600 is compiled for its
+own) — the BCDL runtime itself is the same across the S-series.
 
 **What each model is, where it came from, which build to take, and its licence:
 [`docs/MODELS.md`](docs/MODELS.md).** The example/benchmark models come from
-third parties under **their own licenses** — notably the Ultralytics YOLO weights
-are **AGPL-3.0** (copyleft; commercial use needs their Enterprise license) and
-the insightface face weights are **academic / non-commercial**. Check each before
-redistributing or using commercially. BCDL's own code (this repo) is independent
-of these — it's a generic runtime that can load any `.hbm`, and those licenses
-apply to the *weights you fetch*, not to BCDL.
+third parties, and **the weights and their compiled `.hbm` follow their own
+upstream licences** — notably the Ultralytics YOLO weights are **AGPL-3.0**
+(copyleft; commercial use needs their Enterprise license) and the insightface
+face weights are **academic / non-commercial**. Check each before redistributing
+or using commercially. BCDL's own code (this repo, Apache-2.0) is independent of
+these — it's a generic runtime that can load any `.hbm`; those licences apply to
+the model weights, not to BCDL.
 
 ## Documentation
 
@@ -409,7 +412,7 @@ Contributions are welcome — issues and pull requests alike. See
 
 BCDL is licensed under the **Apache License 2.0** — see [`LICENSE`](LICENSE).
 
-This covers BCDL's own source code only. Third-party model weights you fetch into
-`models/` are governed by their own upstream licenses (see [Models](#models)) —
-most notably the Ultralytics YOLO weights are AGPL-3.0; BCDL neither bundles nor
-redistributes any of them.
+This covers BCDL's own source code only. The third-party model weights under
+`models/` and the `.hbm` compiled from them are governed by their own upstream
+licenses (see [Models](#models)) — most notably the Ultralytics YOLO weights are
+AGPL-3.0, so follow their upstream terms before using or redistributing.
