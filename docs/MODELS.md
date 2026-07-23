@@ -103,8 +103,7 @@ fetch script, and run the test suite.
 ## Getting the models
 
 The `.hbm` files are **not committed** (too large; `.gitignore` excludes
-`*.hbm`), and **BCDL redistributes no model weights**. Populate `models/` on
-the board with:
+`*.hbm`). Populate `models/` on the board with:
 
 ```bash
 scripts/fetch_models.sh
@@ -115,8 +114,10 @@ That script is the single place the local source paths live — set them in
 unset falls back to a placeholder and is simply reported as `MISSING`.
 
 Model conversion (ONNX → `.hbm`, PTQ calibration) happens **offline on an x86
-host** with the D-Robotics OpenExplorer toolchain; this repo only consumes the
-finished binaries.
+host** with the D-Robotics OpenExplorer toolchain. The full conversion recipes —
+ONNX export, calibration, `hb_compile` config and the accuracy/latency numbers
+for every model above — live in the companion
+[**bcdl-model-zoo**](https://github.com/ruisv/bcdl-model-zoo) repository.
 
 Each `.hbm` is compiled for a specific BPU **march**, so run the build compiled
 for your board — S100 and S100P share the Nash march, S600 is compiled for its
@@ -125,9 +126,10 @@ own. The BCDL runtime itself is identical across the S-series.
 ## Licensing
 
 The models above are third-party and carry **their own licences**. BCDL's own
-code is unrelated to them: it is a general-purpose runtime that loads any
-`.hbm`. The licences below constrain *the weights you fetch yourself*, not
-BCDL. Check each one before redistributing or shipping commercially.
+code (this repository, Apache-2.0) is unrelated to them: it is a general-purpose
+runtime that loads any `.hbm`. The licences below constrain **the model weights
+and their compiled `.hbm`**, so check each one before redistributing or shipping
+commercially.
 
 | upstream | licence |
 |---|---|

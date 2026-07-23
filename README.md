@@ -257,20 +257,21 @@ python -c "import bcdl; print(bcdl.__version__)"
 
 ### 模型
 
-编译好的 BPU 模型（`.hbm`）**不**纳入版本库（体积大），且 BCDL **不**重新分发
-任何模型权重 —— 请自行放到 [`models/`](models/) 下，用
-[`scripts/fetch_models.sh`](scripts/fetch_models.sh) 填充。模型转换（ONNX →
-`.hbm`、PTQ 校准）是在 x86 主机上用 D-Robotics **OpenExplorer** 工具链 **离线**
-完成的；BCDL 只消费成品二进制。每个 `.hbm` 都为特定 BPU **march** 编译，所以请
-用为你的板子编译的那一份（S100 / S100P 共用 Nash march；S600 为其自身编译）——
-BCDL 运行时本身在整个 S 系列上一致。
+编译好的 BPU 模型（`.hbm`）**不**纳入版本库（体积大）—— 请放到
+[`models/`](models/) 下，用 [`scripts/fetch_models.sh`](scripts/fetch_models.sh)
+填充。模型转换（ONNX → `.hbm`、PTQ 校准）是在 x86 主机上用 D-Robotics
+**OpenExplorer** 工具链 **离线** 完成的；完整的转换配方（导出、校准、`hb_compile`
+配置与各模型的精度/延迟实测）在配套仓库
+[**bcdl-model-zoo**](https://github.com/ruisv/bcdl-model-zoo)。每个 `.hbm` 都为
+特定 BPU **march** 编译，所以请用为你的板子编译的那一份（S100 / S100P 共用 Nash
+march；S600 为其自身编译）—— BCDL 运行时本身在整个 S 系列上一致。
 
 **每个模型是什么、从哪来、该取哪个 build、以及各自的许可证，见
-[`docs/MODELS.md`](docs/MODELS.md)。** 示例/基准用到的模型都是第三方的，**遵循
-各自的许可证** —— 其中 Ultralytics YOLO 权重为 **AGPL-3.0**（著佐权，商用需其
-Enterprise 授权），insightface 的人脸预训练权重为**学术非商用**；重新分发或商用
-前请逐一核对。BCDL 自身的代码（本仓库）与这些无关 —— 它是一个能加载任意 `.hbm`
-的通用运行时，上述许可证只约束 *你自行获取的权重*。
+[`docs/MODELS.md`](docs/MODELS.md)。** 示例/基准用到的模型都是第三方的，**权重及其
+编译产物遵循各自的原始许可证** —— 其中 Ultralytics YOLO 权重为 **AGPL-3.0**（著佐权，
+商用需其 Enterprise 授权），insightface 的人脸预训练权重为**学术非商用**；重新分发或
+商用前请逐一核对。BCDL 自身的代码（本仓库，Apache-2.0）与这些无关 —— 它是一个能加载
+任意 `.hbm` 的通用运行时,上述许可证约束的是模型权重,而非 BCDL。
 
 ## 文档
 
@@ -421,6 +422,6 @@ PYTHONPATH=build:python pytest tests/
 
 BCDL 以 **Apache License 2.0** 授权 —— 见 [`LICENSE`](LICENSE)。
 
-这只覆盖 BCDL 自身的源码。你拉取到 `models/` 的第三方模型权重受其各自上游
-许可证约束（见[模型](#模型)）—— 尤其 Ultralytics YOLO 权重为 AGPL-3.0；
-BCDL 既不打包也不重新分发其中任何一个。
+这只覆盖 BCDL 自身的源码。`models/` 下的第三方模型权重及其编译产物受各自上游
+许可证约束（见[模型](#模型)）—— 尤其 Ultralytics YOLO 权重为 AGPL-3.0，
+使用或再分发前请遵循其原始授权。
