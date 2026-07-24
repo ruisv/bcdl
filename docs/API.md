@@ -1,5 +1,7 @@
 # BCDL Python API reference
 
+**English** | [简体中文](API.zh.md)
+
 Complete reference for the `bcdl` Python module (the nanobind bindings over the
 C++ core). For the C++ API see [`CPP_API.md`](CPP_API.md) (the public headers
 under [`include/bcdl/`](../include/bcdl/) are the source of truth); the names map
@@ -26,7 +28,7 @@ under [`include/bcdl/`](../include/bcdl/) are the source of truth); the names ma
 
 ## Install
 
-See the [README](../README.md#install-conda) for the full table. The fast path:
+See the [README](../README.en.md#quickstart) for the full table. The fast path:
 
 ```bash
 conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
@@ -460,16 +462,17 @@ valid = res.valid                  # (H, W) uint8 mask, or shape (0,) if off
 
 ## OCR
 
-Full PP-OCRv5 three-stage pipeline, each stage usable on its own. Pure decoders
-(`decode_dbnet`, `decode_cls_dir`, `decode_ctc`, `load_char_dict`) need no model.
+Full PP-OCR three-stage pipeline (PP-OCRv6 by default, v5 kept as a fallback),
+each stage usable on its own. Pure decoders (`decode_dbnet`, `decode_cls_dir`,
+`decode_ctc`, `load_char_dict`) need no model.
 
 ```python
-chars = bcdl.load_char_dict("ppocrv5_dict.txt")
+chars = bcdl.load_char_dict("ppocr_dict.txt")
 
 det = bcdl.DbTextDetector(engine_det)            # DBNet detect
 boxes = det.postprocess(lb)                      # list[TextBox], 4-point rotated
 cls = bcdl.TextAngleClassifier(engine_cls)       # 0/180 direction
-rec = bcdl.TextRecognizer(engine_rec, "ppocrv5_dict.txt")  # CRNN/CTC
+rec = bcdl.TextRecognizer(engine_rec, "ppocr_dict.txt")  # CRNN/CTC
 # (crop each box, run cls then rec on the crop's engine; see examples/ocr_demo)
 
 # numpy decoders:

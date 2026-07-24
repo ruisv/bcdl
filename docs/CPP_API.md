@@ -1,5 +1,7 @@
 # BCDL C++ API reference
 
+**English** | [简体中文](CPP_API.zh.md)
+
 Complete reference for the C++ library (namespace `bcdl`). The public headers
 under [`include/bcdl/`](../include/bcdl/) are the source of truth — this document
 summarizes them with usage. For the Python bindings see
@@ -35,7 +37,7 @@ find_package(bcdl CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE bcdl::bcdl)
 ```
 
-See the [README](../README.md#build-from-source) for the conda packages
+See the [README](../README.en.md#build-from-source) for the conda packages
 (`libbcdl` + `hobot-dnn` + `hobot-media`) and the on-board build. Everything here
 runs **only on an RDK S100 / S100P / S600 board** — the hobot SDK and the BPU/JPU/VPU
 units are board-only.
@@ -451,13 +453,14 @@ std::vector<uint8_t> bgr = bcdl::depthColorize(dm);  // (H*W*3) Turbo BGR
 
 `bcdl/tasks/ocr.h` — three independent stages (det / cls / rec); the application
 composes them (crop each detected box, optional 180° flip, recognize). Each stage
-has a pure decoder + an Engine-bound wrapper.
+has a pure decoder + an Engine-bound wrapper. PP-OCRv6 is the default; v5 is kept
+as a fallback.
 
 ```cpp
 // Recognition (CRNN + CTC):
-std::vector<std::string> dict = bcdl::loadCharDict("ppocrv5_dict.txt"); // blank @ 0
+std::vector<std::string> dict = bcdl::loadCharDict("ppocr_dict.txt"); // blank @ 0
 struct RecResult { std::string text; float score; };
-bcdl::TextRecognizer rec(engine, "ppocrv5_dict.txt", /*out_idx=*/0);
+bcdl::TextRecognizer rec(engine, "ppocr_dict.txt", /*out_idx=*/0);
 bcdl::RecResult r = rec.postprocess();
 // pure: decodeCtc(logits, num_steps, num_classes, dict)
 

@@ -447,8 +447,8 @@ PYTHONPATH=build:python python scripts/board_bench.py --retry-until-clean 3
 
 | Document | What it covers |
 |----------|----------------|
-| [`docs/API.md`](docs/API.md) | **Python API reference** — every class, config, and `decode_*` function, with a usage snippet per task. |
-| [`docs/CPP_API.md`](docs/CPP_API.md) | **C++ API reference** — the same surface in `namespace bcdl`, keyed to the headers. |
+| [`docs/API.md`](docs/API.md) | **Python API reference** — every class, config, and `decode_*` function, with a usage snippet per task. ([简体中文](docs/API.zh.md)) |
+| [`docs/CPP_API.md`](docs/CPP_API.md) | **C++ API reference** — the same surface in `namespace bcdl`, keyed to the headers. ([简体中文](docs/CPP_API.zh.md)) |
 | [`docs/MODELS.md`](docs/MODELS.md) | **Model catalogue** — every `.hbm` the examples and benchmarks use: origin, which build to take, and licence. |
 | [`docs/GDC.md`](docs/GDC.md) | **GDC hardware geometry** — hardware letterbox and dense remap: usage and limits. |
 | [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) | Full on-board benchmark numbers + the annotated check images in the [Gallery](#gallery). |

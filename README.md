@@ -257,7 +257,7 @@ build、许可证如何，见 [`docs/MODELS.md`](docs/MODELS.md)。
 | [`gdc_letterbox_bench.cc`](examples/gdc_letterbox_bench.cc) | GDC 硬件 letterbox 对比 CPU |
 | [`mempool_demo.cc`](examples/mempool_demo.cc) · [`vp_probe.cc`](examples/vp_probe.cc) | 设备内存池 / VP 单元探针 |
 
-Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.md`](docs/API.md)。
+Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`](docs/API.zh.md)。
 
 ## 能力清单
 
@@ -396,8 +396,8 @@ PYTHONPATH=build:python python scripts/board_bench.py --retry-until-clean 3
 
 | 文档 | 涵盖内容 |
 |----------|----------------|
-| [`docs/API.md`](docs/API.md) | **Python API 参考** —— 每个类、配置和 `decode_*` 函数，附每个任务的用法片段。 |
-| [`docs/CPP_API.md`](docs/CPP_API.md) | **C++ API 参考** —— `namespace bcdl` 下的同一接口面，对应到各头文件。 |
+| [`docs/API.zh.md`](docs/API.zh.md) | **Python API 参考** —— 每个类、配置和 `decode_*` 函数，附每个任务的用法片段。（[English](docs/API.md)） |
+| [`docs/CPP_API.zh.md`](docs/CPP_API.zh.md) | **C++ API 参考** —— `namespace bcdl` 下的同一接口面，对应到各头文件。（[English](docs/CPP_API.md)） |
 | [`docs/MODELS.md`](docs/MODELS.md) | **模型清单** —— 示例与基准用到的每个 `.hbm`：来源、该取哪个 build、许可证。 |
 | [`docs/GDC.md`](docs/GDC.md) | **GDC 硬件几何变换** —— 硬件 letterbox 与密集重映射的用法与限制。 |
 | [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) | 完整板端基准数据 + [效果展示](#效果展示)中的标注校验图。 |

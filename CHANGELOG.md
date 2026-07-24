@@ -10,6 +10,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
      not published alongside it. Detail that cannot meet that bar belongs in the
      roadmap/design notes, not here. -->
 
+## [Unreleased]
+
+### Added
+- **Chinese API references.** `docs/API.zh.md` (Python) and `docs/CPP_API.zh.md`
+  (C++) are full translations of the English pair, not summaries: every class,
+  config field, decoder signature, gotcha and measurement carries over. Each doc
+  links to its counterpart, and the READMEs point at the reference in their own
+  language.
+
+### Changed
+- The API references describe OCR as PP-OCRv6 by default with v5 as the
+  fallback, matching the 0.5.0 behaviour.
+
 ## [0.5.0] — 2026-07
 
 ### Changed
