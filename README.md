@@ -1,26 +1,48 @@
-# BCDL — BPU Computational Deep Learning
+# BCDL — RDK BPU 视觉开发框架
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
 [![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-3776AB.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-RDK%20S100%20%2F%20S100P%20%2F%20S600%20(aarch64)-0A7BBB.svg)](#运行环境要求)
-[![Version](https://img.shields.io/badge/version-0.1.0-informational.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-informational.svg)](CHANGELOG.md)
 
 [English](README.en.md) | **简体中文**
 
-一个面向 **D-Robotics RDK S100 / S100P / S600**（BPU "Nash" 加速器）的 C++17
-推理与多媒体库，并提供对 NumPy 友好的 Python 绑定。BCDL 是 CUDA/TensorRT 视觉栈
-的 BPU 原生对应实现：加载一个已编译的 `.hbm` 模型，完成推理、前/后处理、硬件
-编解码与取流——全部在板端运行，且默认在多媒体与计算单元之间零拷贝。
+> ### 几分钟做出一个 BPU 视觉应用。
+> 统一的 C++ / Python API，覆盖取流 → 硬件编解码 → 预处理 → BPU 推理 → 后处理整条链路。
+> **构建在官方运行时之上，不是取代它。**
 
-## 目录
+```python
+import bcdl, cv2
 
-- [效果展示](#效果展示)
-- [为什么选 BCDL](#为什么选-bcdl) · [特性](#特性) · [架构](#架构)
-- [安装](#安装) · [快速上手](#快速上手) · [从源码构建](#从源码构建)
-- [文档](#文档)
-- [性能基准](#性能基准) · [测试](#测试)
-- [社区交流](#社区交流) · [参与贡献](#参与贡献) · [致谢](#致谢) · [许可证](#许可证)
+engine = bcdl.Engine("models/yolo26s_det_nashm_640x640_nv12.hbm")
+pipe   = bcdl.AsyncDetectionPipeline(engine)       # 输入尺寸、解码头都从模型里读
+
+pipe.submit(cv2.imread("data/images/bus.jpg"))     # HxWx3 uint8 BGR
+pipe.finish()
+for d in pipe.next():
+    print(d.class_id, d.score, d.x1, d.y1, d.x2, d.y2)
+```
+
+```bash
+conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
+```
+
+板上装完即可运行 —— 不用编译，不用碰一行 `hbDNN` / `hbUCP` 代码，不用自己写 NMS。
+
+**导航：**
+[为什么用](#为什么用-bcdl) ·
+[与官方 SDK 的关系](#与官方-sdk-的关系) ·
+[架构](#架构) ·
+[快速上手](#快速上手) ·
+[示例](#示例) ·
+[能力清单](#能力清单) ·
+[模型](#模型) ·
+[性能基准](#性能基准) ·
+[文档](#文档) ·
+[从源码构建](#从源码构建) ·
+[测试](#测试) ·
+[社区交流](#社区交流)
 
 ## 效果展示
 
@@ -35,79 +57,78 @@
 | <img src="benchmarks/figures/obb.jpg" width="250"> | <img src="benchmarks/figures/track.jpg" width="250"> | <img src="benchmarks/figures/pose.jpg" width="250"> |
 | **实例分割** | **语义分割** | **单目深度** |
 | <img src="benchmarks/figures/seg.jpg" width="250"> | <img src="benchmarks/figures/semseg.jpg" width="250"> | <img src="benchmarks/figures/depth.jpg" width="250"> |
-| **双目深度（LAS2）** | **OCR（PP-OCRv5）** | **硬件 JPEG 解码（JPU）** |
+| **双目深度（LAS2）** | **OCR（PP-OCR 三段式）** | **硬件 JPEG 解码（JPU）** |
 | <img src="benchmarks/figures/stereo.jpg" width="250"> | <img src="benchmarks/figures/ocr.jpg" width="250"> | <img src="benchmarks/figures/decode_jpu.jpg" width="250"> |
 | **全身姿态（133 关键点）** | **稀疏特征点与匹配（XFeat）** | **超分 x4（SPAN）** |
 | <img src="benchmarks/figures/wholebody.jpg" width="250"> | <img src="benchmarks/figures/features.jpg" width="250"> | <img src="benchmarks/figures/superres_span.jpg" width="250"> |
 
-## 为什么选 BCDL
+## 为什么用 BCDL
 
-整个 S 系列的计算 + 多媒体栈统一在两个 hobot 原语之上：
+拿到一块 RDK 板、拿到一个 `.hbm`，到屏幕上出框，中间隔着的是：设备内存怎么分配、
+缓存什么时候刷、任务句柄什么时候释放、输出张量怎么反量化、NMS / DFL / CTC 怎么写、
+解码器出来的 NV12 怎么不落 BGR 直接喂进去。BCDL 把这些一次性做完，并且做对。
+
+- **✅ 一行安装** —— 预编译的 linux-aarch64 conda 包（Python 3.9–3.14），
+  板上不需要编译工具链，装完就能 `import bcdl`。
+- **✅ 统一的 API** —— 17 类视觉任务共用同一套 `Engine` + 任务类心智模型；
+  换任务不换写法，C++ 与 Python 接口对等。
+- **✅ 不再手写内存与缓存** —— `SysMem` 生命周期、推理前 clean / 读取前 invalidate
+  由 `Engine` 负责。**这是 BPU 上最高频的正确性 bug**，表现为结果“看起来差不多但就是不对”。
+- **✅ 后处理开箱即用** —— 分类别 NMS、DFL、旋转 IoU、CTC、proto × mask-coef……
+  全部是可移植的 CPU/NEON 实现（从 CUDA kernel 重写而来），并有确定性测试钉死。
+- **✅ 零拷贝流水线是默认行为** —— JPU 解码 → GDC 硬件 letterbox → BPU 推理 → VPU 编码，
+  中间不经过 BGR、不经过 `memcpy`。压缩视频端到端 1080p **441 FPS**。
+- **✅ 踩过的坑写在代码里** —— YOLOP 的 anchor 解码编译不出来、人脸检测器的 padding
+  在左上角、嵌入模型要挤压式 resize 而不是 letterbox…… 这些都已经在库里处理好了，
+  不用再花一周复现一遍（见[能力清单](#能力清单)）。
+- **✅ 可验证、可复现** —— 97 个测试（其中 66 个不需要板子），板端基准一条命令复现，
+  并且带“板子是否干净”的结果闸门。
+
+## 与官方 SDK 的关系
+
+BCDL **不替代官方 SDK，它构建在官方 SDK 之上**：所有算力仍然来自 D-Robotics 的
+hobot 运行时（`hbDNN` / `hbUCP` / 多媒体编解码）。区别只在**抽象层次**：
+
+| | 官方 SDK（hbDNN / hbUCP / media codec） | BCDL |
+|---|---|---|
+| 形态 | 底层运行时 + 示例程序 | 可复用的框架（库） |
+| 接口 | 以 C API 为主 | C++17 RAII 类 + Python 绑定 |
+| 设备内存 | 自己 malloc / free `hbUCPSysMem`，自己 clean / invalidate 缓存 | `Engine` 自动处理 |
+| 后处理 | 自己写（NMS / DFL / 旋转 IoU / CTC…） | 17 类任务开箱即用 |
+| 多媒体拼接 | 各单元各自的 API，自己搬 buffer | 统一 `SysMem`，流水线零拷贝 |
+| 语言 | C / C++ | C++ 与 Python 对等，NumPy 进出 |
+| 上手 | 从示例复制，逐个模型改 | `conda install` + 十行代码 |
+| 组织方式 | 按模型给样例 | 按任务给统一接口 |
+
+一句话：**官方 SDK 让 BPU 能跑；BCDL 让你几分钟内把它变成一个应用。**
+
+## 架构
+
+```
+                    你的应用（C++ / Python）
+                              ↓
+   ┌──────────────────────────────────────────────────────┐
+   │  BCDL                                                 │
+   │  tasks · tracks · pipeline · media · preproc · backend │
+   └──────────────────────────────────────────────────────┘
+                              ↓
+        D-Robotics hobot SDK（官方运行时，能力的来源）
+        hbDNN · hbUCP · media codec · VPS/GDC · hb_vp
+                              ↓
+              BPU "Nash" · JPU · VPU · GDC
+```
+
+整个 S 系列的计算 + 多媒体栈统一在两个 hobot 原语之上，这是零拷贝能成为默认行为的原因：
 
 - **`hbUCPSysMem`** —— 唯一的共享内存缓冲（`phyAddr` + `virAddr`），被 BPU 张量、
   JPU/VPU 编解码图像以及 VP 预处理单元共用。
 - **`hbUCPTaskHandle_t`** —— 唯一的任务/队列模型；BPU 推理、JPEG/H.264/H.265
   编解码、resize/cvtColor 全部通过同一个 `hbUCP` 调度器提交与等待。
 
-所以 **JPU → VP → BPU → VPU 的零拷贝是默认行为，而非额外优化。**
-BCDL 是这套底层结构之上一层薄而 RAII 干净的 C++ 封装，外加可移植的后处理
-（把 CUDA kernel 重写为 CPU/NEON）。
+所以 **JPU → VP/GDC → BPU → VPU 的零拷贝是默认行为，而非额外优化。**
+BCDL 是这套底层结构之上一层薄而 RAII 干净的 C++ 封装，外加可移植的后处理。
 
-## 特性
-
-- **后端** —— `Engine` 封装 `hbDNN`（`hbDNNInferV2`）；自动处理缓存一致性
-  （推理前 clean、读取前 invalidate）；零拷贝 / 反量化的输出读取器。
-- **任务**（CPU/NEON 后处理，也提供无需 Engine 的纯 `decode_*` 函数）：
-  - **检测** —— anchor-free LTRB 多尺度 + DFL 头（YOLO26 / YOLOv8 /
-    v5 / v11），分类别 NMS。
-  - **分类、姿态**（17 关键点）、**实例分割**（proto × mask-coef）、
-    **旋转框**（OBB，旋转 IoU NMS）、**语义分割**、**单目深度**、
-    **双目深度**（双图视差）、**单目 3D 检测**（SMOKE —— 单张图出 3D 框 + 朝向）。
-  - **OCR** —— 完整三段式 **PP-OCRv5** 流水线：DBNet 检测 → PP-LCNet
-    方向分类（0°/180°）→ CRNN/CTC 识别（18385 类字典）。
-  - **开放词汇检测 / 分割** —— **YOLOE**（prompt-free，自带 COCO-80 标签表
-    `LabelMap`，复用 LTRB / DFL 解码，无需重训即可命名类别）。
-  - **可提示分割** —— **EdgeSAM** 交互式分割（点 / 框提示；RepViT 图像编码器 →
-    缓存 embedding → 提示解码器两段式，`SamSession`）。
-  - **全景驾驶感知** —— YOLOP 一次推理出三个头：车辆检测（anchor-based
-    `AnchorDetector`）+ 可行驶区域 + 车道线（各复用 `Segmenter`）。注意官方
-    ONNX 把 anchor 解码烘进图里（ScatterND），**该解码在 BPU 上编译不出来**
-    （objectness/类别列不被写入，任何阈值下都是零检测），所以图要切在解码前、
-    解码走 CPU（`decodeYoloV5Anchor`）。
-  - **图像嵌入** —— `ImageEmbedder` + `EmbeddingBank`（以图搜图 / 零样本分类：
-    池化向量读出 + L2 归一化 + 余弦 top-k）。注意嵌入模型的 `.hbm` 常打包多个
-    submodel（整图池化向量 / 逐 patch 特征图），用 `Engine::modelNames` 挑出
-    池化那个；预处理是**挤压式 resize 而非 letterbox**（这类模型没见过 padding）。
-  - **人脸** —— SCRFD 检测（5 关键点，对浮点关键点误差 0.35 px）+ 闭式 Umeyama
-    对齐 `alignFace` 到 112×112 模板；识别不需要新任务，对齐后的 crop 走
-    `ImageEmbedder`、比对走 `EmbeddingBank`。注意这个检测器**把图放左上角、
-    右下补边**（`face_letterbox` 返回零 padding），用居中 letterbox 会让每个框
-    和关键点整体偏移。
-  - **全身姿态（133 关键点）** —— ViTPose，**自顶向下**：与上面的姿态头不同，
-    它对**每个人**的裁剪跑一次，所以前面要接一个检测器、开销随人数增长；换来的
-    是脚、68 点人脸和双手。1.68 ms/人。
-  - **稀疏特征点与匹配** —— XFeat：可重复的关键点 + L2 归一化的 64 维描述子，
-    加互为最近邻匹配（`matchFeatures`）。只有卷积主干在 BPU 上（约 1.0 ms、
-    3.1 MB）；输入的 InstanceNorm 与 softmax / NMS / top-k / 稀疏采样都在 CPU，
-    图里因此没有任何动态控制流。
-  - **超分** —— 分块 x4 放大（`SuperResolver`，重叠交叉淡化拼接）。**两个模型
-    各有所长**：SPAN 保真型，干净输入更准、体积小 6 倍；Compact 感知型、训练在
-    真实退化上，模糊/压缩输入更强。按输入域选，不是谁替代谁。
-  - **多目标跟踪** —— ByteTrack（Kalman + 两阶段关联）；ReID 外观嵌入的 L2
-    归一化 + 余弦相似度（BoT-SORT 关联原语）。
-  - 检测头同时支持 **PTQ（NV12 两平面）与 QAT 导出的浮点输入** 模型
-    （`detect_float` / `letterbox_chw_float`）。
-- **硬件预处理** —— VPS GDC 引擎上的固定几何变换：硬件 letterbox 与任意密集
-  重映射 `GdcRemap`（cv2.remap 语义，用于双目立体校正；2448×2048 约 6.3ms，
-  CPU 基本空闲）。
-- **多媒体** —— 硬件 **JPEG**（JPU）与 **H.264 / H.265**（VPU）编解码。
-- **流水线** —— 同步、缓冲复用的 `DetectionPipeline`，多线程
-  `AsyncDetectionPipeline`（预处理 ‖ 推理 重叠）、`TrackingPipeline`、
-  `StereoPipeline`，以及视频文件 → 解码 → 检测的链路。
-- **Python** —— nanobind 绑定：NumPy 进/出，覆盖每个解码器 + 流水线，阻塞推理
-  期间释放 GIL。
-
-## 架构
+仓库分层：
 
 ```
 python/    nanobind 绑定（NumPy <-> 张量），推理时释放 GIL
@@ -121,18 +142,9 @@ preproc/   CPU letterbox + BGR->NV12（OpenCV/OpenMP）；GDC 硬件 letterbox +
 core/      SysMem · Task · Status · MemPool (libhbucp -> hbUCP*)
 ```
 
-## 运行环境要求
+## 快速上手
 
-- 一块 **RDK S100 / S100P / S600** 开发板（Ubuntu 22.04，aarch64），且板上已有
-  D-Robotics hobot SDK（`/usr/include/hobot`、`/usr/hobot/lib`：`libdnn`、
-  `libhbucp`、`libhbvp`）—— 或安装下文的 `hobot-dnn` / `hobot-media` conda 包。
-  BCDL 的源码在整个 S 系列上一致；而编译出的 `.hbm` 是 **march 相关的**，
-  所以请运行为你目标板编译的模型（见[模型](#模型)）。
-- CMake ≥ 3.22、GCC 11、Ninja。
-- OpenCV 5（图像操作；由 `BCDL_HAVE_OPENCV` 守卫，并有手写回退实现）。
-- Python 模块所需：带 **nanobind** 的 Python 环境（以及 NumPy、OpenCV）。
-
-## 安装
+### 1. 装（一分钟）
 
 预编译的 **linux-aarch64** 包（Python 3.9–3.14）已发布到一个 conda 频道，
 所以在板上你可以完全跳过源码构建：
@@ -148,7 +160,7 @@ python -c "import bcdl; print(bcdl.__version__)"
 conda create -n bcdl -c https://mirrors.ruis.ai/conda -c conda-forge \
     python=3.12 bcdl
 conda activate bcdl
-# 或锁定精确构建：   conda install ... "bcdl=0.1.0"
+# 或锁定精确构建：   conda install ... "bcdl=0.5.0"
 ```
 
 为了避免每次都带 `-c`，可以把该频道加进环境（它必须排在
@@ -188,74 +200,125 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge libbcdl
 > `/usr/hobot/lib` —— 它们随 RDK 系统镜像一起提供，通过 `ldconfig` 解析，
 > 出于设计目的不随包重新分发。
 
-## 快速上手
+### 2. 拿一个模型（一分钟）
 
-**Python** —— 预处理 ‖ 推理 重叠的流式检测：
+BCDL 是通用运行时，能加载任意 `.hbm`。最快的三条路：
 
-```python
-import bcdl
+- 板上系统镜像自带的（`/opt/hobot/model/s100/basic`，如 YOLOv8 检测、DeepLabV3+）；
+- D-Robotics **`rdk_model_zoo`** 里预编译好的；
+- 自己转：完整配方（导出、校准、`hb_compile` 配置、精度/延迟实测）在配套仓库
+  [**bcdl-model-zoo**](https://github.com/ruisv/bcdl-model-zoo)。
 
-engine = bcdl.Engine("models/yolo26s_det_nashm_640x640_nv12.hbm")
-cfg = bcdl.PipelineConfig(); cfg.detect.num_classes = 80
-pipe = bcdl.AsyncDetectionPipeline(engine, cfg, depth=3)
+把 `.hbm` 放到 [`models/`](models/) 下即可（本仓的示例与测试只按
+`models/<name>.hbm` 这个相对路径引用模型）。每个模型是什么、从哪来、该取哪个
+build、许可证如何，见 [`docs/MODELS.md`](docs/MODELS.md)。
 
-for i, frame in enumerate(frames):          # frame: HxWx3 uint8 BGR
-    pipe.submit(frame)                       # 队满则阻塞（背压）
-    if i >= 3:
-        for d in pipe.next():                # 按提交顺序返回结果
-            print(d.class_id, d.score, d.x1, d.y1, d.x2, d.y2)
-pipe.finish()
-while (dets := pipe.next()) is not None:
-    ...                                      # 排空最后在途的帧
-```
+### 3. 跑（一分钟）
 
-纯函数解码器也对外暴露，用于纯 NumPy 路径
-（`bcdl.decode`、`bcdl.decode_pose`、`bcdl.decode_obb`、`bcdl.decode_ctc`…）。
-
-**C++** —— [`examples/`](examples/) 目录有可独立运行的程序：
+上面首屏那段 Python 就是完整程序。C++ 侧则是 [`examples/`](examples/) 里的独立程序：
 
 ```bash
 ./build/det_demo    models/yolo26s_det_nashm_640x640_nv12.hbm data/images/bus.jpg
-./build/ocr_demo    data/images/ocr.jpg          # PP-OCRv5 det -> cls -> rec
+./build/ocr_demo    data/images/ocr.jpg          # PP-OCR det -> cls -> rec
 ./build/track_demo  models/yolo26s_det_nashm_640x640_nv12.hbm  # 检测 + ByteTrack
 ./build/video_det_demo  stream.h264 model.hbm    # VPU 解码 -> BPU 检测
 ```
 
-完整的接口面 —— 每个类、配置和解码器，并附每个任务的用法片段 —— 见下文
-[API 参考](#文档)。
+## 示例
 
-## 从源码构建
+[`examples/`](examples/) 下都是可独立运行的程序，按用途分：
 
-在板上、在你的 Python/conda 环境里构建（需要 hobot SDK —— 来自上文的
-`hobot-dnn` / `hobot-media` conda 包，或系统镜像里的 `/usr/include/hobot` +
-`/usr/hobot/lib`）：
+**视觉任务**
 
-```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
+| 示例 | 做什么 |
+|---|---|
+| [`det_demo.cc`](examples/det_demo.cc) | 目标检测，出框并画图 |
+| [`ocr_demo.cc`](examples/ocr_demo.cc) | 三段式 OCR：检测 → 方向分类 → 识别 |
+| [`depth_demo.cc`](examples/depth_demo.cc) | 单目深度 |
+| [`stereo_demo.cc`](examples/stereo_demo.cc) | 双目视差 / 深度 |
+| [`embed_demo.cc`](examples/embed_demo.cc) | 图像嵌入（以图搜图 / 零样本分类） |
+| [`track_demo.cc`](examples/track_demo.cc) | 检测 + ByteTrack 多目标跟踪 |
 
-这会构建 `bcdl` 库、C++ 示例，以及 `bcdl_py` Python 模块。
+**视频与取流**
 
-**从 CMake 安装并使用** —— 支持 `find_package(bcdl)`：
+| 示例 | 做什么 |
+|---|---|
+| [`video_det_demo.py`](examples/video_det_demo.py) | 视频文件端到端：VPU 解码 → BPU 检测 → 画框 → VPU 编码 → mp4 |
+| [`video_det_demo_async.cc`](examples/video_det_demo_async.cc) | 同一条链路的 C++ 异步版本 |
+| [`rtsp_det_demo.py`](examples/rtsp_det_demo.py) | **RTSP 实时检测**，纯硬件解码（1080p H.264 约 233 FPS） |
+| [`video_decode.cc`](examples/video_decode.cc) · [`video_roundtrip.cc`](examples/video_roundtrip.cc) | H.264/H.265 解码 / 编解码回环 |
+| [`jpeg_roundtrip.cc`](examples/jpeg_roundtrip.cc) | 硬件 JPEG 编解码（JPU） |
 
-```bash
-cmake --install build --prefix /your/prefix
-```
-```cmake
-find_package(bcdl CONFIG REQUIRED)
-target_link_libraries(your_target PRIVATE bcdl::bcdl)   # 一并带入头文件 + hobot 依赖
-```
+**性能与探针**
 
-**安装 Python 模块** —— 一个可 pip 安装的 wheel（scikit-build-core）；
-请在板上构建（C++ 构建需要 hobot SDK）：
+| 示例 | 做什么 |
+|---|---|
+| [`pipeline_bench.cc`](examples/pipeline_bench.cc) · [`async_bench.cc`](examples/async_bench.cc) | 同步 / 异步流水线吞吐 |
+| [`gdc_letterbox_bench.cc`](examples/gdc_letterbox_bench.cc) | GDC 硬件 letterbox 对比 CPU |
+| [`mempool_demo.cc`](examples/mempool_demo.cc) · [`vp_probe.cc`](examples/vp_probe.cc) | 设备内存池 / VP 单元探针 |
 
-```bash
-pip install .          # 或： pip wheel . -w dist/
-python -c "import bcdl; print(bcdl.__version__)"
-```
+Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.md`](docs/API.md)。
 
-### 模型
+## 能力清单
+
+每个任务都有**两个层次**可用：高层任务类（给 `Engine` + config，一次调用出结果），
+或纯 `decode_*` 函数（吃 float32 NumPy 数组，**不需要 Engine、不需要板子、不需要模型**）。
+
+- **后端** —— `Engine` 封装 `hbDNN`（`hbDNNInferV2`）；自动处理缓存一致性
+  （推理前 clean、读取前 invalidate）；零拷贝 / 反量化的输出读取器。
+- **任务**（CPU/NEON 后处理）：
+  - **检测** —— anchor-free LTRB 多尺度 + DFL 头（YOLO26 / YOLOv8 /
+    v5 / v11），分类别 NMS。
+  - **分类、姿态**（17 关键点）、**实例分割**（proto × mask-coef）、
+    **旋转框**（OBB，旋转 IoU NMS）、**语义分割**、**单目深度**、
+    **双目深度**（双图视差）、**单目 3D 检测**（SMOKE —— 单张图出 3D 框 + 朝向）。
+  - **OCR** —— 完整三段式流水线：DBNet 检测 → PP-LCNet 方向分类（0°/180°）→
+    CRNN/CTC 识别。**默认 PP-OCRv6**（识别侧走全 int16 构建：在 S100P 上比编译器
+    默认的混合精度 int8 构建字错率约减半、且快约 2 倍），PP-OCRv5 保留为回退。
+  - **开放词汇检测 / 分割** —— **YOLOE**（prompt-free，自带 COCO-80 标签表
+    `LabelMap`，复用 LTRB / DFL 解码，无需重训即可命名类别）。
+  - **可提示分割** —— **EdgeSAM** 交互式分割（点 / 框提示；RepViT 图像编码器 →
+    缓存 embedding → 提示解码器两段式，`SamSession`）。
+  - **全景驾驶感知** —— YOLOP 一次推理出三个头：车辆检测（anchor-based
+    `AnchorDetector`）+ 可行驶区域 + 车道线（各复用 `Segmenter`）。注意官方
+    ONNX 把 anchor 解码烘进图里（ScatterND），**该解码在 BPU 上编译不出来**
+    （objectness/类别列不被写入，任何阈值下都是零检测），所以图要切在解码前、
+    解码走 CPU（`decodeYoloV5Anchor`）。
+  - **图像嵌入** —— `ImageEmbedder` + `EmbeddingBank`（以图搜图 / 零样本分类：
+    池化向量读出 + L2 归一化 + 余弦 top-k）。注意嵌入模型的 `.hbm` 常打包多个
+    submodel（整图池化向量 / 逐 patch 特征图），用 `Engine::modelNames` 挑出
+    池化那个；预处理是**挤压式 resize 而非 letterbox**（这类模型没见过 padding）。
+  - **人脸** —— SCRFD 检测（5 关键点，对浮点关键点误差 0.35 px）+ 闭式 Umeyama
+    对齐 `alignFace` 到 112×112 模板；识别不需要新任务，对齐后的 crop 走
+    `ImageEmbedder`、比对走 `EmbeddingBank`。注意这个检测器**把图放左上角、
+    右下补边**（`face_letterbox` 返回零 padding），用居中 letterbox 会让每个框
+    和关键点整体偏移。
+  - **全身姿态（133 关键点）** —— ViTPose，**自顶向下**：与上面的姿态头不同，
+    它对**每个人**的裁剪跑一次，所以前面要接一个检测器、开销随人数增长；换来的
+    是脚、68 点人脸和双手。1.68 ms/人。
+  - **稀疏特征点与匹配** —— XFeat：可重复的关键点 + L2 归一化的 64 维描述子，
+    加互为最近邻匹配（`matchFeatures`）。只有卷积主干在 BPU 上（约 1.0 ms、
+    3.1 MB）；输入的 InstanceNorm 与 softmax / NMS / top-k / 稀疏采样都在 CPU，
+    图里因此没有任何动态控制流。
+  - **超分** —— 分块 x4 放大（`SuperResolver`，重叠交叉淡化拼接）。**两个模型
+    各有所长**：SPAN 保真型，干净输入更准、体积小 6 倍；Compact 感知型、训练在
+    真实退化上，模糊/压缩输入更强。按输入域选，不是谁替代谁。
+  - **多目标跟踪** —— ByteTrack（Kalman + 两阶段关联）；ReID 外观嵌入的 L2
+    归一化 + 余弦相似度（BoT-SORT 关联原语）、BoostTrack++ 与相机运动补偿。
+  - 检测头同时支持 **PTQ（NV12 两平面）与 QAT 导出的浮点输入** 模型
+    （`detect_float` / `letterbox_chw_float`）。
+- **硬件预处理** —— VPS GDC 引擎上的固定几何变换：硬件 letterbox 与任意密集
+  重映射 `GdcRemap`（cv2.remap 语义，用于双目立体校正；2448×2048 约 6.3ms，
+  CPU 基本空闲）。
+- **多媒体** —— 硬件 **JPEG**（JPU）与 **H.264 / H.265**（VPU）编解码，
+  以及从 RTSP 网络流直接喂进硬件解码器的路径。
+- **流水线** —— 同步、缓冲复用的 `DetectionPipeline`，多线程
+  `AsyncDetectionPipeline`（预处理 ‖ 推理 重叠）、`TrackingPipeline`、
+  `StereoPipeline`，以及视频文件 / RTSP → 解码 → 检测的链路。
+- **Python** —— nanobind 绑定：NumPy 进/出，覆盖每个解码器 + 流水线，阻塞推理
+  期间释放 GIL。
+
+## 模型
 
 编译好的 BPU 模型（`.hbm`）**不**纳入版本库（体积大）—— 请放到
 [`models/`](models/) 下，用 [`scripts/fetch_models.sh`](scripts/fetch_models.sh)
@@ -271,21 +334,7 @@ march；S600 为其自身编译）—— BCDL 运行时本身在整个 S 系列�
 编译产物遵循各自的原始许可证** —— 其中 Ultralytics YOLO 权重为 **AGPL-3.0**（著佐权，
 商用需其 Enterprise 授权），insightface 的人脸预训练权重为**学术非商用**；重新分发或
 商用前请逐一核对。BCDL 自身的代码（本仓库，Apache-2.0）与这些无关 —— 它是一个能加载
-任意 `.hbm` 的通用运行时,上述许可证约束的是模型权重,而非 BCDL。
-
-## 文档
-
-| 文档 | 涵盖内容 |
-|----------|----------------|
-| [`docs/API.md`](docs/API.md) | **Python API 参考** —— 每个类、配置和 `decode_*` 函数，附每个任务的用法片段。 |
-| [`docs/CPP_API.md`](docs/CPP_API.md) | **C++ API 参考** —— `namespace bcdl` 下的同一接口面，对应到各头文件。 |
-| [`docs/MODELS.md`](docs/MODELS.md) | **模型清单** —— 示例与基准用到的每个 `.hbm`：来源、该取哪个 build、许可证。 |
-| [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) | 完整板端基准数据 + [效果展示](#效果展示)中的标注校验图。 |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 如何搭建、构建（在板上）、测试并提交改动。 |
-| [`CHANGELOG.md`](CHANGELOG.md) | 发布说明（Keep a Changelog / SemVer）。 |
-
-公共头文件在 [`include/bcdl/`](include/bcdl/)；可运行程序在
-[`examples/`](examples/)。
+任意 `.hbm` 的通用运行时，上述许可证约束的是模型权重，而非 BCDL。
 
 ## 性能基准
 
@@ -305,7 +354,7 @@ march；S600 为其自身编译）—— BCDL 运行时本身在整个 S 系列�
 | semseg_rt| PIDNet-S (1/8 出图) | 2048×1024   | 4.52  | 221  | 4.70  | 19.0 |
 | depth  | depth-anything-v2    | 686×518     | 111   | 9    | 115   | 121.8|
 | stereo | las2-m (crop)        | 640×480     | 14.0  | 72   | 21.6  | 40.7 |
-| ocr    | PP-OCRv5 (det→cls→rec)| 960² / 48×320 | 20.0 | 50  | 135   | 35.3 |
+| ocr    | PP-OCRv5 server (det→cls→rec)| 960² / 48×320 | 20.0 | 50  | 135   | 35.3 |
 | embed  | SigLIP base/16       | 224²        | 19.3  | 52   | 20.2  | 129  |
 | drive  | YOLOP (det+可行驶+车道)| 640²       | 2.80  | 358  | 5.44  | 12.0 |
 | face⁰  | SCRFD-10G            | 640²        | 60.2  | 17   | 61.5  | 5.9  |
@@ -342,6 +391,63 @@ PYTHONPATH=build:python python scripts/board_bench.py --retry-until-clean 3
 > 别的判据都靠不住：load average 被常驻 D 状态的内核线程顶在核数附近；进程检查会正好落在
 > 别人任务的两批之间；连 `hrt_model_exec` 也一样会被拖慢（同一模型脏板 22ms / 干净 0.95ms）。
 > **结果本身是唯一可靠的信号。**
+
+## 文档
+
+| 文档 | 涵盖内容 |
+|----------|----------------|
+| [`docs/API.md`](docs/API.md) | **Python API 参考** —— 每个类、配置和 `decode_*` 函数，附每个任务的用法片段。 |
+| [`docs/CPP_API.md`](docs/CPP_API.md) | **C++ API 参考** —— `namespace bcdl` 下的同一接口面，对应到各头文件。 |
+| [`docs/MODELS.md`](docs/MODELS.md) | **模型清单** —— 示例与基准用到的每个 `.hbm`：来源、该取哪个 build、许可证。 |
+| [`docs/GDC.md`](docs/GDC.md) | **GDC 硬件几何变换** —— 硬件 letterbox 与密集重映射的用法与限制。 |
+| [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) | 完整板端基准数据 + [效果展示](#效果展示)中的标注校验图。 |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 如何搭建、构建（在板上）、测试并提交改动。 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 发布说明（Keep a Changelog / SemVer）。 |
+
+公共头文件在 [`include/bcdl/`](include/bcdl/)；可运行程序在
+[`examples/`](examples/)。
+
+## 运行环境要求
+
+- 一块 **RDK S100 / S100P / S600** 开发板（Ubuntu 22.04，aarch64），且板上已有
+  D-Robotics hobot SDK（`/usr/include/hobot`、`/usr/hobot/lib`：`libdnn`、
+  `libhbucp`、`libhbvp`）—— 或安装上文的 `hobot-dnn` / `hobot-media` conda 包。
+  BCDL 的源码在整个 S 系列上一致；而编译出的 `.hbm` 是 **march 相关的**，
+  所以请运行为你目标板编译的模型（见[模型](#模型)）。
+- CMake ≥ 3.22、GCC 11、Ninja。
+- OpenCV 5（图像操作；由 `BCDL_HAVE_OPENCV` 守卫，并有手写回退实现）。
+- Python 模块所需：带 **nanobind** 的 Python 环境（以及 NumPy、OpenCV）。
+
+## 从源码构建
+
+在板上、在你的 Python/conda 环境里构建（需要 hobot SDK —— 来自上文的
+`hobot-dnn` / `hobot-media` conda 包，或系统镜像里的 `/usr/include/hobot` +
+`/usr/hobot/lib`）：
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+这会构建 `bcdl` 库、C++ 示例，以及 `bcdl_py` Python 模块。
+
+**从 CMake 安装并使用** —— 支持 `find_package(bcdl)`：
+
+```bash
+cmake --install build --prefix /your/prefix
+```
+```cmake
+find_package(bcdl CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE bcdl::bcdl)   # 一并带入头文件 + hobot 依赖
+```
+
+**安装 Python 模块** —— 一个可 pip 安装的 wheel（scikit-build-core）；
+请在板上构建（C++ 构建需要 hobot SDK）：
+
+```bash
+pip install .          # 或： pip wheel . -w dist/
+python -c "import bcdl; print(bcdl.__version__)"
+```
 
 ## 测试
 
@@ -389,6 +495,10 @@ PYTHONPATH=build:python pytest tests/
 > 微信群二维码有有效期，若已过期请在 [Issues](../../issues) 留言，我们会更新；
 > 也欢迎直接在 [Issues](../../issues) 交流。
 
+同一块板子上想跑大语言模型？姊妹项目
+[**BLLM**](https://github.com/ruisv/bllm) 是同一套设计取向的 BPU 端侧 LLM / VLM
+运行时，两者共享 BPU 并可协同调度。
+
 ## 参与贡献
 
 欢迎贡献 —— issue 与 pull request 皆可。完整指南见
@@ -415,7 +525,7 @@ PYTHONPATH=build:python pytest tests/
 - **[nanobind](https://github.com/wjakob/nanobind)** —— Python 绑定层。
 - **[OpenCV](https://opencv.org/)** —— 预处理路径上的图像操作。
 - BCDL 重新实现了其后处理的上游模型作者 —— **PaddleOCR / PaddlePaddle**
-  （PP-OCRv5、PP-LCNet）、**Ultralytics**（YOLO 系列）、**Depth-Anything-V2**
+  （PP-OCRv6 / v5、PP-LCNet）、**Ultralytics**（YOLO 系列）、**Depth-Anything-V2**
   与 **DeepLabV3+**。其许可证见[模型](#模型)；BCDL 不打包这些权重中的任何一个。
 
 ## 许可证

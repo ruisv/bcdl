@@ -115,9 +115,15 @@ unset falls back to a placeholder and is simply reported as `MISSING`.
 
 Model conversion (ONNX → `.hbm`, PTQ calibration) happens **offline on an x86
 host** with the D-Robotics OpenExplorer toolchain. The full conversion recipes —
-ONNX export, calibration, `hb_compile` config and the accuracy/latency numbers
-for every model above — live in the companion
-[**bcdl-model-zoo**](https://github.com/ruisv/bcdl-model-zoo) repository.
+ONNX export, calibration, `hb_compile` config and the accuracy/latency numbers —
+live in the companion
+[**bcdl-model-zoo**](https://github.com/ruisv/bcdl-model-zoo) repository, one
+directory per model at `models/<name>/`. Every **converted** entry above has a
+recipe there: `las2`, `ppocr_v6`, `ppocr_v5`, `osnet`, `yolop`, `pidnet`,
+`superres`, `span`, `xfeat`, `yoloe`, `vitpose`, `yolo26`, `face`, `edgesam`.
+The **board** and **zoo** entries are prebuilt downloads, not conversions, so
+their "recipe" is the source URL and they are fetched by `scripts/fetch_models.sh`
+rather than rebuilt.
 
 Each `.hbm` is compiled for a specific BPU **march**, so run the build compiled
 for your board — S100 and S100P share the Nash march, S600 is compiled for its
