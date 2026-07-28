@@ -153,6 +153,14 @@ copy_staged yolop_cut_nashm_640x640_nv12.hbm yolop/out_cut/yolop_cut_nashm_640x6
 # which also compiles cleanly and decodes to garbage.
 copy_staged pidnet_s_nashm_1024x2048_nv12_v3.hbm \
             pidnet/out_v3/pidnet_s_nashm_1024x2048_nv12_v3.hbm
+# YOLO26n-sem semantic segmentation (Cityscapes 19-class, native 640x640, no
+# caller-side upsample needed unlike semseg_rt). Take the int16 build,
+# calibrated on real Cityscapes frames: int8 compiles clean and passes every
+# cosine gate but only agrees with the float model on 61% of pixel-level class
+# decisions; int16 alone gets to 85%, real-domain calibration to 96% (see
+# docs/MODELS.md).
+copy_staged yolo26n_sem_nashm_640x640_nv12.hbm \
+            yolo26_sem/out_int16/yolo26n_sem_nashm_640x640_nv12.hbm
 # M15 whole-body pose (ViTPose-S, 133 keypoints). Top-down: it needs the YOLO
 # person detector above in front of it.
 copy_staged vitpose_s_wholebody_nashm_256x192.hbm \

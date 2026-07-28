@@ -38,6 +38,7 @@ here, see [Getting the models](#getting-the-models)).
 | oriented boxes | `yolo26n_obb_nashm_640x640_nv12.hbm` | YOLO26n-obb | 640×640 | zoo |
 | semantic seg | `deeplabv3plus_dilation1248_1024x2048_nv12.hbm` | DeepLabV3+ | 2048×1024 | board |
 | semantic seg (real-time) | `pidnet_s_nashm_1024x2048_nv12_v3.hbm` | PIDNet-S | 2048×1024 | converted |
+| semantic seg (YOLO26 native res) | `yolo26n_sem_nashm_640x640_nv12.hbm` | YOLO26n-sem | 640×640 | converted |
 | monocular depth | `depth_any.hbm` | Depth-Anything-V2 | 686×518 | zoo |
 | stereo disparity | `las2_m_crop_nashm.hbm`, `las2_m_int16_nashm.hbm` | Lite Any Stereo V2 (M) | 640×480 | converted |
 | open-vocab det | `yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm` | YOLOE-11s | 640×640 | converted |
@@ -70,6 +71,17 @@ longer than ~6.7:1 there is also a 960-wide v6 rec build
 at it. The recogniser reads its class count from the model, so the 18385→18710
 dictionary change needed no code — only `data/ppocr_keys_v6_18710.txt`. Recipes
 for every v6 build live in the companion `bcdl-model-zoo` repo.
+
+**`yolo26n_sem` ships int16 calibrated on real Cityscapes frames, and both
+choices are load-bearing.** An all-int8 build of this model compiles cleanly
+and passes every per-tensor cosine gate (>0.95 every layer, ≥0.98 output)
+while agreeing with the float model on only 61% of pixel-level class
+decisions — whole classes swap wholesale. A dense 19-way per-pixel softmax
+classifier is decision-boundary sensitive in a way a single aggregate cosine
+cannot see. `set_all_nodes_int16` alone gets to 85% agreement; the remaining
+gap turned out to be calibration domain, not quantisation — recalibrating on
+real Cityscapes frames (instead of a general street-scene stand-in) closes it
+to **96%**. Full detail is in the recipe's README.
 
 ## Which build to take
 
@@ -120,7 +132,8 @@ live in the companion
 [**bcdl-model-zoo**](https://github.com/ruisv/bcdl-model-zoo) repository, one
 directory per model at `models/<name>/`. Every **converted** entry above has a
 recipe there: `las2`, `ppocr_v6`, `ppocr_v5`, `osnet`, `yolop`, `pidnet`,
-`superres`, `span`, `xfeat`, `yoloe`, `vitpose`, `yolo26`, `face`, `edgesam`.
+`superres`, `span`, `xfeat`, `yoloe`, `vitpose`, `yolo26`, `yolo26_sem`, `face`,
+`edgesam`.
 The **board** and **zoo** entries are prebuilt downloads, not conversions, so
 their "recipe" is the source URL and they are fetched by `scripts/fetch_models.sh`
 rather than rebuilt.

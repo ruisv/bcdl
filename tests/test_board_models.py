@@ -131,6 +131,24 @@ def test_semantic_seg_cityscapes_realtime():
     assert ids.size >= 3                                  # a real street scene
 
 
+def test_semantic_seg_cityscapes_yolo26():
+    """YOLO26n-sem at its native 640x640: same Segmenter argmax as the other two
+    Cityscapes heads, but a full-res dense head like deeplabv3plus (no 1/8-scale
+    upsample needed). Ships int16, calibrated on real Cityscapes frames -- the
+    int8 build passes every per-tensor cosine gate and still only agrees with
+    the float model on 61% of pixel-level argmax decisions; int16 alone gets to
+    85%, real-domain calibration gets to 96%. See
+    bcdl-model-zoo/models/yolo26_sem/README.md."""
+    t = _task("semseg_yolo26")
+    seg = t.decode()
+    assert (seg.width, seg.height) == (t.in_w, t.in_h)   # full-res 640x640
+    labels = np.asarray(seg.labels)
+    assert labels.shape == (t.in_h, t.in_w)
+    ids = np.unique(labels)
+    assert ids.min() >= 0 and ids.max() < 19             # Cityscapes 19 classes
+    assert ids.size >= 3                                  # a real street scene
+
+
 def test_face_detect_align_embed():
     """The whole face chain on real models: detect -> align -> embed.
 

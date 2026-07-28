@@ -83,6 +83,17 @@ SEMSEG_MODEL = os.environ.get(
 SEMSEG_RT_MODEL = os.environ.get(
     "BCDL_SEMSEG_RT_MODEL",
     os.path.join(MODELS, "pidnet_s_nashm_1024x2048_nv12_v3.hbm"))
+# YOLO26n-sem: same Cityscapes 19-class task as the two above, at the detector's
+# native 640x640. Full-res dense head (no caller-side upsample needed, unlike
+# semseg_rt) -- see bcdl-model-zoo/models/yolo26_sem/. Ships int16, calibrated on
+# real Cityscapes frames: the all-int8 build passes every per-tensor cosine gate
+# and still only agrees with the float model on 61% of pixel-level argmax
+# decisions (whole classes swap); int16 alone recovers to 85%, and switching the
+# PTQ calibration set from a stand-in domain to real Cityscapes frames gets to
+# 96%. See that recipe's README for the measured numbers.
+SEMSEG_YOLO26_MODEL = os.environ.get(
+    "BCDL_SEMSEG_YOLO26_MODEL",
+    os.path.join(MODELS, "yolo26n_sem_nashm_640x640_nv12.hbm"))
 DEPTH_MODEL = os.environ.get(
     "BCDL_DEPTH_MODEL",
     os.path.join(MODELS, "depth_any.hbm"))
@@ -186,6 +197,7 @@ TASKS = {
     # ([1,19,128,256]) rather than full-res, so the label map is 128x256 and the
     # caller upsamples — everything else decodes through the same Segmenter.
     "semseg_rt": dict(model=SEMSEG_RT_MODEL, image="segmentation.png", wh=(2048, 1024), kind="nv12", names=None),
+    "semseg_yolo26": dict(model=SEMSEG_YOLO26_MODEL, image="segmentation.png", wh=(640, 640), kind="nv12", names=None),
     "depth":  dict(model=DEPTH_MODEL,  image="bus.jpg",          wh=(686, 518),   kind="depth", names=None),
     # --- SOTA additions (2026-07): open-vocab det/seg, transformer det ---------
     "yoloe_det": dict(model="yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm", image="bus.jpg", wh=(640, 640), kind="nv12", names=COCO_NAMES),
@@ -431,8 +443,8 @@ class Task:
         elif k == "semseg":
             cfg = b.SegConfig(); cfg.channels_first = False  # deeplabv3plus is NHWC [1,H,W,C]
             self.dec = b.Segmenter(self.engine, cfg)         # argmax over 19 channels
-        elif k == "semseg_rt":
-            cfg = b.SegConfig(); cfg.channels_first = True   # PIDNet is NCHW [1,C,H,W]
+        elif k in ("semseg_rt", "semseg_yolo26"):
+            cfg = b.SegConfig(); cfg.channels_first = True   # both NCHW [1,C,H,W]
             self.dec = b.Segmenter(self.engine, cfg)         # same decode, 19 channels
         elif k == "depth":
             self.dec = b.DepthEstimator(self.engine)
@@ -459,7 +471,7 @@ class Task:
             return self.dec.detect([self.y, self.uv], self.lb, self.orig_w, self.orig_h)
         if k == "cls":
             return self.dec.classify([self.y, self.uv])
-        if k in ("semseg", "semseg_rt"):   # 2-input NV12 -> feed both, then argmax decode
+        if k in ("semseg", "semseg_rt", "semseg_yolo26"):   # 2-input NV12 -> feed both, then argmax decode
             self.engine._e.set_input(0, self.y)
             self.engine._e.set_input(1, self.uv)
             self.engine._e.infer(0)
@@ -473,7 +485,7 @@ class Task:
         k = self.key
         if k in ("seg", "yoloe_seg"):
             return self.dec.postprocess(self.lb, self.orig_w, self.orig_h)
-        if k in ("cls", "semseg", "semseg_rt", "depth"):
+        if k in ("cls", "semseg", "semseg_rt", "semseg_yolo26", "depth"):
             return self.dec.postprocess()
         return self.dec.postprocess(self.lb)
 
@@ -488,7 +500,7 @@ class Task:
             return f"{len(results)} instance(s)"
         if k == "obb":
             return f"{len(results)} rotated box(es)"
-        if k in ("semseg", "semseg_rt"):
+        if k in ("semseg", "semseg_rt", "semseg_yolo26"):
             n = int(np.unique(np.asarray(results.labels)).size)
             return f"{results.width}x{results.height} seg, {n} classes"
         if k == "depth":
@@ -539,7 +551,7 @@ class Task:
                               (0, 255, 0), 2)
                 _draw_skeleton(vis, d.keypoints)
             return vis
-        if k == "semseg":                              # palette overlay
+        if k in ("semseg", "semseg_rt", "semseg_yolo26"):  # palette overlay
             cseg = self.bcdl.seg_colorize(results)     # (segH,segW,3) BGR
             cseg = cv2.resize(cseg, (self.orig_w, self.orig_h),
                               interpolation=cv2.INTER_NEAREST)
