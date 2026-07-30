@@ -490,10 +490,10 @@ PYTHONPATH=build:python pytest tests/
 
 欢迎加入 **BCDL (BPU) 技术交流群**，一起讨论 RDK / BPU 部署与本项目的使用。
 
-<img src="docs/assets/bcdl-group-qr.jpg" alt="BCDL 交流群二维码" width="240">
+<img src="https://ruisv.oss-cn-beijing.aliyuncs.com/public/rdk/images/bllm-qrcode.jpg" alt="BCDL 交流群二维码" width="240">
 
-> 微信群二维码有有效期，若已过期请在 [Issues](../../issues) 留言，我们会更新；
-> 也欢迎直接在 [Issues](../../issues) 交流。
+> 微信群二维码有有效期，上面这张会在同一链接上原地更新；若扫码仍失效，
+> 请在 [Issues](../../issues) 留言，也欢迎直接在 Issues 交流。
 
 同一块板子上想跑大语言模型？姊妹项目
 [**BLLM**](https://github.com/ruisv/bllm) 是同一套设计取向的 BPU 端侧 LLM / VLM

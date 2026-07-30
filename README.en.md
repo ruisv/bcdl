@@ -543,11 +543,11 @@ explicit `--hbm`).
 Join the **BCDL (BPU) tech chat group** to discuss RDK / BPU deployment and using
 this project.
 
-<img src="docs/assets/bcdl-group-qr.jpg" alt="BCDL chat group QR" width="240">
+<img src="https://ruisv.oss-cn-beijing.aliyuncs.com/public/rdk/images/bllm-qrcode.jpg" alt="BCDL chat group QR" width="240">
 
-> WeChat group QR codes expire — if it no longer works, please open an
-> [Issue](../../issues) and we'll refresh it. You're also welcome to reach us via
-> [Issues](../../issues).
+> WeChat group QR codes expire; the image above is refreshed in place at the same
+> link. If scanning still fails, open an [Issue](../../issues) — you're also
+> welcome to just discuss there.
 
 Want large language models on the same board? The sister project
 [**BLLM**](https://github.com/ruisv/bllm) is an on-board LLM / VLM runtime for the
