@@ -428,6 +428,51 @@ dm = bcdl.decode_depth(out.astype(np.float32), cfg)
 - **`DepthEstimator(engine, config=None, output_index=0)`** — `.estimate(model_input, timeout_ms=0)`,
   `.postprocess()`, `.config`.
 
+## Depth refinement (RGB-D)
+
+Takes a depth map you already have — a stereo or ToF reading, noisy and full of
+holes — plus the aligned RGB frame, and returns cleaned metric depth with a
+per-pixel trust mask. This is the LingBot-Depth head; it does not estimate depth
+from scratch the way `DepthEstimator` (monocular) or `StereoPipeline` do.
+
+```python
+refiner = bcdl.DepthRefiner(engine)          # inputs: image, depth_log
+r = refiner.run(bgr, depth_m)                # BGR (H,W,3) uint8 + (H,W) float32 metres
+r.depth                                      # (H, W) float32 metres, 0 where rejected
+r.mask                                       # (H, W) uint8, 1 = trusted
+r.vmin, r.vmax                               # range over trusted pixels
+
+k = bcdl.Intrinsics(fx, fy, cx, cy)          # in the SENSOR image's pixels
+k = bcdl.scale_intrinsics(k, bgr.shape[1], bgr.shape[0], r.width, r.height)
+pts = bcdl.depth_to_pointcloud(r, k)         # (H, W, 3) float32 metres, camera space
+
+# numpy path — feed the graph yourself:
+img = bcdl.preprocess_refine_image(bgr)      # (1, 3, eh, ew) float32
+dep = bcdl.preprocess_refine_depth(depth_m)  # (1, 1, eh, ew) float32
+r = bcdl.decode_refined_depth(depth_out, mask_logit_out)
+```
+
+- **`DepthRefineConfig`** — `encoder_height`, `encoder_width` (taken from the
+  model at construction), `min_valid_depth`, `mask_threshold`, `apply_mask`.
+- **`RefinedDepth`** — `width`, `height`, `vmin`, `vmax`, `depth`, `mask`.
+- **`Intrinsics(fx, fy, cx, cy)`** · **`scale_intrinsics(k, from_w, from_h, to_w, to_h)`**.
+- **`preprocess_refine_image(bgr, config=None)`** · **`preprocess_refine_depth(depth_m, config=None)`**
+  — the exact host preprocessing the model was calibrated with. The RGB
+  downscale is area-averaged; a plain bilinear resize is measurably worse.
+- **`decode_refined_depth(depth, mask_logit=None, config=None) -> RefinedDepth`**.
+- **`depth_to_pointcloud(refined, intrinsics) -> np.ndarray`**.
+- **`DepthRefiner(engine, config=None, image_input=0, depth_input=1, depth_output=0, mask_output=1)`**
+  — `.run(bgr, depth_m)`, `.postprocess()`, `.config`.
+
+> Depth goes into the graph as **log depth with 0 meaning "no reading"**, which
+> is upstream's own convention — a genuine 1 m reading and a missing pixel land
+> on the same value, and the model leans on the RGB tokens to separate them.
+> The deployed graph also keeps every depth token, where upstream drops tokens
+> whose patch has no valid reading at all (a data-dependent sequence length
+> cannot be compiled). On the reference scenes that costs 0.06% absolute
+> relative error; those scenes are 87–100% valid, so very sparse input depth is
+> outside what was measured.
+
 ## Stereo
 
 Two rectified images to a disparity map, optionally metric depth and a validity

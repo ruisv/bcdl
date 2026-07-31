@@ -70,7 +70,7 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 
 - **✅ 一行安装** —— 预编译的 linux-aarch64 conda 包（Python 3.9–3.14），
   板上不需要编译工具链，装完就能 `import bcdl`。
-- **✅ 统一的 API** —— 17 类视觉任务共用同一套 `Engine` + 任务类心智模型；
+- **✅ 统一的 API** —— 18 类视觉任务共用同一套 `Engine` + 任务类心智模型；
   换任务不换写法，C++ 与 Python 接口对等。
 - **✅ 不再手写内存与缓存** —— `SysMem` 生命周期、推理前 clean / 读取前 invalidate
   由 `Engine` 负责。**这是 BPU 上最高频的正确性 bug**，表现为结果“看起来差不多但就是不对”。
@@ -94,7 +94,7 @@ hobot 运行时（`hbDNN` / `hbUCP` / 多媒体编解码）。区别只在**抽�
 | 形态 | 底层运行时 + 示例程序 | 可复用的框架（库） |
 | 接口 | 以 C API 为主 | C++17 RAII 类 + Python 绑定 |
 | 设备内存 | 自己 malloc / free `hbUCPSysMem`，自己 clean / invalidate 缓存 | `Engine` 自动处理 |
-| 后处理 | 自己写（NMS / DFL / 旋转 IoU / CTC…） | 17 类任务开箱即用 |
+| 后处理 | 自己写（NMS / DFL / 旋转 IoU / CTC…） | 18 类任务开箱即用 |
 | 多媒体拼接 | 各单元各自的 API，自己搬 buffer | 统一 `SysMem`，流水线零拷贝 |
 | 语言 | C / C++ | C++ 与 Python 对等，NumPy 进出 |
 | 上手 | 从示例复制，逐个模型改 | `conda install` + 十行代码 |
@@ -133,7 +133,7 @@ BCDL 是这套底层结构之上一层薄而 RAII 干净的 C++ 封装，外加�
 ```
 python/    nanobind 绑定（NumPy <-> 张量），推理时释放 GIL
 tasks/     det · cls · pose · seg · obb · semseg · depth · mono3d · ocr · open-vocab · sam · embed
-           drive · face · wholebody · features · superres
+           drive · face · wholebody · features · superres · depth-refine
 tracks/    ByteTrack 多目标跟踪 · ReID 外观嵌入
 pipeline/  同步 / 异步检测 · 跟踪 · 双目  (JPU -> VP -> BPU -> CPU/VPU)
 media/     JpegCodec (JPU) · VideoCodec H.264/H.265 (VPU)
@@ -236,6 +236,7 @@ build、许可证如何，见 [`docs/MODELS.md`](docs/MODELS.md)。
 | [`ocr_demo.cc`](examples/ocr_demo.cc) | 三段式 OCR：检测 → 方向分类 → 识别 |
 | [`depth_demo.cc`](examples/depth_demo.cc) | 单目深度 |
 | [`stereo_demo.cc`](examples/stereo_demo.cc) | 双目视差 / 深度 |
+| [`depth_refine_demo.cc`](examples/depth_refine_demo.cc) | RGB-D 深度精修：补洞去噪 + 点云 |
 | [`embed_demo.cc`](examples/embed_demo.cc) | 图像嵌入（以图搜图 / 零样本分类） |
 | [`track_demo.cc`](examples/track_demo.cc) | 检测 + ByteTrack 多目标跟踪 |
 
@@ -272,6 +273,9 @@ Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`]
   - **分类、姿态**（17 关键点）、**实例分割**（proto × mask-coef）、
     **旋转框**（OBB，旋转 IoU NMS）、**语义分割**、**单目深度**、
     **双目深度**（双图视差）、**单目 3D 检测**（SMOKE —— 单张图出 3D 框 + 朝向）。
+  - **RGB-D 深度精修** —— **LingBot-Depth**：把已有的带噪、有空洞的传感器深度
+    （双目或 ToF）连同对齐的 RGB 一起送入，输出补全后的米制深度 + 逐像素可信
+    掩膜，可直接反投影成点云。它精修而非估计，和上面两个深度头是互补关系。
   - **OCR** —— 完整三段式流水线：DBNet 检测 → PP-LCNet 方向分类（0°/180°）→
     CRNN/CTC 识别。**默认 PP-OCRv6**（识别侧走全 int16 构建：在 S100P 上比编译器
     默认的混合精度 int8 构建字错率约减半、且快约 2 倍），PP-OCRv5 保留为回退。

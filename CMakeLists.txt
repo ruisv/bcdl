@@ -84,6 +84,7 @@ add_library(bcdl SHARED
   src/tasks/mono3d.cc
   src/tasks/ocr.cc
   src/tasks/depth.cc
+  src/tasks/depth_refine.cc
   src/tasks/segmentation.cc
   src/tasks/embedding.cc
   src/tasks/panoptic_drive.cc
@@ -300,6 +301,13 @@ if(BCDL_BUILD_EXAMPLES)
     add_executable(stereo_demo examples/stereo_demo.cc)
     target_link_libraries(stereo_demo PRIVATE bcdl::bcdl ${OpenCV_LIBS})
     set_target_properties(stereo_demo PROPERTIES
+      BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
+    # RGB-D depth refinement: RGB + a raw sensor depth map -> cleaned metric
+    # depth, a trust mask and an optional point cloud (LingBot-Depth .hbm).
+    add_executable(depth_refine_demo examples/depth_refine_demo.cc)
+    target_link_libraries(depth_refine_demo PRIVATE bcdl::bcdl ${OpenCV_LIBS})
+    set_target_properties(depth_refine_demo PROPERTIES
       BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
   endif()
 endif()

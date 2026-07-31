@@ -441,6 +441,37 @@ std::vector<uint8_t> bgr = bcdl::depthColorize(dm);  // (H*W*3) Turbo BGR
 // 纯函数：decodeDepth(data, shape, cfg)
 ```
 
+## 深度精修 Depth refinement（RGB-D）
+
+`bcdl/tasks/depth_refine.h` —— 输入是**已有的**带噪、有空洞的深度图加上对齐的
+RGB 帧，输出补全后的米制深度 + 可信掩膜（LingBot-Depth）。和单目/双目两个头
+不同，它做的是精修而非估计。
+
+```cpp
+struct DepthRefineConfig { int encoder_height=420, encoder_width=560;
+                           float min_valid_depth=0.01f, mask_threshold=0.5f;
+                           bool apply_mask=true; };
+struct RefinedDepth { int width, height; std::vector<float> depth;
+                      std::vector<uint8_t> mask; float vmin, vmax; };
+struct Intrinsics { float fx, fy, cx, cy; };
+
+bcdl::DepthRefiner refiner(engine);            // 编码器网格从模型里读
+bcdl::RefinedDepth r = refiner.run(bgr, w, h, stride, depth_m, depth_stride);
+
+bcdl::Intrinsics k = bcdl::scaleIntrinsics(sensor_k, w, h, r.width, r.height);
+std::vector<float> pts = bcdl::depthToPointCloud(r, k);   // (H*W*3) 米
+
+// 纯函数部分，想自己喂 engine 时用：
+//   preprocessRefineImage(bgr, w, h, stride, cfg, &image_tensor)   // [3,eh,ew]
+//   preprocessRefineDepth(depth_m, w, h, stride, cfg, &log_tensor) // [1,eh,ew]
+//   depthU16ToMetres(raw16, w, h, stride, /*scale=*/1000.f)
+//   decodeRefinedDepth(depth, mask_logit, h, w, cfg)
+```
+
+engine 的两个输入必须是 F32 featuremap（否则构造函数抛异常）。深度以 log 深度、
+0 表示"没有读数"的形式进图；部署图保留全部深度 token，而上游会丢掉空 patch 的
+token —— 代价见 [`MODELS.md`](MODELS.md) 与头文件。
+
 ## OCR
 
 `bcdl/tasks/ocr.h` —— 三段互相独立的阶段（det / cls / rec）；由应用来组合

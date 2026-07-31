@@ -17,6 +17,7 @@
 #include "bcdl/preproc/vp_image.h"
 #include "bcdl/tasks/classification.h"
 #include "bcdl/tasks/depth.h"
+#include "bcdl/tasks/depth_refine.h"
 #include "bcdl/tasks/embedding.h"
 #include "bcdl/tasks/face.h"
 #include "bcdl/tasks/detection.h"

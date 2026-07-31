@@ -33,6 +33,7 @@
 #endif
 #include "bcdl/tasks/classification.h"
 #include "bcdl/tasks/depth.h"
+#include "bcdl/tasks/depth_refine.h"
 #include "bcdl/tasks/embedding.h"
 #include "bcdl/tasks/detection.h"
 #include "bcdl/tasks/face.h"
@@ -648,6 +649,137 @@ NB_MODULE(bcdl_py, m) {
            nb::keep_alive<1, 2>())
       .def("postprocess", &bcdl::DepthEstimator::postprocess)
       .def_prop_ro("config", &bcdl::DepthEstimator::config);
+
+  // ===========================================================================
+  // Depth refinement: RGB + raw sensor depth -> cleaned metric depth + trust mask
+  // ===========================================================================
+  nb::class_<bcdl::DepthRefineConfig>(m, "DepthRefineConfig")
+      .def(nb::init<>())
+      .def_rw("encoder_height", &bcdl::DepthRefineConfig::encoder_height)
+      .def_rw("encoder_width", &bcdl::DepthRefineConfig::encoder_width)
+      .def_rw("min_valid_depth", &bcdl::DepthRefineConfig::min_valid_depth)
+      .def_rw("mask_threshold", &bcdl::DepthRefineConfig::mask_threshold)
+      .def_rw("apply_mask", &bcdl::DepthRefineConfig::apply_mask);
+
+  nb::class_<bcdl::Intrinsics>(m, "Intrinsics")
+      .def(nb::init<>())
+      .def("__init__",
+           [](bcdl::Intrinsics* self, float fx, float fy, float cx, float cy) {
+             new (self) bcdl::Intrinsics{fx, fy, cx, cy};
+           },
+           "fx"_a, "fy"_a, "cx"_a, "cy"_a)
+      .def_rw("fx", &bcdl::Intrinsics::fx)
+      .def_rw("fy", &bcdl::Intrinsics::fy)
+      .def_rw("cx", &bcdl::Intrinsics::cx)
+      .def_rw("cy", &bcdl::Intrinsics::cy);
+
+  m.def("scale_intrinsics", &bcdl::scaleIntrinsics, "k"_a, "from_w"_a, "from_h"_a,
+        "to_w"_a, "to_h"_a,
+        "Rescale pinhole intrinsics between image sizes (plain resize, not crop).");
+
+  nb::class_<bcdl::RefinedDepth>(m, "RefinedDepth")
+      .def(nb::init<>())
+      .def_ro("width", &bcdl::RefinedDepth::width)
+      .def_ro("height", &bcdl::RefinedDepth::height)
+      .def_ro("vmin", &bcdl::RefinedDepth::vmin)
+      .def_ro("vmax", &bcdl::RefinedDepth::vmax)
+      .def_prop_ro(
+          "depth",
+          [](const bcdl::RefinedDepth& r) {
+            return toNumpy(std::vector<float>(r.depth),
+                           {static_cast<size_t>(r.height), static_cast<size_t>(r.width)});
+          },
+          nb::rv_policy::reference,
+          "Refined metric depth as a float32 (H, W) numpy array, 0 where rejected.")
+      .def_prop_ro(
+          "mask",
+          [](const bcdl::RefinedDepth& r) {
+            return toNumpy(std::vector<uint8_t>(r.mask),
+                           {static_cast<size_t>(r.height), static_cast<size_t>(r.width)});
+          },
+          nb::rv_policy::reference,
+          "Per-pixel trust mask as a uint8 (H, W) numpy array, 1 = trusted.");
+
+  m.def(
+      "preprocess_refine_image",
+      [](nb::ndarray<const uint8_t, nb::c_contig> bgr, const bcdl::DepthRefineConfig& cfg) {
+        if (bgr.ndim() != 3 || bgr.shape(2) != 3)
+          throw std::invalid_argument("preprocess_refine_image expects an (H, W, 3) BGR array");
+        std::vector<float> out;
+        bcdl::preprocessRefineImage(bgr.data(), static_cast<int>(bgr.shape(1)),
+                                    static_cast<int>(bgr.shape(0)),
+                                    static_cast<int>(bgr.shape(1)) * 3, cfg, &out);
+        return toNumpy(std::move(out), {1, 3, static_cast<size_t>(cfg.encoder_height),
+                                        static_cast<size_t>(cfg.encoder_width)});
+      },
+      "bgr"_a, "config"_a = bcdl::DepthRefineConfig{},
+      "BGR (H, W, 3) uint8 -> the model's `image` input, float32 (1, 3, eh, ew).");
+
+  m.def(
+      "preprocess_refine_depth",
+      [](nb::ndarray<const float, nb::c_contig> depth, const bcdl::DepthRefineConfig& cfg) {
+        if (depth.ndim() != 2)
+          throw std::invalid_argument("preprocess_refine_depth expects an (H, W) float array");
+        std::vector<float> out;
+        bcdl::preprocessRefineDepth(depth.data(), static_cast<int>(depth.shape(1)),
+                                    static_cast<int>(depth.shape(0)),
+                                    static_cast<int>(depth.shape(1)), cfg, &out);
+        return toNumpy(std::move(out), {1, 1, static_cast<size_t>(cfg.encoder_height),
+                                        static_cast<size_t>(cfg.encoder_width)});
+      },
+      "depth_m"_a, "config"_a = bcdl::DepthRefineConfig{},
+      "Metric depth (H, W) float32 -> the model's `depth_log` input, float32 (1, 1, eh, ew).");
+
+  m.def(
+      "decode_refined_depth",
+      [](nb::ndarray<const float, nb::c_contig> depth, nb::object mask_logit,
+         const bcdl::DepthRefineConfig& cfg) {
+        std::vector<int> dims;
+        for (size_t d = 0; d < depth.ndim(); ++d)
+          if (depth.shape(d) > 1) dims.push_back(static_cast<int>(depth.shape(d)));
+        if (dims.size() < 2)
+          throw std::invalid_argument("decode_refined_depth: cannot resolve HxW");
+        const int H = dims[dims.size() - 2], W = dims[dims.size() - 1];
+        const float* mp = nullptr;
+        nb::ndarray<const float, nb::c_contig> mask_arr;
+        if (!mask_logit.is_none()) {
+          mask_arr = nb::cast<nb::ndarray<const float, nb::c_contig>>(mask_logit);
+          mp = mask_arr.data();
+        }
+        return bcdl::decodeRefinedDepth(depth.data(), mp, H, W, cfg);
+      },
+      "depth"_a, "mask_logit"_a = nb::none(), "config"_a = bcdl::DepthRefineConfig{},
+      "Decode the refinement model's outputs into a RefinedDepth.");
+
+  m.def(
+      "depth_to_pointcloud",
+      [](const bcdl::RefinedDepth& r, const bcdl::Intrinsics& k) {
+        return toNumpy(bcdl::depthToPointCloud(r, k),
+                       {static_cast<size_t>(r.height), static_cast<size_t>(r.width), 3});
+      },
+      "refined"_a, "intrinsics"_a,
+      "Unproject to a camera-space point cloud, float32 (H, W, 3) in metres.");
+
+  nb::class_<bcdl::DepthRefiner>(m, "DepthRefiner")
+      .def(nb::init<bcdl::Engine&, bcdl::DepthRefineConfig, int, int, int, int>(), "engine"_a,
+           "config"_a = bcdl::DepthRefineConfig{}, "image_input"_a = 0, "depth_input"_a = 1,
+           "depth_output"_a = 0, "mask_output"_a = 1, nb::keep_alive<1, 2>())
+      .def(
+          "run",
+          [](bcdl::DepthRefiner& self, nb::ndarray<const uint8_t, nb::c_contig> bgr,
+             nb::ndarray<const float, nb::c_contig> depth_m) {
+            if (bgr.ndim() != 3 || bgr.shape(2) != 3)
+              throw std::invalid_argument("run() expects an (H, W, 3) BGR array");
+            if (depth_m.ndim() != 2)
+              throw std::invalid_argument("run() expects an (H, W) float depth array");
+            return self.run(bgr.data(), static_cast<int>(bgr.shape(1)),
+                            static_cast<int>(bgr.shape(0)), static_cast<int>(bgr.shape(1)) * 3,
+                            depth_m.data(), static_cast<int>(depth_m.shape(1)));
+          },
+          "bgr"_a, "depth_m"_a,
+          "Preprocess, infer and decode one RGB-D frame.")
+      .def("postprocess", &bcdl::DepthRefiner::postprocess)
+      .def_prop_ro("config", &bcdl::DepthRefiner::config);
 
   // ===========================================================================
   // Stereo: two-image disparity / depth pipeline (e.g. LAS2)

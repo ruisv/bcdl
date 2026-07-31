@@ -354,6 +354,22 @@ decodeDepth = bcdl_py.decode_depth
 depth_colorize = bcdl_py.depth_colorize
 depth_to_gray8 = bcdl_py.depth_to_gray8
 
+# RGB-D depth refinement: an existing noisy/holey depth map + the aligned RGB
+# frame in, cleaned metric depth + a trust mask out. preprocess_refine_* are the
+# exact host preprocessing the model was calibrated with, exposed so the numpy
+# path can feed the graph directly.
+DepthRefineConfig = bcdl_py.DepthRefineConfig
+RefinedDepth = bcdl_py.RefinedDepth
+Intrinsics = bcdl_py.Intrinsics
+scale_intrinsics = bcdl_py.scale_intrinsics
+scaleIntrinsics = bcdl_py.scale_intrinsics
+preprocess_refine_image = bcdl_py.preprocess_refine_image
+preprocess_refine_depth = bcdl_py.preprocess_refine_depth
+decode_refined_depth = bcdl_py.decode_refined_depth
+decodeRefinedDepth = bcdl_py.decode_refined_depth
+depth_to_pointcloud = bcdl_py.depth_to_pointcloud
+depthToPointCloud = bcdl_py.depth_to_pointcloud
+
 SegConfig = bcdl_py.SegConfig
 SegMask = bcdl_py.SegMask
 decode_seg = bcdl_py.decode_seg
@@ -381,6 +397,31 @@ class DepthEstimator:
     def postprocess(self) -> "DepthMap":
         """Post-process the Engine's current output (run engine.infer() first)."""
         return self._d.postprocess()
+
+
+class DepthRefiner:
+    """High-level RGB-D refinement head: wraps an Engine + DepthRefineConfig.
+
+    Unlike DepthEstimator this one owns its preprocessing, because the model's
+    two inputs (area-resized normalized RGB, and log depth with 0 for "no
+    reading") have to match what the .hbm was calibrated with exactly."""
+
+    def __init__(self, engine: "Engine", config: "DepthRefineConfig | None" = None,
+                 image_input: int = 0, depth_input: int = 1, depth_output: int = 0,
+                 mask_output: int = 1):
+        self.engine = engine
+        self.config = config if config is not None else DepthRefineConfig()
+        self._r = bcdl_py.DepthRefiner(engine._e, self.config, image_input, depth_input,
+                                       depth_output, mask_output)
+
+    def run(self, bgr: np.ndarray, depth_m: np.ndarray) -> "RefinedDepth":
+        """Refine one frame: BGR (H,W,3) uint8 + metric depth (H,W) float32."""
+        return self._r.run(np.ascontiguousarray(bgr),
+                           np.ascontiguousarray(depth_m, dtype=np.float32))
+
+    def postprocess(self) -> "RefinedDepth":
+        """Decode the Engine's current outputs (run engine.infer() first)."""
+        return self._r.postprocess()
 
 
 class Segmenter:
@@ -1397,6 +1438,19 @@ __all__ = [
     "decodeDepth",
     "depth_colorize",
     "depth_to_gray8",
+    # depth refinement (RGB-D)
+    "DepthRefineConfig",
+    "RefinedDepth",
+    "DepthRefiner",
+    "Intrinsics",
+    "scale_intrinsics",
+    "scaleIntrinsics",
+    "preprocess_refine_image",
+    "preprocess_refine_depth",
+    "decode_refined_depth",
+    "decodeRefinedDepth",
+    "depth_to_pointcloud",
+    "depthToPointCloud",
     # segmentation
     "SegConfig",
     "SegMask",

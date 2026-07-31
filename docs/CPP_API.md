@@ -449,6 +449,38 @@ std::vector<uint8_t> bgr = bcdl::depthColorize(dm);  // (H*W*3) Turbo BGR
 // pure: decodeDepth(data, shape, cfg)
 ```
 
+## Depth refinement (RGB-D)
+
+`bcdl/tasks/depth_refine.h` — an existing noisy/holey depth map plus the aligned
+RGB frame in, cleaned metric depth + a trust mask out (LingBot-Depth). Unlike the
+monocular and stereo heads this one refines rather than estimates.
+
+```cpp
+struct DepthRefineConfig { int encoder_height=420, encoder_width=560;
+                           float min_valid_depth=0.01f, mask_threshold=0.5f;
+                           bool apply_mask=true; };
+struct RefinedDepth { int width, height; std::vector<float> depth;
+                      std::vector<uint8_t> mask; float vmin, vmax; };
+struct Intrinsics { float fx, fy, cx, cy; };
+
+bcdl::DepthRefiner refiner(engine);            // adopts the model's encoder grid
+bcdl::RefinedDepth r = refiner.run(bgr, w, h, stride, depth_m, depth_stride);
+
+bcdl::Intrinsics k = bcdl::scaleIntrinsics(sensor_k, w, h, r.width, r.height);
+std::vector<float> pts = bcdl::depthToPointCloud(r, k);   // (H*W*3) metres
+
+// pure pieces, for feeding the engine yourself:
+//   preprocessRefineImage(bgr, w, h, stride, cfg, &image_tensor)   // [3,eh,ew]
+//   preprocessRefineDepth(depth_m, w, h, stride, cfg, &log_tensor) // [1,eh,ew]
+//   depthU16ToMetres(raw16, w, h, stride, /*scale=*/1000.f)
+//   decodeRefinedDepth(depth, mask_logit, h, w, cfg)
+```
+
+The engine's two inputs must be F32 featuremaps (the constructor throws
+otherwise). Depth enters as log depth with 0 for "no reading", and the compiled
+graph keeps every depth token where upstream drops empty ones — see
+[`MODELS.md`](MODELS.md) and the header for what that costs.
+
 ## OCR
 
 `bcdl/tasks/ocr.h` — three independent stages (det / cls / rec); the application

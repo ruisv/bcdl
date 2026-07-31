@@ -120,6 +120,11 @@ copy "${ZOO}/depth_anything_v2/model/s100/depth_any.hbm"
 LAS2_DIR="${BCDL_SRC_LAS2:-/path/to/converted/las2}"
 copy "${LAS2_DIR}/las2_m_int16_nashm.hbm"
 copy "${LAS2_DIR}/las2_m_crop_nashm.hbm"
+# RGB-D depth refinement (LingBot-Depth v0.5, 480x640) — converted offline.
+# Refines an existing noisy/holey depth map rather than estimating one; pairs
+# with either of the two models above as the depth source.
+LINGBOT_DIR="${BCDL_SRC_LINGBOT:-/path/to/converted/lingbot-depth}"
+copy "${LINGBOT_DIR}/lingbot_depth_v05_int16_nashm.hbm"
 # Board-shipped: DFL det (yolov8) + semantic seg (deeplabv3plus)
 copy "${HOBOT}/yolov8_640x640_nv12.hbm"
 copy "${HOBOT}/deeplabv3plus_dilation1248_1024x2048_nv12.hbm"

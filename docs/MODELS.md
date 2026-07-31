@@ -41,6 +41,7 @@ here, see [Getting the models](#getting-the-models)).
 | semantic seg (YOLO26 native res) | `yolo26n_sem_nashm_640x640_nv12.hbm` | YOLO26n-sem | 640×640 | converted |
 | monocular depth | `depth_any.hbm` | Depth-Anything-V2 | 686×518 | zoo |
 | stereo disparity | `las2_m_crop_nashm.hbm`, `las2_m_int16_nashm.hbm` | Lite Any Stereo V2 (M) | 640×480 | converted |
+| RGB-D depth refinement | `lingbot_depth_v05_int16_nashm.hbm` | LingBot-Depth v0.5 (MDM, DINOv2 ViT-L/14 RGBD) | 640×480 RGB + depth | converted |
 | open-vocab det | `yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm` | YOLOE-11s | 640×640 | converted |
 | open-vocab seg | `yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm` | YOLOE-11s | 640×640 | converted |
 | promptable seg | `edge_sam_encoder_nashm.hbm` | EdgeSAM encoder | 1024×1024 | converted |
@@ -98,6 +99,8 @@ suffix is which build you have, not noise:
 | `_v3` | PIDNet-S | The earlier builds were calibrated on data that had **not** been pre-normalised. When the calibration data is float32, the compiler's `norm_type` does not apply to it, so the input thresholds come out wrong — again with a clean compile. |
 | `_qat` | OSNet-AIN | int8 PTQ does not work on this network at all: it compiles cleanly and returns well-formed unit vectors whose Market-1501 Rank-1 is 51% against the float model's 85%. The shipped build was recovered by QAT self-distillation to 84.6%. |
 | `_crop` / `_int16` | Lite Any Stereo V2 | Two calibration modes — centre-crop-fit and resize-fit. Match it to how you letterbox the pair; the repo's stereo test uses a centre-cropped pair and prefers `_crop`. |
+| `_int16` | LingBot-Depth | int8 PTQ does not survive this network. It compiles cleanly and returns a well-formed depth map whose dynamic range has collapsed — 2.9–13.8 m against the float model's 0.97–45.8 m, 233% mean absolute relative error, 0.53 cosine, mask IoU 0.56. The per-layer report says why: LayerNorm and softmax `Mul` nodes come back at 0.006 cosine, and 1056 of 1418 nodes sit below 0.90. A 24-layer ViT-L is the case the all-int16 rule exists for. |
+| the token count | LingBot-Depth | The upstream network has no fixed resolution: a token budget plus the aspect ratio sets the encoder grid. The shipped build uses 1200 tokens, i.e. a 30×40 grid, a 420×560 encoder input, and a decoder pyramid that lands exactly on 480×640 so the final resize is the identity. Larger budgets (up to 3600) buy accuracy at a quadratic cost in attention — the graph is already the slowest model in this catalogue. |
 
 Two more choices in the table are **not** better/worse pairs:
 
@@ -158,6 +161,7 @@ commercially.
 | DeepLabV3+, SigLIP | via D-Robotics `rdk_model_zoo` — check its terms |
 | SCRFD, ArcFace (insightface) | MIT **code**, but the pretrained **weights are academic / non-commercial**. For a commercial build swap in YuNet (OpenCV Zoo — plain CNN, int8-safe) and pick another recognition backbone |
 | Lite Any Stereo V2 | check upstream before redistribution |
+| LingBot-Depth (MDM) | Apache-2.0 |
 | EdgeSAM | check upstream before redistribution |
 | OSNet (torchreid) | check upstream before redistribution |
 | ViTPose (easy_ViTPose export) | Apache-2.0 |

@@ -13,6 +13,45 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **RGB-D depth refinement (`tasks/depth_refine.h`).** A new task head that takes
+  a depth map you already have — a stereo or ToF reading, noisy and full of
+  holes — plus the aligned RGB frame, and returns hole-filled metric depth with a
+  per-pixel trust mask, ready to unproject into a camera-space point cloud. It
+  refines rather than estimates, so it complements the monocular and stereo depth
+  heads instead of replacing either. `DepthRefiner` owns its preprocessing,
+  because the two graph inputs (area-resized normalized RGB, and log depth with 0
+  standing for "no reading") have to match what the model was calibrated with
+  exactly; `preprocessRefineImage` / `preprocessRefineDepth` /
+  `decodeRefinedDepth` / `depthToPointCloud` are exposed as pure functions for
+  callers who drive the engine themselves. New `examples/depth_refine_demo.cc`
+  writes an input-vs-refined comparison and an optional `.xyz` point cloud.
+
+  Two properties of the deployed graph are worth knowing. Upstream drops depth
+  tokens whose patch holds no valid reading, which makes the transformer's
+  sequence length depend on the data and cannot be compiled statically; the
+  deployed graph keeps every token, measured at 0.06% mean absolute relative
+  depth error and 0.9999 mask IoU across the reference scenes — but those scenes
+  are 87–100% valid, so very sparse input depth is outside what was measured. And
+  the RGB downscale is area-averaged rather than bilinear: against the reference
+  implementation's antialiased resize, area costs 6.1e-4 mean absolute relative
+  error where plain bilinear costs 9.1e-4.
+
+  The shipped build is all-int16 because int8 PTQ does not survive a 24-layer
+  ViT-L: it compiles cleanly and returns a depth map whose dynamic range has
+  collapsed (2.9–13.8 m against the float model's 0.97–45.8 m, 233% mean
+  absolute relative error, 0.53 cosine). See `docs/MODELS.md`.
+
+  **This is the slowest model in the catalogue by an order of magnitude: 1457 ms
+  per frame (0.69 FPS) on the S100P**, against 2.9% mean absolute relative error
+  and 0.959 mask IoU versus the float model. Treat it as on-demand refinement of
+  a keyframe, not as something to put in a video loop. The cost is the attention
+  score matrix, which is quadratic in a sequence length of 1 + 2N (image and
+  depth tokens are concatenated) and moves 23 GB of DDR per frame at int16 —
+  the attention matmuls spend 4.3 ms computing inside a 21.9 ms slot. The token
+  budget is therefore the latency lever, and its accuracy cost is mild: against a
+  3600-token float reference, the shipped 1200 tokens give 1.20% mean absolute
+  relative error, 768 give 1.75% at 2.4× cheaper attention, and 432 give 2.56% at
+  7.5× cheaper. Quantization error already exceeds all of those.
 - **Chinese API references.** `docs/API.zh.md` (Python) and `docs/CPP_API.zh.md`
   (C++) are full translations of the English pair, not summaries: every class,
   config field, decoder signature, gotcha and measurement carries over. Each doc

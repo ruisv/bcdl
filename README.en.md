@@ -74,7 +74,7 @@ does it correctly.
 
 - **✅ One-line install** — prebuilt linux-aarch64 conda packages (Python
   3.9–3.14). No toolchain on the board; `import bcdl` right after install.
-- **✅ Unified API** — 17 vision tasks share one `Engine` + task-class model.
+- **✅ Unified API** — 18 vision tasks share one `Engine` + task-class model.
   Switching task doesn't switch mental model, and C++ and Python are peers.
 - **✅ No hand-written memory or cache discipline** — `SysMem` lifetime, clean
   before infer and invalidate before read are the `Engine`'s job. **This is the
@@ -104,7 +104,7 @@ media codec). The difference is the **level of abstraction**:
 | Shape | low-level runtime + sample programs | a reusable framework (library) |
 | Interface | mostly C APIs | C++17 RAII classes + Python bindings |
 | Device memory | malloc/free `hbUCPSysMem` yourself, clean/invalidate yourself | handled by `Engine` |
-| Post-processing | write your own (NMS / DFL / rotated IoU / CTC…) | 17 tasks out of the box |
+| Post-processing | write your own (NMS / DFL / rotated IoU / CTC…) | 18 tasks out of the box |
 | Media plumbing | per-unit APIs, move buffers yourself | one `SysMem`, zero-copy pipelines |
 | Languages | C / C++ | C++ and Python as peers, NumPy in/out |
 | Getting started | copy a sample, adapt per model | `conda install` + ten lines |
@@ -146,7 +146,7 @@ Repository layers:
 ```
 python/    nanobind bindings (NumPy <-> tensors), GIL-released infer
 tasks/     det · cls · pose · seg · obb · semseg · depth · mono3d · ocr · open-vocab · sam · embed
-           drive · face · wholebody · features · superres
+           drive · face · wholebody · features · superres · depth-refine
 tracks/    ByteTrack multi-object tracker · ReID appearance embeddings
 pipeline/  sync / async detection · tracking · stereo  (JPU -> VP -> BPU -> CPU/VPU)
 media/     JpegCodec (JPU) · VideoCodec H.264/H.265 (VPU)
@@ -254,6 +254,7 @@ Everything under [`examples/`](examples/) is a standalone runnable program:
 | [`ocr_demo.cc`](examples/ocr_demo.cc) | 3-stage OCR: detect → angle classify → recognize |
 | [`depth_demo.cc`](examples/depth_demo.cc) | monocular depth |
 | [`stereo_demo.cc`](examples/stereo_demo.cc) | stereo disparity / depth |
+| [`depth_refine_demo.cc`](examples/depth_refine_demo.cc) | RGB-D depth refinement: hole-filling + point cloud |
 | [`embed_demo.cc`](examples/embed_demo.cc) | image embeddings (retrieval / zero-shot classification) |
 | [`track_demo.cc`](examples/track_demo.cc) | detection + ByteTrack multi-object tracking |
 
@@ -293,6 +294,11 @@ takes float32 NumPy arrays — **no Engine, no board, no model needed**.
     mask-coef), **Oriented boxes** (OBB, rotated-IoU NMS), **Semantic
     segmentation**, **Monocular depth**, **Stereo depth** (two-image disparity),
     **Monocular 3D detection** (SMOKE — 3D box + orientation from a single image).
+  - **RGB-D depth refinement** — **LingBot-Depth**: feed an existing noisy, holey
+    sensor depth map (stereo or ToF) together with the aligned RGB frame, get
+    back hole-filled metric depth plus a per-pixel trust mask, ready to unproject
+    into a point cloud. It refines rather than estimates, so it complements the
+    two depth heads above.
   - **OCR** — full 3-stage pipeline: DBNet detect → PP-LCNet direction classifier
     (0°/180°) → CRNN/CTC recognize. **Defaults to PP-OCRv6** with an all-int16
     recogniser build (on the S100P it roughly halves the character error of the

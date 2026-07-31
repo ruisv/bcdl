@@ -414,6 +414,46 @@ dm = bcdl.decode_depth(out.astype(np.float32), cfg)
 - **`DepthEstimator(engine, config=None, output_index=0)`** —— `.estimate(model_input, timeout_ms=0)`、
   `.postprocess()`、`.config`。
 
+## 深度精修 Depth refinement（RGB-D）
+
+输入是你**已经有的**深度图——双目或 ToF 的读数，带噪、有空洞——加上对齐的 RGB
+帧，输出干净的米制深度和逐像素可信掩膜。这是 LingBot-Depth 头；它不像
+`DepthEstimator`（单目）或 `StereoPipeline` 那样从零估计深度。
+
+```python
+refiner = bcdl.DepthRefiner(engine)          # 输入：image、depth_log
+r = refiner.run(bgr, depth_m)                # BGR (H,W,3) uint8 + (H,W) float32 米
+r.depth                                      # (H, W) float32 米，被拒绝处为 0
+r.mask                                       # (H, W) uint8，1 = 可信
+r.vmin, r.vmax                               # 仅统计可信像素的范围
+
+k = bcdl.Intrinsics(fx, fy, cx, cy)          # 用**传感器原图**的像素单位
+k = bcdl.scale_intrinsics(k, bgr.shape[1], bgr.shape[0], r.width, r.height)
+pts = bcdl.depth_to_pointcloud(r, k)         # (H, W, 3) float32 米，相机坐标系
+
+# numpy 路径 —— 自己喂图：
+img = bcdl.preprocess_refine_image(bgr)      # (1, 3, eh, ew) float32
+dep = bcdl.preprocess_refine_depth(depth_m)  # (1, 1, eh, ew) float32
+r = bcdl.decode_refined_depth(depth_out, mask_logit_out)
+```
+
+- **`DepthRefineConfig`** —— `encoder_height`、`encoder_width`（构造时从模型读取）、
+  `min_valid_depth`、`mask_threshold`、`apply_mask`。
+- **`RefinedDepth`** —— `width`、`height`、`vmin`、`vmax`、`depth`、`mask`。
+- **`Intrinsics(fx, fy, cx, cy)`** · **`scale_intrinsics(k, from_w, from_h, to_w, to_h)`**。
+- **`preprocess_refine_image(bgr, config=None)`** · **`preprocess_refine_depth(depth_m, config=None)`**
+  —— 与模型标定时**完全一致**的前处理。RGB 降采样走面积平均，换成普通双线性会实测变差。
+- **`decode_refined_depth(depth, mask_logit=None, config=None) -> RefinedDepth`**。
+- **`depth_to_pointcloud(refined, intrinsics) -> np.ndarray`**。
+- **`DepthRefiner(engine, config=None, image_input=0, depth_input=1, depth_output=0, mask_output=1)`**
+  —— `.run(bgr, depth_m)`、`.postprocess()`、`.config`。
+
+> 深度是以 **log 深度、0 表示"没有读数"** 的形式进图的，这是上游自己的约定——
+> 真实的 1 m 读数和缺失像素落在同一个值上，靠 RGB token 去区分。部署图还保留了
+> 全部深度 token，而上游会把"整块 patch 都没有有效读数"的 token 丢掉（变长序列
+> 编不出静态图）。在参考场景上这一改动的代价是 0.06% 的绝对相对误差；但那些场景
+> 的深度有效率是 87–100%，**极稀疏输入不在实测范围内**。
+
 ## 双目 Stereo
 
 两张已校正的图像 → 视差图，可选输出米制深度与有效性掩膜。像素归一化已经融进
