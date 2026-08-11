@@ -12,6 +12,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08
+
 ### Added
 - **RGB-D depth refinement (`tasks/depth_refine.h`).** A new task head that takes
   a depth map you already have — a stereo or ToF reading, noisy and full of
@@ -52,6 +54,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   3600-token float reference, the shipped 1200 tokens give 1.20% mean absolute
   relative error, 768 give 1.75% at 2.4× cheaper attention, and 432 give 2.56% at
   7.5× cheaper. Quantization error already exceeds all of those.
+- **YOLO26n-sem semantic segmentation (Cityscapes, 19 classes).** A second
+  real-time segmentation model, and no new C++: it decodes through the existing
+  `Segmenter` argmax path exactly as DeepLabV3+ and PIDNet-S do. What it adds is
+  native 640×640 output, so unlike the 1024×2048 `semseg_rt` build the caller
+  does not have to upsample the label map itself.
+
+  The shipped build is int16 **and** calibrated on real Cityscapes frames, and
+  both halves are load-bearing. An all-int8 build compiles cleanly and passes
+  every per-tensor cosine gate (>0.95 on every layer, ≥0.98 on the output) while
+  agreeing with the float model on only 61% of pixel-level class decisions —
+  whole classes swap wholesale. A dense 19-way per-pixel classifier is
+  decision-boundary sensitive in a way an aggregate cosine cannot see, which is
+  worth remembering the next time a cosine gate says a segmentation model is
+  fine. Uniform int16 recovers 85%; the rest was calibration domain rather than
+  precision, and recalibrating on real Cityscapes frames instead of a
+  general street-scene stand-in closes it to 96%.
 - **Chinese API references.** `docs/API.zh.md` (Python) and `docs/CPP_API.zh.md`
   (C++) are full translations of the English pair, not summaries: every class,
   config field, decoder signature, gotcha and measurement carries over. Each doc
