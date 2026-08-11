@@ -153,20 +153,32 @@ runtime that loads any `.hbm`. The licences below constrain **the model weights
 and their compiled `.hbm`**, so check each one before redistributing or shipping
 commercially.
 
+**The licence on the repository is not the licence on the weights.** That is the
+single most common way to get this wrong, and it is why several rows below carry
+a permissive badge and a restriction at the same time. A checkpoint can be
+encumbered by two things the code licence never mentions: the **pretrained
+weights it was fine-tuned from** (ViTPose starts from MAE, which is CC-BY-NC),
+and the **dataset it was trained on** (Cityscapes bars commercial use of models
+trained on it, in as many words). Where upstream is silent on the weights, this
+table says so rather than inferring a grant from the code licence — silence is
+not permission. Every row was checked against the upstream LICENSE file and the
+weights' own model card; the rows marked *unresolved* are ones no primary source
+answers, not ones nobody looked at.
+
 | upstream | licence |
 |---|---|
-| PP-OCRv6 det/rec, PP-OCRv5 det/rec, PP-LCNet cls (PaddleOCR) | Apache-2.0 |
+| PP-OCRv6 det/rec, PP-OCRv5 det/rec, PP-LCNet cls (PaddleOCR) | Apache-2.0, code **and** weights (each model card declares it) |
 | YOLO26 / YOLOv8 / YOLOE (Ultralytics) | **AGPL-3.0** — copyleft; commercial use needs their Enterprise licence |
 | Depth-Anything-V2 | Apache-2.0 (Small) / CC-BY-NC-4.0 (Base and up) — check the variant |
 | DeepLabV3+, SigLIP | via D-Robotics `rdk_model_zoo` — check its terms |
 | SCRFD, ArcFace (insightface) | MIT **code**, but the pretrained **weights are academic / non-commercial**. For a commercial build swap in YuNet (OpenCV Zoo — plain CNN, int8-safe) and pick another recognition backbone |
-| Lite Any Stereo V2 | check upstream before redistribution |
-| LingBot-Depth (MDM) | Apache-2.0 |
-| EdgeSAM | check upstream before redistribution |
-| OSNet (torchreid) | check upstream before redistribution |
-| ViTPose (easy_ViTPose export) | Apache-2.0 |
-| XFeat | Apache-2.0 |
-| SPAN | Apache-2.0 |
-| Real-ESRGAN (realesr-general-x4v3) | BSD-3-Clause |
-| YOLOP | MIT |
-| PIDNet | MIT |
+| Lite Any Stereo V2 | MIT, code and weights. One note: the released weights were distilled from FoundationStereo, whose NVIDIA licence is research-only. That is upstream's compliance question rather than a term they passed down, but it is worth a look before a commercial build |
+| LingBot-Depth (MDM) | Apache-2.0, code and weights; its DINOv2 backbone is Apache-2.0 too |
+| EdgeSAM | **unresolved** — upstream terms not reviewed |
+| OSNet (torchreid) | MIT **code**. The ReID-useful checkpoints are trained on MSMT17 / Market-1501, which are academic-use-only datasets, and no upstream source says whether that reaches the weights — **unresolved**. The clean route is the ImageNet-pretrained backbone plus your own permissively-licensed ReID data |
+| ViTPose (easy_ViTPose export) | Apache-2.0 **code**, but the whole-body checkpoint is fine-tuned from **MAE, which is CC-BY-NC-4.0**, and trained on COCO-WholeBody (research / non-commercial). Treat the weights as **non-commercial** |
+| XFeat | Apache-2.0 — the weights are committed in the same repo, so they are covered |
+| SPAN | Apache-2.0 for the project. The checkpoints ship from a separate file host with no terms attached to them, so the grant is by project statement rather than on the artefact |
+| Real-ESRGAN (realesr-general-x4v3) | BSD-3-Clause — the weights are release assets of the same repo, published by the copyright holder |
+| YOLOP | MIT **code**, and unusually the weights are committed in the repo, so MIT covers them. But it is trained on **BDD100K**, whose agreement limits commercial use to member organizations — non-commercial is clear, commercial needs a look |
+| PIDNet | MIT **code**, trained on **Cityscapes**, which explicitly permits distributing models trained on it *and* explicitly bars commercial use of any derivative work. So: redistributable, **non-commercial** |
