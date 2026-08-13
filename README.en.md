@@ -63,6 +63,14 @@ Reproduce with `scripts/board_bench.py`; full numbers in
 | <img src="benchmarks/figures/stereo.jpg" width="250"> | <img src="benchmarks/figures/ocr.jpg" width="250"> | <img src="benchmarks/figures/decode_jpu.jpg" width="250"> |
 | **Whole-body pose (133 keypoints)** | **Sparse features & matching (XFeat)** | **Super-resolution x4 (SPAN)** |
 | <img src="benchmarks/figures/wholebody.jpg" width="250"> | <img src="benchmarks/figures/features.jpg" width="250"> | <img src="benchmarks/figures/superres_span.jpg" width="250"> |
+| **Optical flow (NeuFlow v2)** | **Industrial anomaly detection (GLASS)** | **End-to-end driving (DiffusionDrive)** |
+| <img src="benchmarks/figures/flow.jpg" width="250"> | <img src="benchmarks/figures/anomaly.jpg" width="250"> | <img src="benchmarks/figures/drive.jpg" width="250"> |
+
+**Lidar 3-D detection (PointPillars)** — the model's own 3-D boxes projected back
+onto the camera image, scored against the labels. See
+[how to read it](docs/MODELS.md#reading-the-lidar-check-figure).
+
+<img src="benchmarks/figures/lidar3d.jpg" width="780">
 
 ## Why BCDL
 
@@ -74,7 +82,7 @@ does it correctly.
 
 - **✅ One-line install** — prebuilt linux-aarch64 conda packages (Python
   3.9–3.14). No toolchain on the board; `import bcdl` right after install.
-- **✅ Unified API** — 18 vision tasks share one `Engine` + task-class model.
+- **✅ Unified API** — 22 vision tasks share one `Engine` + task-class model.
   Switching task doesn't switch mental model, and C++ and Python are peers.
 - **✅ No hand-written memory or cache discipline** — `SysMem` lifetime, clean
   before infer and invalidate before read are the `Engine`'s job. **This is the
@@ -90,7 +98,8 @@ does it correctly.
   BPU compilation, the face detector pads bottom-right, embedding towers want a
   squashing resize rather than a letterbox… all dealt with in the library
   (see [Capabilities](#capabilities)) instead of costing you a week.
-- **✅ Verifiable and reproducible** — 97 tests (66 of which need no board), and
+- **✅ Verifiable and reproducible** — 335 tests (261 of which touch no model at all,
+  running the pure-numpy decode paths), and
   an on-board benchmark that reruns itself until the board is provably quiet.
 
 ## Relation to the official SDK
@@ -346,6 +355,31 @@ takes float32 NumPy arrays — **no Engine, no board, no model needed**.
   - **Multi-object tracking** — ByteTrack (Kalman + two-stage association); ReID
     appearance embeddings with L2-normalize + cosine similarity (BoT-SORT
     association primitives), BoostTrack++ and camera-motion compensation.
+  - **Optical flow** — NeuFlow v2: a dense displacement field, Middlebury-wheel
+    colourisation and an EPE metric. **Shipped at int16 on purpose**: int8
+    degrades into a flat ~1.9 px noise floor, so fast pixels look fine and slow
+    ones are pure noise — while the compiler reports 0.9954 output cosine for it.
+    A head that regresses a physical quantity has to be scored in that
+    quantity's units. 19.3 ms on the BPU.
+  - **Industrial anomaly detection** — GLASS one-class detection: trained on one
+    product's **normal** images only, out comes a per-pixel anomaly map. The
+    image score is the **maximum, not the mean** — a part is as bad as its worst
+    patch. The backbone is a frozen ImageNet WideResNet-50 and only two small
+    heads are trained per product, so the shipped model is an **example** and the
+    threshold is a line-side decision. Image and pixel AUROC both 0.9905 on
+    MVTec-AD bottle, matching float.
+  - **End-to-end driving** — DiffusionDrive: a stitched three-camera strip, a
+    lidar BEV histogram and ego state in; a 4-second planned trajectory, 30 agents
+    and a 7-class BEV semantic map out. The first model here whose **inputs are
+    quantized too** (four int16 tensors with per-tensor scales — feed them float
+    bytes and it runs happily on noise). Trajectory cosine 0.9994 against FP32
+    over 120 real frames.
+  - **Lidar 3-D detection** — PointPillars: a sweep in, oriented 3-D boxes out.
+    The chain is deliberately separate pieces (voxelize → VFE → scatter →
+    backbone+head → decode + BEV NMS) because their costs differ wildly. The
+    anchor decode runs on the CPU: the published graph bakes it in with
+    `ScatterND`, which **compiles without an error into a model whose outputs are
+    never written**.
   - Detection heads take both **PTQ (NV12 two-plane) and QAT-exported float-input**
     models (`detect_float` / `letterbox_chw_float`).
 - **Hardware preprocessing** — fixed geometric transforms on the VPS GDC engine:
@@ -536,13 +570,15 @@ end-to-end against the **conda packages** (`bcdl` + `libbcdl` + `hobot-dnn` +
 `hobot-media`): **96 passed, 1 skipped** (97 collected; the skip needs an
 explicit `--hbm`).
 
-| group | files | tests | needs board? |
-|-------|-------|-------|--------------|
-| Decode math (det/cls/pose/obb/instance-seg/depth/seg/ocr/stereo) + memory-safety | `test_detection`, `test_classification`, `test_pose`, `test_obb`, `test_instance_seg`, `test_depth_seg`(+`_py`), `test_ocr`, `test_stereo_py`, `test_memory_safety` | 66 | no |
-| Tasks on real models (cls·det·det_dfl·pose·seg·obb·semseg·depth·OCR 3-stage) | `test_board_models` | 11 | yes |
-| Stereo depth (real LAS2 `.hbm`) | `test_stereo_board_py` | 3 | yes |
-| Media codecs (VPImage · JPEG/JPU · H.264/H.265/VPU) | `test_codec_py`, `test_video_decode_py` | 11 | yes |
-| Pipelines (ByteTrack, async detection) | `test_tracking_py`, `test_async_detection_py` | 5 | yes |
+| group | tests | needs an `.hbm`? |
+|-------|-------|--------------|
+| **Decode and geometry math** — the pure-numpy path for every task family: detection, classification, pose, OBB, instance seg, semantic seg, depth, RGB-D refinement, OCR, stereo, embeddings, features, super-resolution, ReID, optical flow, anomaly, end-to-end driving, lidar 3-D — plus calibration geometry and memory safety | **261** | no |
+| **Real models, end to end** — each task's result gate on a real `.hbm`, media codecs (JPU / VPU), pipelines (ByteTrack, async detection), Engine input/output stride | **74** | yes |
+| **total** | **335** | |
+
+The 261 that need no `.hbm` are deliberately the thick half: a decoder's
+arithmetic can be caught without a board, while board tests are slow and depend
+on which models have been downloaded.
 
 ## Community
 

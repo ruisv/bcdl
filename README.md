@@ -61,6 +61,13 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 | <img src="benchmarks/figures/stereo.jpg" width="250"> | <img src="benchmarks/figures/ocr.jpg" width="250"> | <img src="benchmarks/figures/decode_jpu.jpg" width="250"> |
 | **全身姿态（133 关键点）** | **稀疏特征点与匹配（XFeat）** | **超分 x4（SPAN）** |
 | <img src="benchmarks/figures/wholebody.jpg" width="250"> | <img src="benchmarks/figures/features.jpg" width="250"> | <img src="benchmarks/figures/superres_span.jpg" width="250"> |
+| **光流（NeuFlow v2）** | **工业异常检测（GLASS）** | **端到端驾驶（DiffusionDrive）** |
+| <img src="benchmarks/figures/flow.jpg" width="250"> | <img src="benchmarks/figures/anomaly.jpg" width="250"> | <img src="benchmarks/figures/drive.jpg" width="250"> |
+
+**激光雷达 3-D 检测（PointPillars）** —— 模型自己的 3-D 框投影回相机图，
+并与标注对分。[怎么读这张图](docs/MODELS.md#reading-the-lidar-check-figure)。
+
+<img src="benchmarks/figures/lidar3d.jpg" width="780">
 
 ## 为什么用 BCDL
 
@@ -70,7 +77,7 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 
 - **✅ 一行安装** —— 预编译的 linux-aarch64 conda 包（Python 3.9–3.14），
   板上不需要编译工具链，装完就能 `import bcdl`。
-- **✅ 统一的 API** —— 18 类视觉任务共用同一套 `Engine` + 任务类心智模型；
+- **✅ 统一的 API** —— 22 类视觉任务共用同一套 `Engine` + 任务类心智模型；
   换任务不换写法，C++ 与 Python 接口对等。
 - **✅ 不再手写内存与缓存** —— `SysMem` 生命周期、推理前 clean / 读取前 invalidate
   由 `Engine` 负责。**这是 BPU 上最高频的正确性 bug**，表现为结果“看起来差不多但就是不对”。
@@ -81,7 +88,7 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 - **✅ 踩过的坑写在代码里** —— YOLOP 的 anchor 解码编译不出来、人脸检测器的 padding
   在左上角、嵌入模型要挤压式 resize 而不是 letterbox…… 这些都已经在库里处理好了，
   不用再花一周复现一遍（见[能力清单](#能力清单)）。
-- **✅ 可验证、可复现** —— 97 个测试（其中 66 个不需要板子），板端基准一条命令复现，
+- **✅ 可验证、可复现** —— 335 个测试（其中 261 个不碰模型，纯 numpy 解码路径），板端基准一条命令复现，
   并且带“板子是否干净”的结果闸门。
 
 ## 与官方 SDK 的关系
@@ -94,7 +101,7 @@ hobot 运行时（`hbDNN` / `hbUCP` / 多媒体编解码）。区别只在**抽�
 | 形态 | 底层运行时 + 示例程序 | 可复用的框架（库） |
 | 接口 | 以 C API 为主 | C++17 RAII 类 + Python 绑定 |
 | 设备内存 | 自己 malloc / free `hbUCPSysMem`，自己 clean / invalidate 缓存 | `Engine` 自动处理 |
-| 后处理 | 自己写（NMS / DFL / 旋转 IoU / CTC…） | 18 类任务开箱即用 |
+| 后处理 | 自己写（NMS / DFL / 旋转 IoU / CTC…） | 22 类任务开箱即用 |
 | 多媒体拼接 | 各单元各自的 API，自己搬 buffer | 统一 `SysMem`，流水线零拷贝 |
 | 语言 | C / C++ | C++ 与 Python 对等，NumPy 进出 |
 | 上手 | 从示例复制，逐个模型改 | `conda install` + 十行代码 |
@@ -309,6 +316,22 @@ Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`]
     真实退化上，模糊/压缩输入更强。按输入域选，不是谁替代谁。
   - **多目标跟踪** —— ByteTrack（Kalman + 两阶段关联）；ReID 外观嵌入的 L2
     归一化 + 余弦相似度（BoT-SORT 关联原语）、BoostTrack++ 与相机运动补偿。
+  - **光流** —— NeuFlow v2：稠密位移场 + Middlebury 色轮着色、EPE 度量。
+    **发的是 int16**：int8 会退化成一条约 1.9 px 的平噪声底，快像素看着没事、
+    慢像素全是噪声，而编译器给它报的输出余弦是 0.9954 —— 回归物理量的头要用
+    那个量的单位打分，不能用余弦。19.3 ms 纯 BPU。
+  - **工业异常检测** —— GLASS 单类检测：只用某产品的**正常**图训练，输出逐像素
+    异常图。图像分数取**最大值不取均值**（零件有多坏取决于最坏那块）。骨干是冻结
+    的 ImageNet WideResNet-50，每个产品只训两个小头，所以随库的模型是**示例**、
+    阈值是产线级决策。MVTec-AD bottle 上图像/像素 AUROC 均 0.9905，与浮点持平。
+  - **端到端驾驶** —— DiffusionDrive：三目拼接相机 + 点云 BEV 直方图 + 自车状态
+    进，4 秒规划轨迹 + 30 个目标 + 7 类 BEV 语义图出。本仓第一个**输入也是量化**
+    的模型（四个输入都是带 scale 的 int16，直接塞 float 字节会照跑但在跑噪声）。
+    120 帧真实数据上板端对 FP32 轨迹余弦 0.9994。
+  - **激光雷达 3-D 检测** —— PointPillars：点云进，带朝向的 3-D 框出。整条链
+    自己拆开（体素化 → VFE → scatter → 骨干+头 → 解码 + BEV NMS），因为各段
+    成本差得极远。anchor 解码放 CPU：官方图把它烘进 `ScatterND`，那东西**编译
+    不报错、产物却从不写输出**。
   - 检测头同时支持 **PTQ（NV12 两平面）与 QAT 导出的浮点输入** 模型
     （`detect_float` / `letterbox_chw_float`）。
 - **硬件预处理** —— VPS GDC 引擎上的固定几何变换：硬件 letterbox 与任意密集
@@ -482,13 +505,14 @@ PYTHONPATH=build:python pytest tests/
 `hobot-media`）端到端：**96 通过、1 跳过**（共收集 97 个；该跳过项需要显式
 `--hbm`）。
 
-| 分组 | 文件 | 测试数 | 需要板子？ |
-|-------|-------|-------|--------------|
-| 解码数学（det/cls/pose/obb/实例分割/depth/seg/ocr/stereo）+ 内存安全 | `test_detection`、`test_classification`、`test_pose`、`test_obb`、`test_instance_seg`、`test_depth_seg`(+`_py`)、`test_ocr`、`test_stereo_py`、`test_memory_safety` | 66 | 否 |
-| 真实模型上的任务（cls·det·det_dfl·pose·seg·obb·semseg·depth·OCR 三段） | `test_board_models` | 11 | 是 |
-| 双目深度（真实 LAS2 `.hbm`） | `test_stereo_board_py` | 3 | 是 |
-| 多媒体编解码（VPImage · JPEG/JPU · H.264/H.265/VPU） | `test_codec_py`、`test_video_decode_py` | 11 | 是 |
-| 流水线（ByteTrack、异步检测） | `test_tracking_py`、`test_async_detection_py` | 5 | 是 |
+| 分组 | 测试数 | 需要 `.hbm`？ |
+|-------|-------|--------------|
+| **解码与几何数学** —— 每个任务族的纯 numpy 路径：检测 / 分类 / 姿态 / OBB / 实例分割 / 语义分割 / 深度 / RGB-D 精修 / OCR / 立体 / 嵌入 / 特征点 / 超分 / ReID / 光流 / 异常检测 / 端到端驾驶 / 激光雷达 3D，加上标定几何与内存安全 | **261** | 否 |
+| **真实模型端到端** —— 各任务在真 `.hbm` 上的结果闸门、媒体编解码（JPU / VPU）、流水线（ByteTrack、异步检测）、Engine 输入输出 stride | **74** | 是 |
+| **合计** | **335** | |
+
+不需要 `.hbm` 的那 261 项是刻意做厚的：解码器的数学错误不需要板子就能抓，
+而板端测试跑得慢、又依赖模型是否已下载。
 
 ## 社区交流
 

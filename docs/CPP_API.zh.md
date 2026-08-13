@@ -152,7 +152,8 @@ std::size_t obytes = engine.outputBytes(0);
 | `inputType(i)` / `outputType(i)` | `hbDNN` 张量类型枚举。 |
 | `inputProperties(i)` / `outputProperties(i)` | 完整的 `hbDNNTensorProperties`（dtype、量化、stride）。 |
 | `inputBytes(i)` / `outputBytes(i)` | 分配到的设备缓冲大小。 |
-| `inputPackedBytes(i)` | 输入 `i` 作为连续行主序数组的大小 —— 模型对某一维补齐时会小于 `inputBytes(i)`。 |
+| `inputPackedBytes(i)` / `outputPackedBytes(i)` | 该张量作为连续行主序数组的大小 —— 模型对某一维补齐时会小于设备缓冲。 |
+| `copyOutput(i, dst, bytes)` | 把输出 `i` 从补齐后的设备 layout 收拢成 `outputPackedBytes(i)` 字节的连续行主序数组；dtype 不变（`outputAsFloat()` 还会做反量化）。 |
 | `inputStride(i)` | 输入 `i` 解析后的字节 stride，最内层在最后。 |
 | `outputStride(i)` | 输出 `i` 的字节 stride。输出同样会补齐；`outputAsFloat()` 会处理好，直接读原始指针的代码**不能**摊平 reshape。 |
 | `setInput(i, data, bytes)` | 把 host 字节拷进输入 `i` 并刷缓存。`bytes` 必须等于 `inputPackedBytes(i)`（按设备 layout 散布写入）或 `inputBytes(i)`（原样拷贝）；其他值一律抛异常。 |
@@ -424,6 +425,120 @@ std::vector<uint8_t> bgr = bcdl::segColorize(m);   // (H*W*3) BGR 调色板
 ```
 
 `num_classes=0` 表示从张量推断 C；模型已经输出 id 时设 `argmaxed=true`。
+
+## 激光雷达 3D 检测 Lidar 3-D detection
+
+`bcdl/preproc/lidar_voxelize.h` + `bcdl/tasks/lidar_det3d.h` —— 点云到带朝向的 3D 框,
+形态是「多段编译模型 + 段间 CPU 处理」的流水线。
+
+```cpp
+struct Box3D { float x,y,z, dx,dy,dz, heading; int label; float score; };
+
+bcdl::VoxelConfig vcfg;                                   // KITTI 几何
+bcdl::Pillars p = bcdl::voxelizePillars(points, n, /*stride=*/4, vcfg);
+std::vector<float> x = bcdl::pillarPointFeatures(p.voxels.data(), p.num_points.data(),
+                                                 p.coords.data(), p.num_pillars, vcfg);
+// vfe engine -> 柱特征
+std::vector<float> canvas = bcdl::scatterPillars(feats, p.coords.data(),
+                                                 p.num_pillars, 64, vcfg);
+// backbone+head engine
+bcdl::LidarDetector3d det(head_engine);
+std::vector<bcdl::Box3D> boxes = det.postprocess();
+// 纯函数：generateAnchors3d(cfg) · decodeDet3d(...) · bevIou(a,b) · nms3d(...)
+```
+
+点必须已经在**自车系**;`VoxelConfig` 里的上限是会真的截断的——`Pillars` 会把丢掉的每个点
+和每个列都报出来,而不是默默截断。
+
+`pillarPointFeatures()` 只有**重导成 `(1, C, pillars, points)` 上 1×1 卷积**的那种 VFE 才需要;
+吃三个原始柱张量的 VFE 把同样的展开做在自己图里。把它搬出来值 179 倍:那个形状是
+「巨大柱维 + 4 宽通道维」,图内那版为一个 95 MFLOP 的 MLP 花 290 ms,卷积形态只要 1.62 ms。
+
+anchor 解码放 CPU 是刻意的:官方 head 把它烘进图里用的是 `ScatterND`,那东西**编译不报错、
+产物却从不写输出**。`generateAnchors3d` 与该模型自带的 anchor 常量吻合到 8e-06——
+顺序(类优先再朝向、且在区间上取**闭区间** linspace)是这么定下来的,不是猜的。
+
+## 异常检测 Anomaly detection（单类）
+
+`bcdl/tasks/anomaly.h` —— 只用某产品的**正常**图训练,输出每个 patch「有多不像」。
+模型是按产品的、阈值是产线级决策,所以随库的模型是**示例**而不是通用检测器。
+
+```cpp
+struct AnomalyConfig { int out_width=0, out_height=0; int blur_kernel=33;
+                       float blur_sigma=4.0f, threshold=0.5f; };
+struct AnomalyMap { int width, height; std::vector<float> data; float score; };
+
+bcdl::AnomalyDetector det(engine);
+bcdl::AnomalyMap m = det.detect(bgr, width, height, stride);
+std::vector<uint8_t> mask = bcdl::anomalyMask(m, 0.5f);
+// 纯函数：decodeAnomaly(data, shape, cfg) · anomalyPreprocess(bgr, ..., out)
+```
+
+`score` 取图的**最大值**——零件有多坏取决于最坏那一块,取均值会让大片干净区域盖掉小缺陷。
+上采样到输入分辨率与高斯平滑都属于参考后处理;`blur_kernel = 0` 可省掉平滑
+(288×288 下约 6 ms),但数值会变。
+
+`anomalyPreprocess` 做 BGR→RGB、`/255`、ImageNet mean/std——这套归一化是训练契约的一部分,
+默认值就是那组统计量。
+
+## 光流 Optical flow
+
+`bcdl/tasks/optical_flow.h` —— 两帧转稠密位移场。向量单位是源图像素,+u 向右 / +v 向下(OpenCV 约定)。
+
+```cpp
+struct FlowConfig { float scale_x=1, scale_y=1; bool channels_first=true; };
+struct FlowField { int width, height; std::vector<float> data; /* H*W*2, (u,v) */ };
+
+bcdl::OpticalFlowEstimator est(engine);
+bcdl::FlowField f = est.estimate(bgr0, bgr1, width, height, stride);
+std::vector<uint8_t> vis = bcdl::flowColorize(f);            // BGR H*W*3
+float epe = bcdl::flowEndpointError(f, reference);
+// 纯函数：decodeFlow(data, shape, cfg) · flowPreprocess(bgr, ..., out)
+```
+
+`estimate()` 从 Engine 读模型输入尺寸,缩放两帧,并把返回向量从模型像素换算回源图像素——
+留在模型像素的场会让后续 warp 整体位移量偏掉,而且**看不出哪里不对**。
+
+**预处理保持 BGR 与 0-255**:参考实现的 /255 在图内部。`flowPreprocess` 与 Python 路径绑定到同一份
+C++ 实现,保证两条路喂给模型的像素完全一致。
+
+## 端到端驾驶 End-to-end driving（相机 + 激光雷达 → 轨迹）
+
+`bcdl/tasks/e2e_drive.h` + `bcdl/preproc/drive_inputs.h` —— 三路前视相机 + 一帧激光雷达进去，
+一条规划好的自车轨迹出来（外加检出车辆与 BEV 语义图）。自车系、米、x 向前 / y 向左；
+位姿是**未来**的固定间隔采样。
+
+```cpp
+struct DrivePose  { float x, y, heading; };
+struct DriveAgent { float x, y, heading, length, width, score; };
+struct DriveResult { std::vector<DrivePose> trajectory;
+                     std::vector<DriveAgent> agents; bcdl::SegMask bev; };
+
+bcdl::DrivePlanner planner(engine, anchors, num_modes, num_poses);
+
+std::vector<float> camera = bcdl::stitchDriveCameras(l, lw, lh, ls, f, fw, fh, fs,
+                                                     r, rw, rh, rs);   // (3,H,W) RGB [0,1]
+bcdl::LidarBev bev = bcdl::lidarBevHistogram(points, n, /*stride_floats=*/3);
+
+bcdl::DriveStatus st; st.driving_command = 0; st.velocity_x = 5.0f;
+bcdl::DriveResult res = planner.plan(camera, bev.data, st);
+// 纯函数：decodeDrive(traj, traj_shape, agents, agent_shape, labels, label_shape,
+//                    bev, bev_shape, cfg)
+```
+
+BEV 栅格**第 0 轴是 x（前向）**、第 1 轴是 y —— 与上游直方图同序。
+`LidarBevConfig::use_ground_plane=false`（默认）只出一个通道，装高于 `split_height` 的点。
+
+`DriveResult::bev` 的轴**不是**屏幕轴：行号随**前方距离**增大（row 0 是自车端），
+列号随**向左**增大，按「上=前方」画要把两个轴都反过来。上游两个约定都没写，
+而直路在旋转 180° 下近似对称——**画反了看不出来**。解码原样返回模型输出，不替调用方拿主意。
+
+`DriveAnchorConfig::noise_scale = 0` 只把采样器的随机项清零、保留调度自身的缩放，
+这是与另一个实现做数值对比时该用的配置。`DriveIoConfig` 负责张量下标映射，
+输出下标设成 `-1` 即跳过该头。
+
+输入经 `setInputFromFloat`（`bcdl/backend/input_writer.h`）写入，按模型声明的 dtype 量化——
+这个模型的输入是带 per-tensor scale 的 int16，直接塞 float 原始字节它会**照常跑，只是在跑噪声**。
 
 ## 深度 Depth
 

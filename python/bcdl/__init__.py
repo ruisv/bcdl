@@ -80,19 +80,24 @@ class Engine:
 
     def infer(self, inputs: list[np.ndarray], timeout_ms: int = 0) -> list[np.ndarray]:
         """Run one inference. ``inputs`` are copied into the device buffers in
-        order; returns one numpy array per model output."""
+        order; returns one numpy array per model output, in the output's own
+        dtype (quantized outputs come back as raw integers — see the note above
+        ``decode()`` below).
+
+        Padded outputs are gathered back to a packed layout first. Taking the
+        flat prefix of the device buffer instead is a silent shear: PointPillars'
+        ``[1,64,11546,1]`` head pads each channel by 6 float slots, which
+        displaces channel c by 6c and returns a tensor that still looks like
+        plausible data.
+        """
         for i, arr in enumerate(inputs):
             self._e.set_input(i, np.ascontiguousarray(arr))
         self._e.infer(timeout_ms)
         outs = []
         for i in range(self._e.num_outputs):
-            raw = self._e.output_bytes(i)
             dtype = np.dtype(self._e.output_dtype(i))
             shape = self._e.output_shape(i)
-            n = int(np.prod(shape)) if shape else 0
-            # output_bytes() returns the aligned device buffer; take the valid
-            # prefix. (Stride-padded layouts are handled in the task layer.)
-            flat = np.frombuffer(raw, dtype=dtype, count=n)
+            flat = np.frombuffer(self._e.output_packed(i), dtype=dtype)
             outs.append(flat.reshape(shape))
         return outs
 
@@ -376,6 +381,75 @@ decode_seg = bcdl_py.decode_seg
 decodeSeg = bcdl_py.decode_seg
 seg_colorize = bcdl_py.seg_colorize
 
+# Lidar: pillar encoding and 3-D detection. The pipeline is deliberately several
+# separate pieces (voxelize -> [pillar_point_features ->] VFE engine -> scatter
+# -> backbone engine -> head engine -> decode) rather than one class: on this
+# model the CPU and BPU stages have wildly different costs, and a single call
+# would hide which.
+#
+# Two VFE forms exist and the difference is worth 179x. A VFE that takes
+# (pillars, points, 4) does the feature expansion inside its own graph, and pays
+# for it: that shape is a huge pillar axis against a 4-wide channel axis, the
+# worst case for a convolution engine (290 ms for a 95 MFLOP MLP). A VFE
+# re-exported as a 1x1 convolution over (1, 10, pillars, points) runs the same
+# arithmetic in 1.6 ms and takes `pillar_point_features()` instead. Feed whichever
+# one the model's input shape asks for.
+VoxelConfig = bcdl_py.VoxelConfig
+Pillars = bcdl_py.Pillars
+voxelize_pillars = bcdl_py.voxelize_pillars
+pillar_point_features = bcdl_py.pillar_point_features
+scatter_pillars = bcdl_py.scatter_pillars
+Box3D = bcdl_py.Box3D
+Anchor3dConfig = bcdl_py.Anchor3dConfig
+Det3dConfig = bcdl_py.Det3dConfig
+generate_anchors_3d = bcdl_py.generate_anchors_3d
+decode_det3d = bcdl_py.decode_det3d
+decodeDet3d = bcdl_py.decode_det3d
+bev_iou = bcdl_py.bev_iou
+nms3d = bcdl_py.nms3d
+
+# Industrial anomaly detection. One-class: the model has only ever seen normal
+# parts, so it is per-product and the shipped model is an example rather than a
+# general detector — and the threshold is a per-line decision, not a default.
+AnomalyConfig = bcdl_py.AnomalyConfig
+AnomalyMap = bcdl_py.AnomalyMap
+decode_anomaly = bcdl_py.decode_anomaly
+decodeAnomaly = bcdl_py.decode_anomaly
+anomaly_mask = bcdl_py.anomaly_mask
+anomaly_preprocess = bcdl_py.anomaly_preprocess
+
+# Dense optical flow. Two frames in, one displacement field out — the vectors
+# come back in SOURCE pixels, not the model's, because a field silently scaled
+# to the model's resolution warps everything by the wrong amount without ever
+# looking wrong.
+FlowConfig = bcdl_py.FlowConfig
+FlowField = bcdl_py.FlowField
+decode_flow = bcdl_py.decode_flow
+decodeFlow = bcdl_py.decode_flow
+flow_colorize = bcdl_py.flow_colorize
+flow_endpoint_error = bcdl_py.flow_endpoint_error
+flow_preprocess = bcdl_py.flow_preprocess
+
+# End-to-end driving (camera + lidar -> planned trajectory). The sensor tensors
+# are geometric contracts, so the builders are bound to the same C++ used by the
+# native path rather than reimplemented here in numpy: one definition of what the
+# model is fed, not two that can quietly drift apart.
+LidarBevConfig = bcdl_py.LidarBevConfig
+lidar_bev_histogram = bcdl_py.lidar_bev_histogram
+DriveCameraConfig = bcdl_py.DriveCameraConfig
+stitch_drive_cameras = bcdl_py.stitch_drive_cameras
+DriveConfig = bcdl_py.DriveConfig
+DrivePose = bcdl_py.DrivePose
+DriveAgent = bcdl_py.DriveAgent
+DriveResult = bcdl_py.DriveResult
+DriveStatus = bcdl_py.DriveStatus
+DriveAnchorConfig = bcdl_py.DriveAnchorConfig
+DriveIoConfig = bcdl_py.DriveIoConfig
+drive_status_vector = bcdl_py.drive_status_vector
+drive_anchor_noise = bcdl_py.drive_anchor_noise
+decode_drive = bcdl_py.decode_drive
+decodeDrive = bcdl_py.decode_drive
+
 
 class DepthEstimator:
     """High-level depth head: wraps an Engine + DepthConfig. Preprocessing is the
@@ -444,6 +518,128 @@ class Segmenter:
     def postprocess(self) -> "SegMask":
         """Post-process the Engine's current output (run engine.infer() first)."""
         return self._s.postprocess()
+
+
+class LidarDetector3d:
+    """Anchor decode + BEV NMS for a pillar detector's head.
+
+    Deliberately the LAST stage only. A pillar detector is
+    voxelize_pillars -> VFE engine -> scatter_pillars -> backbone engine -> this,
+    and the stages have very different costs; one all-in-one call would hide
+    which one you are actually paying for."""
+
+    def __init__(self, engine: "Engine", config: "Det3dConfig | None" = None,
+                 cls_index: int = 0, box_index: int = 1, dir_index: int = 2):
+        self.engine = engine
+        self.config = config if config is not None else Det3dConfig()
+        self._d = bcdl_py.LidarDetector3d(engine._e, self.config, cls_index, box_index,
+                                          dir_index)
+
+    def postprocess(self) -> list:
+        """Decode the Engine's current outputs (run engine.infer() first)."""
+        return self._d.postprocess()
+
+    @property
+    def anchors(self) -> np.ndarray:
+        return self._d.anchors
+
+
+class AnomalyDetector:
+    """One-class anomaly detection: one BGR image in, a per-pixel anomaly map out.
+
+    `map.score` is the map's maximum, because a part is as bad as its worst
+    patch — a mean would let one large clean region hide a small defect, which is
+    the case the method exists to catch. The map defaults to the model's input
+    resolution (the head's own grid is coarse)."""
+
+    def __init__(self, engine: "Engine", config: "AnomalyConfig | None" = None,
+                 output_index: int = 0, input_index: int = 0):
+        self.engine = engine
+        self.config = config if config is not None else AnomalyConfig()
+        self._a = bcdl_py.AnomalyDetector(engine._e, self.config, output_index, input_index)
+
+    def detect(self, bgr: np.ndarray, timeout_ms: int = 0) -> "AnomalyMap":
+        """Run one image through preprocess -> BPU -> upsample/smooth."""
+        return self._a.detect(np.ascontiguousarray(bgr), timeout_ms)
+
+    def postprocess(self) -> "AnomalyMap":
+        """Decode the Engine's current output (run engine.infer() first)."""
+        return self._a.postprocess()
+
+    @property
+    def input_size(self) -> tuple:
+        return (self._a.input_width, self._a.input_height)
+
+
+class OpticalFlowEstimator:
+    """Dense optical flow: two BGR frames in, a FlowField out.
+
+    Owns its preprocessing because a flow model is picky about it in a way that
+    fails silently — the reference implementation feeds BGR in 0-255 and divides
+    by 255 inside the graph, so handing it RGB or pre-normalised pixels returns a
+    plausible field rather than an error."""
+
+    def __init__(self, engine: "Engine", config: "FlowConfig | None" = None,
+                 output_index: int = 0, input0_index: int = 0, input1_index: int = 1):
+        self.engine = engine
+        self.config = config if config is not None else FlowConfig()
+        self._f = bcdl_py.OpticalFlowEstimator(engine._e, self.config, output_index,
+                                               input0_index, input1_index)
+
+    def estimate(self, frame0: np.ndarray, frame1: np.ndarray,
+                 timeout_ms: int = 0) -> "FlowField":
+        """Two same-sized (H, W, 3) uint8 BGR frames -> flow in source pixels."""
+        return self._f.estimate(np.ascontiguousarray(frame0),
+                                np.ascontiguousarray(frame1), timeout_ms)
+
+    def postprocess(self) -> "FlowField":
+        """Decode the Engine's current output (run engine.infer() first)."""
+        return self._f.postprocess()
+
+    @property
+    def input_size(self) -> tuple:
+        return (self._f.input_width, self._f.input_height)
+
+
+class DrivePlanner:
+    """End-to-end driving head: camera + lidar + ego status in, one planned
+    trajectory (plus detected vehicles and a BEV semantic map) out.
+
+    Unlike the other task wrappers this one owns the input side too, because the
+    model takes four tensors — including the clustered trajectory anchors the
+    diffusion decoder starts from, which are fixed per model and are therefore
+    built once here rather than by every caller. Build the camera canvas with
+    stitch_drive_cameras() and the lidar grid with lidar_bev_histogram()."""
+
+    def __init__(self, engine: "Engine", anchors: np.ndarray,
+                 config: "DriveConfig | None" = None,
+                 anchor_config: "DriveAnchorConfig | None" = None,
+                 io: "DriveIoConfig | None" = None):
+        self.engine = engine
+        self.config = config if config is not None else DriveConfig()
+        self.anchor_config = anchor_config if anchor_config is not None else DriveAnchorConfig()
+        self.io = io if io is not None else DriveIoConfig()
+        self._p = bcdl_py.DrivePlanner(
+            engine._e, np.ascontiguousarray(anchors, dtype=np.float32),
+            self.config, self.anchor_config, self.io)
+
+    def plan(self, camera: np.ndarray, lidar: np.ndarray, status: "DriveStatus",
+             timeout_ms: int = 0) -> "DriveResult":
+        """Run one planning pass. `camera` is the (3,H,W) RGB canvas in [0,1],
+        `lidar` the (C,H,W) BEV histogram; both are quantized to the model's
+        declared input dtype on the way in."""
+        return self._p.plan(np.ascontiguousarray(camera, dtype=np.float32),
+                            np.ascontiguousarray(lidar, dtype=np.float32),
+                            status, timeout_ms)
+
+    def postprocess(self) -> "DriveResult":
+        """Decode the Engine's current outputs (run engine.infer() first)."""
+        return self._p.postprocess()
+
+    @property
+    def diffusion_input(self) -> np.ndarray:
+        """The normalized, noised anchor tensor fed to the diffusion decoder."""
+        return self._p.diffusion_input
 
 
 # --- face: detection with 5 landmarks + alignment for recognition ----------
@@ -834,15 +1030,14 @@ def _read_packed_output(engine, idx, shape):
     SamSession for the encoder embedding + low-res mask logits (both packed F32
     from the EdgeSAM hbms). Rejects non-float (scaled-int) outputs — those need
     per-tensor dequant via the C++ `outputAsFloat` path, not a raw byte read —
-    and rejects a short buffer. (Assumes no last-dim stride padding, which holds
-    for these hbms; stride-padded outputs would need the C++ reader.)"""
+    and rejects a short buffer."""
     dt = np.dtype(engine.output_dtype(idx))
     if dt.kind != "f":
         raise RuntimeError(
             f"SamSession: output {idx} dtype {dt} is not float; a scaled-int output "
             "needs the C++ dequant path (outputAsFloat), not this packed reader")
     n = int(np.prod(shape))
-    flat = np.frombuffer(engine._e.output_bytes(idx), dt)
+    flat = np.frombuffer(engine._e.output_packed(idx), dt)
     if flat.size < n:
         raise RuntimeError(
             f"SamSession: output {idx} has {flat.size} elems < {n} for shape {shape}")

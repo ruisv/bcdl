@@ -13,6 +13,7 @@ copies of the same numbers is how they drift.
 - [The catalogue](#the-catalogue)
 - [Which build to take](#which-build-to-take)
 - [Getting the models](#getting-the-models)
+- [Reading the lidar check figure](#reading-the-lidar-check-figure)
 - [Licensing](#licensing)
 
 ## The catalogue
@@ -52,6 +53,11 @@ here, see [Getting the models](#getting-the-models)).
 | person ReID | `osnet_ain_qat_nashm_256x128.hbm` | OSNet-AIN | 256×128 | converted |
 | whole-body pose | `vitpose_s_wholebody_nashm_256x192.hbm` | ViTPose-S, 133 kpt | 256×192 | converted |
 | panoptic driving | `yolop_cut_nashm_640x640_nv12.hbm` | YOLOP | 640×640 | converted |
+| end-to-end driving | `diffusiondrive_r34_256x1024_s100p.hbm` | DiffusionDrive (ResNet-34) | 1024×256 cam + 256×256 lidar | zoo (downloaded) |
+| optical flow | `neuflow_v2_int16_nashm_512x384.hbm` | NeuFlow v2 | 512×384 ×2 frames | converted |
+| anomaly detection | `glass_bottle_int8_nashm_288x288.hbm` | GLASS (WideResNet-50) | 288×288 | converted |
+| lidar 3-D detection | `pointpillars_vfe.hbm` + `pointpillars_backbone.hbm` + `pointpillars_head_int16_nashm_248x216.hbm` | PointPillars (KITTI) | 11546 pillars → 496×432 BEV | zoo + converted head |
+| lidar 3-D detection — sample frame | `models/kitti_frame/` (sweep + image + calib + labels) | one KITTI frame, staged from your own copy | — | **not redistributed** (see [Reading the lidar check figure](#reading-the-lidar-check-figure)) |
 | sparse features | `xfeat_nashm_640x480.hbm` | XFeat | 640×480 | converted |
 | super-resolution ×4 | `realesr_general_x4v3_nashm_128.hbm` | Real-ESRGAN Compact | 128×128 tile | converted |
 | super-resolution ×4 | `spanx4_ch48_nashm_128.hbm` | SPAN ch48 | 128×128 tile | converted |
@@ -84,6 +90,71 @@ gap turned out to be calibration domain, not quantisation — recalibrating on
 real Cityscapes frames (instead of a general street-scene stand-in) closes it
 to **96%**. Full detail is in the recipe's README.
 
+**The flow model is int16 because int8 turns into a 2-pixel noise floor that
+no cosine gate reports.** Optical flow can be scored against exact ground truth
+without a dataset — shift an image by a known amount and the correct field is
+that constant everywhere — and doing so on the S100P gives:
+
+| build | static-pair floor | EPE on known 2–16 px shifts | pure BPU | end to end |
+|---|---|---|---|---|
+| float (ONNX) | 0.025 px | 0.036–0.076 px | — | — |
+| int8 | **1.936 px** | 1.61–2.15 px | 14.4 ms | 21.3 ms |
+| int16 | **0.070 px** | 0.055–0.081 px | 19.3 ms | 26.3 ms |
+
+The int8 error is a **flat noise floor**: a 2-pixel shift and a 16-pixel shift
+come back with the same ~1.9 px error, so fast pixels look fine (relative error
+~12%) and slow ones are pure noise. That is invisible to the compiler's output
+cosine, which read **0.9954** for the int8 build — a large-magnitude field
+absorbs 2 px of noise without moving the cosine much. int16 costs 34% latency
+and recovers essentially float accuracy. **When a head regresses a physical
+quantity over a wide dynamic range, score it in that quantity's units, not in
+cosine.**
+
+**The anomaly model is int8, and the reason is the exact opposite of the flow
+model's — which is the point.** Its int8 build compiles to an output cosine of
+just **0.9409**, well under the usual gate, and its score map differs from the
+float model's by 0.024 per pixel on average. Scored on what the task actually
+measures — the official MVTec-AD `bottle` test split, 83 images with pixel ground
+truth — it is indistinguishable from float:
+
+| build | image AUROC | pixel AUROC | output cosine | pure BPU | end to end |
+|---|---|---|---|---|---|
+| float (ONNX) | 0.9905 | 0.9907 | — | — | — |
+| **int8 (shipped)** | **0.9905** | **0.9905** | 0.9409 | 72.5 ms | 81.0 ms |
+| int16 | 0.9897 | 0.9905 | 0.9918 | **6619.9 ms** | 6626 ms |
+
+AUROC is rank-based, so quantisation noise that shifts every score slightly but
+preserves the ordering costs nothing, which is why int8 ships.
+
+> **The int16 latency in that table is UNVERIFIED and probably wrong.** It was
+> measured in a window where the board was also running an unrelated service, and
+> back-to-back repeats of the *same* model in that state differ by up to 46× —
+> the board-timing trap this repo already documents. Re-measure both builds
+> min-of-N on an idle board before quoting any int8-vs-int16 latency ratio here.
+> The AUROC figures are unaffected: they are result gates, not timings.
+
+Taken with the flow row above, the two are a matched pair: **a 0.9954 cosine hid
+a model that was unusable, and a 0.9409 cosine hid nothing at all.** Cosine is
+not a proxy for task quality in either direction.
+
+Latency is dominated by the backbone (72.5 of 81 ms); the decode's Gaussian
+smoothing is another 6.3 ms, which `blur_kernel = 0` removes at the cost of
+matching the reference post-processing.
+
+**The driving model's int16 error shows up as a mode flip, not as drift.**
+Measured against the upstream FP32 model on 120 real nuScenes keyframes fed to
+both sides as bit-identical tensors: trajectory cosine **0.9994**, median
+endpoint deviation **0.47 m** over the 4 s horizon, BEV semantic argmax
+agreement **94.4%**, vehicle detections agreeing on **90.5%** of slots. But 2 of
+the 120 frames deviate by more than 2 m, and the worst (6.2 m) is not a drifted
+version of the same plan — it is a different one of the 20 candidate modes. The
+argmax over those modes happens inside the compiled graph, so quantisation noise
+near a tie changes the whole trajectory rather than nudging it. Budget for that
+tail rather than for the mean. (For scale, open-loop L2 against the realized
+future on those frames is 0.28 m at 1 s and 1.85 m at 3 s — but that is a
+NAVSIM-trained model evaluated on nuScenes, a different sensor rig, so it
+measures cross-domain transfer, not the model's accuracy.)
+
 ## Which build to take
 
 **A model's file name matches the model name inside it, deliberately.** Several
@@ -98,9 +169,68 @@ suffix is which build you have, not noise:
 | `_cut` | YOLOP | The published export bakes the anchor decode into the graph via `ScatterND`. That compiles without a single error into a model whose objectness and class columns are **never written**. Cutting the graph before the decode and emitting the three raw heads is what works. |
 | `_v3` | PIDNet-S | The earlier builds were calibrated on data that had **not** been pre-normalised. When the calibration data is float32, the compiler's `norm_type` does not apply to it, so the input thresholds come out wrong — again with a clean compile. |
 | `_qat` | OSNet-AIN | int8 PTQ does not work on this network at all: it compiles cleanly and returns well-formed unit vectors whose Market-1501 Rank-1 is 51% against the float model's 85%. The shipped build was recovered by QAT self-distillation to 84.6%. |
+| `_s100p` | DiffusionDrive | The first prebuilt published **per board** rather than per march — there is an `_s600` sibling. It is also an all-int16 build straight from upstream, so the usual "prefer int8" reading of a suffix does not apply here. Its companion anchor file is not optional: without `kmeans_navsim_traj_20.npy` the diffusion decoder has nothing to denoise. |
 | `_crop` / `_int16` | Lite Any Stereo V2 | Two calibration modes — centre-crop-fit and resize-fit. Match it to how you letterbox the pair; the repo's stereo test uses a centre-cropped pair and prefers `_crop`. |
 | `_int16` | LingBot-Depth | int8 PTQ does not survive this network. It compiles cleanly and returns a well-formed depth map whose dynamic range has collapsed — 2.9–13.8 m against the float model's 0.97–45.8 m, 233% mean absolute relative error, 0.53 cosine, mask IoU 0.56. The per-layer report says why: LayerNorm and softmax `Mul` nodes come back at 0.006 cosine, and 1056 of 1418 nodes sit below 0.90. A 24-layer ViT-L is the case the all-int16 rule exists for. |
 | the token count | LingBot-Depth | The upstream network has no fixed resolution: a token budget plus the aspect ratio sets the encoder grid. The shipped build uses 1200 tokens, i.e. a 30×40 grid, a 420×560 encoder input, and a decoder pyramid that lands exactly on 480×640 so the final resize is the identity. Larger budgets (up to 3600) buy accuracy at a quadratic cost in attention — the graph is already the slowest model in this catalogue. |
+
+### PointPillars comes in two chains, and one is 46× faster
+
+The published stages are what `fetch_models.sh` gets, and they run at **403.7 ms
+of BPU time** for one sweep. The VFE is 290 ms of that, for a 4→64 MLP of about
+95 MFLOP — roughly 0.3 GFLOPS, which is the tell. It is not compute-bound, it is
+layout-bound: it takes `(11546, 32, 4)`, a huge pillar axis against a 4-wide
+channel axis, the worst shape a convolution engine can be handed.
+
+The same arithmetic re-exported as a **1×1 convolution over `(1, 10, P, 32)`**,
+with the max over points as a pooling window, runs in **1.62 ms** — the per-point
+MLP becomes a channel convolution and the feature expansion moves to the CPU
+(`pillarPointFeatures()`, 1.1 ms). Re-exporting the backbone and head from the
+same checkpoint as one int8 graph takes 113.7 ms to 7.20 ms. Together:
+
+| | published | re-exported |
+|---|---|---|
+| VFE | 290.0 ms | 1.62 ms |
+| backbone + head | 106.2 + 7.5 ms | 7.20 ms (one graph) |
+| **BPU total** | **403.7 ms** | **8.82 ms** |
+| end to end, this repo's chain | 468.8 ms | **43.0 ms** |
+
+**Score the quantization against the chain's OWN float, not against the other
+chain.** The two chains are different weights, so any comparison between them
+mixes "different checkpoint" with "int8 cost" and reads as more favourable than
+it is. Against its own float ONNX on the sample sweep, this chain finds 18 boxes
+where float finds 18, matched centres agree to 0.07 m, scores sit 0.035 low, and
+93% of the anchors float scores above 0.3 survive. The remaining difference from
+the published chain (18 boxes against 16, 13 of them within 1 m) is the
+checkpoint, not the quantization.
+
+Two calibration facts are load-bearing, both measured:
+
+- **Calibrate the head on more than one frame.** The first build used a single
+  sweep and lost 4 of 18 boxes, with scores depressed 0.135 and two headings
+  flipped by π — and *lowering the threshold does not recover them*, because what
+  degrades is the ranking (board/float: 14/18 at 0.30, 24/34 at 0.15). Eight real
+  sweeps take the box head from 0.897 cosine to 0.9745 and the direction head
+  from 0.848 to 0.9584, **at identical latency**.
+- **int8 beats int16 for the convolution VFE** (0.9988 against 0.9567 versus its
+  own float), which is not the usual direction.
+
+What is *not* established either way is KITTI mAP: these are single-sweep
+fidelity numbers, which answer "does the board reproduce the float model" and
+not "how good is this detector".
+
+**These builds are not distributed with this library.** They are re-exported from
+an OpenPCDet checkpoint whose weights are KITTI-trained, and KITTI is
+CC BY-NC-SA — so what ships is the runtime and the conversion recipe, not the
+weights. Compile them yourself and drop them into `models/` as
+`pointpillars_vfe_conv_int8_nashm.hbm` and `pointpillars_bbhead_int8_nashm.hbm`,
+or point `BCDL_LIDAR_VFE` / `BCDL_LIDAR_HEAD` anywhere. Nothing dispatches on the
+file name: a VFE with one input is taken as the convolution form, and a head
+whose input is the scatter canvas is taken to have the backbone fused in.
+
+After this, the chain is dominated by **host-to-device copies, not compute** —
+the 55 MB BEV canvas costs about 12 ms to hand to the fused graph and the 15 MB
+expanded pillar tensor about 5 ms, against 8.8 ms of actual BPU work.
 
 Two more choices in the table are **not** better/worse pairs:
 
@@ -136,7 +266,9 @@ live in the companion
 directory per model at `models/<name>/`. Every **converted** entry above has a
 recipe there: `las2`, `ppocr_v6`, `ppocr_v5`, `osnet`, `yolop`, `pidnet`,
 `superres`, `span`, `xfeat`, `yoloe`, `vitpose`, `yolo26`, `yolo26_sem`, `face`,
-`edgesam`.
+`edgesam`, plus `pointpillars` — the one recipe there whose output is not in the
+table above at all, because its weights cannot be redistributed (see the two
+chains, above).
 The **board** and **zoo** entries are prebuilt downloads, not conversions, so
 their "recipe" is the source URL and they are fetched by `scripts/fetch_models.sh`
 rather than rebuilt.
@@ -144,6 +276,108 @@ rather than rebuilt.
 Each `.hbm` is compiled for a specific BPU **march**, so run the build compiled
 for your board — S100 and S100P share the Nash march, S600 is compiled for its
 own. The BCDL runtime itself is identical across the S-series.
+
+## Reading the lidar check figure
+
+`benchmarks/figures/lidar3d.jpg` is committed, so you can look at it without a
+board. This section explains what it shows and how to regenerate it on your own
+data — it is the fastest way to see whether the detector is behaving.
+
+### What the figure shows
+
+Two views of **one lidar sweep**, plus a scorecard.
+
+**Top — the camera image with the model's 3-D boxes drawn on it.** The boxes are
+not drawn on the image; they are the detector's own 3-D output, projected
+through the frame's calibration (`P2 · R0_rect · Tr_velo_to_cam`). That is what
+makes this the deciding view: a box either wraps the car at the right size and
+facing the right way, or it visibly does not. A top-down footprint can hide a
+box that is half a metre too low or turned 180°; a projected cuboid cannot. Each
+box's **front face is shaded** so its heading is unambiguous.
+
+**Bottom left — the same boxes over the sweep, bird's-eye.** Returns are coloured
+by **height**, stretched over the 2nd–98th percentile of the frame (the ramp on
+the right is labelled with the actual metres). Height colour is what separates a
+box sitting on a car from a box sitting on a wall or a hedge. Rings are 10 m
+apart, the ego vehicle is drawn to scale at the origin, and +x is up.
+
+**Bottom right — the scorecard**, if the frame has labels.
+
+| colour | meaning |
+|---|---|
+| green | a detection that **matched a label** |
+| pink, dashed | a detection that matched nothing — a **false positive** |
+| amber, dashed | a label **nothing found** — a miss |
+| grey | a detection **outside the camera's view**, shown but not scored |
+
+That last row matters and is easy to get wrong. KITTI labels only what the
+camera could see, while the detector is handed the whole 360° sweep — so a car
+detected behind the vehicle has no label and is *not* a mistake. The figure
+shows it in grey and leaves it out of the arithmetic, which is what KITTI's own
+evaluation does.
+
+Matching is by bird's-eye IoU at **KITTI's own thresholds** — 0.7 for cars, 0.5
+for pedestrians and cyclists — so "matched" means what it means in the
+benchmark, not whatever was lenient enough to flatter the figure.
+
+> **One frame is not an evaluation.** The recall and precision printed here
+> describe this sweep only. They are for spotting that something is broken, not
+> for reporting how good the detector is; that needs the KITTI validation split
+> and the official evaluation.
+
+### Regenerating it, on your own frame
+
+The check figure is committed but **no dataset is**. KITTI is CC BY-NC-SA, so
+the four files it needs are copied out of a KITTI checkout you already have:
+
+```bash
+# scripts/local.env  (gitignored)
+BCDL_SRC_KITTI=/path/to/kitti/object/training   # holds velodyne/ image_2/ calib/ label_2/
+BCDL_KITTI_FRAME=000736                         # any frame id you like
+```
+
+then, on the board:
+
+```bash
+scripts/fetch_models.sh                          # stages models/kitti_frame/
+PYTHONPATH=build:python python scripts/board_bench.py --tasks lidar3d
+```
+
+which writes `benchmarks/figures/lidar3d.jpg`. The staged directory is just:
+
+```
+models/kitti_frame/
+  velodyne.bin     the sweep            (required)
+  calib.txt        P2, R0_rect, Tr_velo_to_cam  (required)
+  image_2.png      the left colour camera       (required for the camera view)
+  label_2.txt      ground truth                 (optional — no labels, no scorecard)
+  frame_id.txt     what to print in the title
+```
+
+**Any calibrated sensor rig works**, not only KITTI: write your own four files in
+that layout and the figure follows. The conventions the loader assumes are
+KITTI's, and they are the part to get right — lidar is x-forward / y-left /
+z-up, the label file is in *camera* coordinates with `y` at the **bottom** of the
+box, and the rotation `ry` is about the camera's down-axis. `tests/kitti_frame.py`
+documents each one at the line that depends on it.
+
+**Without any of this it still works.** With no frame staged the figure falls
+back to bird's-eye only, driven by the sample sweep that `fetch_models.sh`
+downloads from the model zoo — no camera view and no scorecard, because an
+uncalibrated point cloud cannot support either.
+
+### If the boxes land in the wrong place
+
+Run the geometry tests first — they separate a calibration mistake from a model
+one, and they are cheap:
+
+```bash
+PYTHONPATH=build:python pytest -s tests/test_kitti_frame.py
+```
+
+They check the projection against a hand-computable synthetic calibration, and
+then check that your labels and the detector agree about where the cars are —
+two independent routes to the same answer, so agreement means both are right.
 
 ## Licensing
 
@@ -178,7 +412,12 @@ answers, not ones nobody looked at.
 | OSNet (torchreid) | MIT **code**. The ReID-useful checkpoints are trained on MSMT17 / Market-1501, which are academic-use-only datasets, and no upstream source says whether that reaches the weights — **unresolved**. The clean route is the ImageNet-pretrained backbone plus your own permissively-licensed ReID data |
 | ViTPose (easy_ViTPose export) | Apache-2.0 **code**, but the whole-body checkpoint is fine-tuned from **MAE, which is CC-BY-NC-4.0**, and trained on COCO-WholeBody (research / non-commercial). Treat the weights as **non-commercial** |
 | XFeat | Apache-2.0 — the weights are committed in the same repo, so they are covered |
+| PointPillars (published stages) | via D-Robotics `rdk_model_zoo` — check its terms. The network is OpenPCDet (Apache-2.0) and the weights are KITTI-trained; KITTI is CC BY-NC-SA, so treat the weights as **non-commercial** |
+| KITTI (the staged check frame) | **CC BY-NC-SA 3.0** — non-commercial, share-alike, attribution. Nothing from it is redistributed here: `fetch_models.sh` copies four files out of *your* KITTI checkout into `models/kitti_frame/`, which is gitignored. The rendered check figure is committed; the data behind it is not |
+| GLASS | MIT, code **and** the released weights. Those weights are trained on **MVTec AD**, which is CC BY-NC-SA 4.0 — so the shipped example model is **non-commercial**. That constraint does not travel to a deployment: this method is retrained on the customer's own normal parts, and what the library ships is the runtime, not the weights |
+| NeuFlow v2 | Apache-2.0, and the checkpoints are committed in the repo, so the licence covers them. Training data is the usual flow stack (FlyingThings / Sintel / KITTI), whose own terms are research-oriented — the same unresolved data chain every optical-flow model carries |
 | SPAN | Apache-2.0 for the project. The checkpoints ship from a separate file host with no terms attached to them, so the grant is by project statement rather than on the artefact |
 | Real-ESRGAN (realesr-general-x4v3) | BSD-3-Clause — the weights are release assets of the same repo, published by the copyright holder |
 | YOLOP | MIT **code**, and unusually the weights are committed in the repo, so MIT covers them. But it is trained on **BDD100K**, whose agreement limits commercial use to member organizations — non-commercial is clear, commercial needs a look |
+| DiffusionDrive | MIT **code** (navsim itself Apache-2.0), but both the compiled model and the trajectory anchors derive from **NAVSIM / OpenScene**, which build on nuPlan — non-commercial terms. Treat the weights and the anchor file as **non-commercial** |
 | PIDNet | MIT **code**, trained on **Cityscapes**, which explicitly permits distributing models trained on it *and* explicitly bars commercial use of any derivative work. So: redistributable, **non-commercial** |

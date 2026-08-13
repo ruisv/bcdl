@@ -97,8 +97,14 @@ outs = engine.infer([x])                     # outs[i] 已 reshape 成 output_sh
 | `input_packed_bytes(i) -> int` | 输入 `i` 作为连续行主序数组的大小。模型对某一维做了补齐时会小于 `input_bytes(i)`。 |
 | `input_stride(i) -> list[int]` | 输入 `i` 解析后的字节 stride，最内层在最后。 |
 | `output_stride(i) -> list[int]` | 输出 `i` 的字节 stride。**输出同样会补齐** —— 把原始缓冲直接摊平 reshape 会把张量剪切错位。 |
+| `output_packed_bytes(i) -> int` | 输出 `i` 作为连续行主序数组的大小。模型对某一维做了补齐时会小于设备缓冲。 |
 | `input_dtype(i) / output_dtype(i) -> str` | NumPy dtype 字符串（如 `"float32"`、`"float16"`、`"int8"`）。 |
 | `infer(inputs, timeout_ms=0) -> list[np.ndarray]` | 把输入拷进设备缓冲、执行、每个输出返回一个数组。`timeout_ms=0` 表示阻塞。 |
+
+> **补齐的输出已经替你收拢过了。** 即使模型对某一维做了补齐，`infer()` 返回的也是
+> 连续行主序数组（ViTPose 的 `[1,133,64,48]` 热图每行 192 字节有效、stride 256）。
+> 直接摊平读设备缓冲会把第 `r` 行错位 `r * pad`，**得到的张量看上去仍然像数据** ——
+> 这曾让一个其实正确的模型被当成量化失败查了一天。
 
 > 高层任务类内部包住一个 `Engine`，直接调用原生后处理（不走每次调用的 NumPy 往返），
 > 所以单个任务优先用它们；只有当你想拿到原始输出张量时才用 `Engine.infer()`。
@@ -389,6 +395,175 @@ mask = bcdl.decode_seg(logits.astype(np.float32), cfg)
 - **`seg_colorize(mask) -> np.ndarray`** —— `(H,W,3)` uint8 固定调色板。
 - **`Segmenter(engine, config=None, output_index=0)`** —— `.segment(model_input, timeout_ms=0)`、
   `.postprocess()`、`.config`。
+
+## 激光雷达 3D 检测 Lidar 3-D detection
+
+点云进,带朝向的 3D 框出(自车系的中心、尺寸、偏航角,单位米)。柱式检测器是一条**流水线**
+而不是一个模型,各段成本差别极大,所以刻意不合并:
+
+```python
+cfg = bcdl.VoxelConfig()                               # 默认就是 KITTI 那套几何
+vox, npts, coords, stats = bcdl.voxelize_pillars(points_xyzi, cfg)
+x = bcdl.pillar_point_features(vox, npts, coords, stats.num_pillars, cfg)
+feats = vfe_engine.infer([x])[0]                       # BPU,出 (1, C, P, 1)
+canvas = bcdl.scatter_pillars(feats.reshape(feats.shape[1], -1).T[:stats.num_pillars],
+                              coords[:stats.num_pillars], stats.num_pillars, cfg)
+head_engine.infer([canvas])                            # BPU(backbone 已并进去)
+boxes = bcdl.LidarDetector3d(head_engine).postprocess()
+```
+
+**点必须已经在自车系** —— 后面没有任何一环能看出你还停在传感器坐标系里。
+**上限是真的会截断的**:`stats` 会报出超出范围被丢的点、因所在柱已满被丢的点、
+以及没有槽位的占据列;这样一帧过密的扫描会**说出来**,而不是悄悄变瞎。
+
+**VFE 有两种形态,差 179 倍**。吃三个原始柱张量的那种把逐点特征展开做在自己图里,
+为一个 95 MFLOP 的 MLP 付 290 ms —— `(pillars, points, 4)` 是「巨大柱维 + 4 宽通道维」,
+正是卷积加速器最不擅长的形状。同一个 MLP 改写成 `(1, 10, P, 32)` 上的 1×1 卷积只要
+1.62 ms,改吃 `pillar_point_features()`。**按模型自己要什么喂**:单输入的 VFE 就是卷积形态;
+同理,输入是 scatter 画布的 head 已经把 backbone 并了进去,不需要再单独跑一段。
+两条链的取法见 `docs/MODELS.md`。
+
+- **`VoxelConfig`** —— `min_x`/`max_x`/`min_y`/`max_y`/`min_z`/`max_z`、
+  `pillar_x`/`pillar_y`、`max_points_per_pillar`、`max_pillars`、`num_features`;
+  只读的 `grid_x`/`grid_y`。
+- **`voxelize_pillars(points, config) -> (voxels, num_points, coords, Pillars)`** ——
+  `points` 是 `(N, >=3)` float32 的 x, y, z[, 强度…]。
+- **`pillar_point_features(voxels, num_points, coords, num_pillars, config) -> np.ndarray`**
+  —— 出 `(1, num_features+6, max_pillars, max_points)`:原始点、相对柱质心的偏移、
+  相对柱几何中心的偏移。**没填满的点位保持为零** —— 它们同样要过 MLP,否则点间取 max
+  会把偏置映射出来的那个值当成一个真点。
+- **`scatter_pillars(features, coords, num_pillars, config) -> np.ndarray`** ——
+  出 `(1, C, grid_y, grid_x)`。
+- **`Box3D`** —— `x`、`y`、`z`、`dx`、`dy`、`dz`、`heading`、`label`、`score`。
+- **`Anchor3dConfig`** —— 栅格 + 每类 `sizes`/`centers` + `rotations`。
+  **`generate_anchors_3d(config)`** 出 `(N, 7)`;它与官方模型图里自带的 anchor 常量
+  **逐位吻合到 8e-06**。
+- **`Det3dConfig`** —— `score_thresh`、`nms_iou`、`max_boxes`、`apply_sigmoid`、`anchors`。
+- **`decode_det3d(cls, box, dir=None, anchors=..., config=...) -> list[Box3D]`**
+  (别名 `decodeDet3d`)。`dir=None` 时每个朝向**只在模 π 意义下正确**。
+- **`bev_iou(a, b)`** · **`nms3d(boxes, iou_thresh, max_boxes)`** ——
+  这一族的 NMS 定义在 **BEV 投影**上,不是体积。
+- **`LidarDetector3d(engine, config=None, cls_index=0, box_index=1, dir_index=2)`** ——
+  `.postprocess()`、`.anchors`。
+
+## 异常检测 Anomaly detection（单类）
+
+回答的是「这个零件像不像那批好的」。没有类别表,也没有缺陷训练集——模型只见过某一个产品的
+**正常**样本,输出的是每个 patch「有多不像」。
+
+两条 API 藏不住的后果:模型是**按产品**的,所以随库的 `.hbm` 是**示例而不是通用检测器**
+(换零件就要重训);阈值是**产线级决策**,按该产品正常波动标定,不是库的常量。
+
+```python
+det = bcdl.AnomalyDetector(engine)
+m = det.detect(bgr)                  # 一张 (H, W, 3) uint8 BGR
+m.score                              # 图像级判定 = 图的最大值
+heat = m.data                        # (H, W) float32,模型输入分辨率
+mask = bcdl.anomaly_mask(m, 0.5)     # (H, W) uint8 0/255
+
+# numpy 路径：
+m = bcdl.decode_anomaly(grid.astype(np.float32), cfg)
+```
+
+图像分数取**最大值**而不是均值:一个零件有多坏,取决于它最坏的那一块;**取均值会让一大片
+干净区域把小缺陷盖掉**——而那恰恰是这套方法存在的理由。
+
+- **`AnomalyConfig`** —— `out_width`/`out_height`(0 ⇒ 保持原始网格;检测类默认设成模型输入尺寸)、
+  `blur_kernel`(奇数,0 关闭)、`blur_sigma`、`threshold`。上采样**和**高斯平滑都是参考实现
+  后处理的一部分,不是装饰。
+- **`AnomalyMap`** —— `width`、`height`、`score`、`data`(`(H,W)` float32)。
+- **`decode_anomaly(output, config=AnomalyConfig()) -> AnomalyMap`**(别名 `decodeAnomaly`)。
+- **`anomaly_mask(map, threshold) -> np.ndarray`** —— `(H,W)` uint8 0/255。
+- **`anomaly_preprocess(bgr, in_w, in_h) -> np.ndarray`** —— resize + BGR→RGB + `/255` +
+  ImageNet mean/std,输出 `(3,H,W)`。
+- **`AnomalyDetector(engine, config=None, output_index=0, input_index=0)`** ——
+  `.detect(bgr, timeout_ms=0)`、`.postprocess()`、`.input_size`。
+
+## 光流 Optical flow
+
+两帧进,逐像素位移场出。向量单位是**源图像素**、+u 向右 +v 向下(OpenCV 约定),
+拆成 x/y 两张图后可直接喂 `cv2.remap`。
+
+```python
+est = bcdl.OpticalFlowEstimator(engine)
+flow = est.estimate(frame0, frame1)     # 两张 (H, W, 3) uint8 BGR
+uv = flow.data                          # (H, W, 2) float32,源图像素
+bgr = bcdl.flow_colorize(flow)          # Middlebury 色轮
+
+# numpy 路径：
+flow = bcdl.decode_flow(out.astype(np.float32), cfg)
+epe = bcdl.flow_endpoint_error(flow_a, flow_b)
+```
+
+预处理特意放在类里面:参考实现喂的是 **BGR、0-255**,除以 255 在**图内部**做——
+给它 RGB 或者先归一化过的像素,**不会报错,只会给你一个看着挺合理的错场**。
+
+- **`FlowConfig`** —— `scale_x`、`scale_y`(模型像素 → 源图像素,`estimate()` 会按传入尺寸自动设)、
+  `channels_first`(`[1,2,H,W]` vs `[1,H,W,2]`)。
+- **`FlowField`** —— `width`、`height`、`data`(`(H,W,2)` float32,uv 交错)。
+- **`decode_flow(output, config=FlowConfig()) -> FlowField`**(别名 `decodeFlow`)。
+- **`flow_colorize(flow, max_magnitude=0.0) -> np.ndarray`** —— `(H,W,3)` uint8 BGR;
+  传 `0` 用该场自身 99 分位幅值归一化,免得一个快速物体把整帧压成灰的。
+- **`flow_endpoint_error(a, b) -> float`** —— 平均端点误差(像素),拿量化版对浮点参考打分就用它。
+- **`flow_preprocess(bgr, in_w, in_h) -> np.ndarray`** —— 单帧转 `(3,H,W)` float,保持 BGR 与 0-255。
+- **`OpticalFlowEstimator(engine, config=None, output_index=0, input0_index=0, input1_index=1)`** ——
+  `.estimate(frame0, frame1, timeout_ms=0)`、`.postprocess()`、`.input_size`。
+
+## 端到端驾驶 End-to-end driving（相机 + 激光雷达 → 轨迹）
+
+本库唯一一个输出「决策」而不是「观测」的头：三路前视相机 + 一帧激光雷达进去，
+一条规划好的自车轨迹出来，外加与它联合训练的感知头。多模态扩散解码器在编译图内部——
+喂进聚类轨迹锚点，出来的已经是选好的那一条。
+
+所有位姿都是自车系、米、x 向前 / y 向左、heading 弧度逆时针，且是**未来**的固定间隔采样
+（现货模型：4 s 内 8 个点）。
+
+```python
+anchors = np.load("kmeans_navsim_traj_20.npy").astype(np.float32)   # (20, 8, 2)
+planner = bcdl.DrivePlanner(engine, anchors)
+
+camera = bcdl.stitch_drive_cameras(cam_left, cam_front, cam_right)  # (3, H, W) RGB [0,1]
+lidar = bcdl.lidar_bev_histogram(points_xyz)                        # (C, H, W)
+
+status = bcdl.DriveStatus()
+status.driving_command = 0          # 路径指令，one-hot 槽位
+status.velocity_x = 5.0             # m/s
+
+r = planner.plan(camera, lidar, status)
+[(p.x, p.y, p.heading) for p in r.trajectory]   # 规划轨迹
+[(a.x, a.y, a.score) for a in r.agents]         # 检出的车辆
+bgr = bcdl.seg_colorize(r.bev)                  # BEV 语义图（SegMask）
+```
+
+两个传感器构造函数是**几何契约**而不是便利封装：BEV 网格转置了、status 顺序错了，
+模型照样推理、照样给你一条看着很顺的轨迹。
+
+- **`lidar_bev_histogram(points, config=LidarBevConfig()) -> np.ndarray`** ——
+  `(N,>=3)` 自车系 xyz → `(C,H,W)` 占据栅格，取值 `[0,1]`。网格**第 0 轴是 x（前向）**，
+  第 1 轴是 y。**`LidarBevConfig`** —— `min_x`/`max_x`/`min_y`/`max_y`、
+  `pixels_per_meter`、`max_height`、`split_height`、`hist_max_per_pixel`、
+  `use_ground_plane`（false ⇒ 单通道，只要高于分界的点）。
+- **`stitch_drive_cameras(left, front, right, config=DriveCameraConfig()) -> np.ndarray`** ——
+  三张 `(H,W,3)` BGR → `(3,out_h,out_w)` RGB float `[0,1]`。**`DriveCameraConfig`** ——
+  `crop_top`、`crop_bottom`、`crop_side`（只作用于左右两路）、`out_width`、`out_height`。
+  缩放发生在拼接**之后**，所以像素会跨接缝插值。
+- **`DriveStatus`** —— `driving_command`（one-hot 槽位）、`velocity_x`、`velocity_y`、
+  `accel_x`、`accel_y`。**`drive_status_vector(status, num_commands=4)`** 负责打包。
+- **`DriveAnchorConfig`** —— 归一化（`x_offset`/`x_span`/`y_offset`/`y_span`）、DDIM 调度
+  （`truncated_timestep`、`num_train_timesteps`、`beta_start`、`beta_end`）、`noise_scale`、
+  `seed`。**`drive_anchor_noise(anchors, config)`** 应用它；`noise_scale=0` 只把随机项清零
+  （便于复现对比），调度自身的缩放仍然保留。
+- **`DriveResult`** —— `trajectory`（`DrivePose` 列表）、`agents`（`DriveAgent`：`x`、`y`、
+  `heading`、`length`、`width`、`score`）、`bev`（就是 `SegMask`，可直接 `seg_colorize`）。
+  **BEV 图的轴不是屏幕轴**：行号随**前方距离**增大（row 0 是自车端），列号随**向左**增大，
+  所以要按「上=前方」画必须 `bev.labels[::-1, ::-1]`。上游两个约定都没写，而直路在旋转 180°
+  下近似对称——**画反了看着完全合理**。
+- **`DriveConfig`** —— `agent_score_thresh`、`bev`（一个 `SegConfig`）。
+- **`DriveIoConfig`** —— 哪个张量是哪个，默认值对齐现货导出；把某个输出下标设成 `-1` 即跳过该头。
+- **`decode_drive(trajectory=None, agent_states=None, agent_labels=None, bev=None, config=DriveConfig()) -> DriveResult`**
+  （别名 `decodeDrive`）—— numpy 路径，任一头都可以传 `None`。
+- **`DrivePlanner(engine, anchors, config=None, anchor_config=None, io=None)`** ——
+  `.plan(camera, lidar, status, timeout_ms=0)`、`.postprocess()`、`.diffusion_input`。
 
 ## 深度 Depth
 

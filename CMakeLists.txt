@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(bcdl LANGUAGES CXX VERSION 0.6.0)
+project(bcdl LANGUAGES CXX VERSION 0.7.0)
 
 # --- Guard: this project only builds on the aarch64 RDK board ----------------
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
@@ -70,9 +70,12 @@ add_library(bcdl SHARED
   src/core/mem_pool.cc
   src/backend/engine.cc
   src/backend/output_reader.cc
+  src/backend/input_writer.cc
   src/preproc/vp_image.cc
   src/preproc/letterbox.cc
   src/preproc/letterbox_cpu.cc
+  src/preproc/drive_inputs.cc
+  src/preproc/lidar_voxelize.cc
   src/media/jpeg_codec.cc
   src/media/video_codec.cc
   src/tasks/detection.cc
@@ -88,6 +91,10 @@ add_library(bcdl SHARED
   src/tasks/segmentation.cc
   src/tasks/embedding.cc
   src/tasks/panoptic_drive.cc
+  src/tasks/e2e_drive.cc
+  src/tasks/optical_flow.cc
+  src/tasks/anomaly.cc
+  src/tasks/lidar_det3d.cc
   src/tasks/face.cc
   src/tasks/wholebody.cc
   src/tasks/features.cc

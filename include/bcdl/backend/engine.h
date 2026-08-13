@@ -89,6 +89,22 @@ class Engine {
   const void* outputData(int i) const { return output_mem_[i].data(); }
   std::size_t outputBytes(int i) const { return output_mem_[i].size(); }
 
+  /// Byte size of output[i] as a PACKED (contiguous, row-major) host array.
+  /// The mirror of inputPackedBytes(); differs from outputBytes(i) whenever the
+  /// model pads a dimension.
+  std::size_t outputPackedBytes(int i) const;
+
+  /// Gather output[i] out of its (possibly padded) device layout into a packed
+  /// row-major host array of exactly outputPackedBytes(i) bytes. The dtype is
+  /// unchanged — this undoes the padding, not the quantisation (outputAsFloat()
+  /// does both).
+  ///
+  /// Reading the device buffer flat instead is the shear that padding causes:
+  /// PointPillars' [1,64,11546,1] head pads each channel by 6 float slots, so a
+  /// flat read displaces channel c by 6c and the last channel by 378 pillars —
+  /// which looks like a plausible-but-wrong tensor, not like an error.
+  void copyOutput(int i, void* dst, std::size_t bytes) const;
+
   /// Element size in bytes for an hbDNN tensor type (HB_DNN_TENSOR_TYPE_*).
   static std::size_t elemSize(int tensor_type);
 

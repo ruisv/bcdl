@@ -12,6 +12,87 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08
+
+Four new task heads — optical flow, industrial anomaly detection, end-to-end
+driving and lidar 3-D detection — a lidar chain that is 46× faster on the BPU,
+an output-side stride fix that had been quietly shearing one model in five, and
+check figures rebuilt around what actually settles a detection.
+
+### Changed
+- **OCR decoding is 2.2× faster — 205 ms to 93 ms** — and nothing about OCR
+  changed. `outputAsFloat()`'s slow path decomposed indices element by element,
+  and the PP-OCRv6 recogniser's `[1,40,18710]` output is row-padded (74880-byte
+  stride against 74840 valid), so it took that path. Copying whole rows instead
+  costs 4 ms where it used to cost 56. Every padded output benefits: whole-body
+  pose heatmaps, segmentation logits, XFeat's three heads, YOLOP's three.
+
+### Fixed
+- **`Engine.infer()` no longer shears a padded output.** Outputs are allocated in
+  the device layout, which pads a dimension on 8 of the models this library
+  ships against — a `[1,133,64,48]` ViTPose heatmap carries a 256-byte row
+  stride against 192 valid bytes. `infer()` took the flat valid prefix of that
+  buffer, which displaces row `r` by `r * pad`; the result still looked like
+  data, so nothing raised. This is the mirror of the input-side stride fix in
+  0.4.0, and the same class of bug: a re-compiled PointPillars stage was scored
+  at cosine 0.70 against its own float reference and written off as a
+  quantization failure, when the artifact was faithful to 0.9988 and the reader
+  was wrong. The high-level task classes were never affected — they decode
+  through the native `outputAsFloat()`, which honored the stride all along.
+
+### Added
+- **Check figures that can be used to judge the model, not just admire it.** The
+  two bird's-eye figures are now drawn as SVG and rasterised with librsvg
+  (`tests/bev_svg.py`) — real typography, vectors and CSS, with only the
+  genuinely raster layers embedded as images. More importantly, the lidar figure
+  changed what it shows: with a calibrated frame staged it projects the model's
+  own 3-D boxes back onto the camera photograph and scores them against the
+  labels — matched, false positive, missed — at KITTI's own BEV IoU thresholds,
+  restricted to the camera frustum because the labels only cover what the camera
+  saw. A top-down footprint cannot show that a box is half a metre too low or
+  turned around; a projected cuboid shows both at a glance. No dataset is
+  redistributed: `scripts/fetch_models.sh` stages four files out of your own
+  KITTI checkout, and without them the figure falls back to bird's-eye only.
+  `docs/MODELS.md` has a walkthrough of what every colour means and how to
+  regenerate the figure on your own sensor rig.
+- **`tests/kitti_frame.py`** — one calibrated frame's sweep, image, calibration
+  and labels, with the projection and the camera↔lidar conventions documented at
+  the lines that depend on them, plus greedy BEV-IoU matching.
+- **`pillarPointFeatures()` (`preproc/lidar_voxelize.h`, Python
+  `pillar_point_features`)**, and with it support for a PointPillars chain that
+  is **45.9× faster on the BPU**. A VFE that takes the three raw pillar tensors
+  expands them into per-point features inside its own graph and spends 290 ms on
+  a 95 MFLOP MLP: `(pillars, points, 4)` is a huge pillar axis against a 4-wide
+  channel axis, the worst shape a convolution engine can be handed. Re-exported
+  as a 1×1 convolution over `(1, 10, P, 32)` with the max over points as a
+  pooling window, the same arithmetic takes 1.62 ms, and this function does the
+  expansion on the CPU in 1.13 ms. Re-exporting the backbone and head as one int8
+  graph takes another 113.7 ms to 7.20 ms. End to end the chain goes from 468.8
+  to 43.0 ms on the sample sweep.
+
+  Quantization is scored against this chain's **own** float, because the
+  published chain is different weights and comparing against it mixes the
+  checkpoint change into the int8 cost: 18 boxes where float finds 18, matched
+  centres within 0.07 m, scores 0.035 low, 93% of the anchors float scores above
+  0.3 surviving. Getting there needed the head calibrated on eight real sweeps
+  rather than one — a single-frame set cost 4 of 18 boxes and two π heading
+  flips, and *lowering the threshold did not recover them* because the ranking
+  itself degrades. These are single-sweep fidelity figures, not KITTI mAP.
+
+  Both chains are supported and neither is selected by file name: a VFE with one
+  input is taken as the convolution form, and a head whose input is the scatter
+  canvas is taken to have the backbone fused in. The faster builds are **not
+  distributed** — they come from a KITTI-trained checkpoint, so what ships is the
+  runtime and the conversion recipe; `docs/MODELS.md` covers both chains.
+
+  What is left is no longer compute: 8.8 ms of BPU work now sits behind ~17 ms of
+  host-to-device copying, most of it the 55 MB BEV canvas.
+- `Engine::outputPackedBytes()` / `Engine::copyOutput()` (C++) and
+  `output_packed_bytes()` / `output_packed()` (Python): read an output as a
+  contiguous row-major array of its declared shape and dtype, with the padding
+  gathered out and the quantization left alone. The symmetric counterparts of
+  `inputPackedBytes()` / `setInput()`.
+
 ## [0.6.0] — 2026-08
 
 ### Added

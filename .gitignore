@@ -19,6 +19,9 @@ third_party/
 *.bin
 *.onnx
 tests/data/
+# The staged check frame is somebody else's data (KITTI is CC BY-NC-SA). The
+# rendered figure is committed; the frame it was rendered from is not.
+models/
 
 # editor
 .vscode/

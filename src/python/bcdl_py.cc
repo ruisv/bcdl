@@ -25,15 +25,19 @@
 #include "bcdl/version.h"
 #include "bcdl/media/jpeg_codec.h"
 #include "bcdl/media/video_codec.h"
+#include "bcdl/preproc/drive_inputs.h"
+#include "bcdl/preproc/lidar_voxelize.h"
 #include "bcdl/preproc/geometry.h"
 #include "bcdl/preproc/vp_image.h"
 #ifdef BCDL_HAVE_GDC
 #include "bcdl/preproc/gdc_letterbox.h"
 #include "bcdl/preproc/gdc_remap.h"
 #endif
+#include "bcdl/tasks/anomaly.h"
 #include "bcdl/tasks/classification.h"
 #include "bcdl/tasks/depth.h"
 #include "bcdl/tasks/depth_refine.h"
+#include "bcdl/tasks/e2e_drive.h"
 #include "bcdl/tasks/embedding.h"
 #include "bcdl/tasks/detection.h"
 #include "bcdl/tasks/face.h"
@@ -41,8 +45,10 @@
 #include "bcdl/tasks/features.h"
 #include "bcdl/tasks/superres.h"
 #include "bcdl/tasks/instance_seg.h"
+#include "bcdl/tasks/lidar_det3d.h"
 #include "bcdl/tasks/mono3d.h"
 #include "bcdl/tasks/obb.h"
+#include "bcdl/tasks/optical_flow.h"
 #include "bcdl/tasks/panoptic_drive.h"
 #include "bcdl/tasks/ocr.h"
 #include "bcdl/tasks/open_vocab.h"
@@ -143,7 +149,12 @@ NB_MODULE(bcdl_py, m) {
            [](bcdl::Engine& e, int i) { return dtypeName(e.outputType(i)); }, "index"_a)
       .def(
           "set_input",
-          [](bcdl::Engine& e, int i, nb::ndarray<nb::c_contig> arr) {
+          // `const void` matters: setInput only READS the array, and demanding a
+          // writable one rejects the most ordinary multi-stage case there is —
+          // feeding one model's output into the next. Engine.infer() builds its
+          // outputs with np.frombuffer, which is read-only, so a two-model
+          // pipeline failed here with a type error that named no cause.
+          [](bcdl::Engine& e, int i, nb::ndarray<nb::ro, nb::c_contig> arr) {
             e.setInput(i, arr.data(), arr.nbytes());
           },
           "index"_a, "array"_a)
@@ -154,7 +165,24 @@ NB_MODULE(bcdl_py, m) {
             return nb::bytes(static_cast<const char*>(e.outputData(i)),
                              e.outputBytes(i));
           },
-          "index"_a);
+          "index"_a,
+          "Output[i]'s device buffer verbatim, padding and all. Reshaping it "
+          "flat shears a padded tensor — use output_packed() unless you are "
+          "walking output_stride() yourself.")
+      .def("output_packed_bytes",
+           [](bcdl::Engine& e, int i) { return e.outputPackedBytes(i); }, "index"_a,
+           "Byte size of output[i] as a contiguous row-major array. Smaller than "
+           "the device buffer whenever the model pads a dimension.")
+      .def(
+          "output_packed",
+          [](bcdl::Engine& e, int i) {
+            std::string buf(e.outputPackedBytes(i), '\0');
+            e.copyOutput(i, buf.data(), buf.size());
+            return nb::bytes(buf.data(), buf.size());
+          },
+          "index"_a,
+          "Output[i] gathered into a contiguous row-major array of its declared "
+          "shape and dtype (padding removed, quantisation left alone).");
 
   // --- preproc geometry: letterbox fit + un-letterbox map --------------------
   nb::class_<bcdl::LetterboxInfo>(m, "LetterboxInfo")
@@ -2262,4 +2290,607 @@ NB_MODULE(bcdl_py, m) {
       .def(nb::init<bcdl::Engine&, bcdl::DbConfig, int>(), "engine"_a,
            "config"_a = bcdl::DbConfig{}, "output_index"_a = 0, nb::keep_alive<1, 2>())
       .def("postprocess", &bcdl::DbTextDetector::postprocess, "letterbox"_a);
+
+  // ===========================================================================
+  // Lidar: pillar encoding + 3-D detection
+  // ===========================================================================
+  nb::class_<bcdl::VoxelConfig>(m, "VoxelConfig")
+      .def(nb::init<>())
+      .def_rw("min_x", &bcdl::VoxelConfig::min_x)
+      .def_rw("max_x", &bcdl::VoxelConfig::max_x)
+      .def_rw("min_y", &bcdl::VoxelConfig::min_y)
+      .def_rw("max_y", &bcdl::VoxelConfig::max_y)
+      .def_rw("min_z", &bcdl::VoxelConfig::min_z)
+      .def_rw("max_z", &bcdl::VoxelConfig::max_z)
+      .def_rw("pillar_x", &bcdl::VoxelConfig::pillar_x)
+      .def_rw("pillar_y", &bcdl::VoxelConfig::pillar_y)
+      .def_rw("max_points_per_pillar", &bcdl::VoxelConfig::max_points_per_pillar)
+      .def_rw("max_pillars", &bcdl::VoxelConfig::max_pillars)
+      .def_rw("num_features", &bcdl::VoxelConfig::num_features)
+      .def_prop_ro("grid_x", &bcdl::VoxelConfig::gridX)
+      .def_prop_ro("grid_y", &bcdl::VoxelConfig::gridY);
+
+  nb::class_<bcdl::Pillars>(m, "Pillars")
+      .def_ro("num_pillars", &bcdl::Pillars::num_pillars)
+      .def_ro("points_used", &bcdl::Pillars::points_used)
+      .def_ro("points_out_of_range", &bcdl::Pillars::points_out_of_range)
+      .def_ro("points_dropped_full", &bcdl::Pillars::points_dropped_full)
+      .def_ro("pillars_dropped", &bcdl::Pillars::pillars_dropped)
+      .def("__repr__", [](const bcdl::Pillars& p) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "Pillars(%d filled, %zu points used, %zu out of range, "
+                      "%zu dropped full, %zu pillars dropped)",
+                      p.num_pillars, p.points_used, p.points_out_of_range,
+                      p.points_dropped_full, p.pillars_dropped);
+        return std::string(buf);
+      });
+
+  m.def(
+      "voxelize_pillars",
+      [](nb::ndarray<const float, nb::c_contig> points, const bcdl::VoxelConfig& cfg) {
+        if (points.ndim() != 2 || points.shape(1) < 3) {
+          throw std::invalid_argument(
+              "voxelize_pillars: expected an (N, >=3) float32 array of x, y, z[, ...]");
+        }
+        bcdl::Pillars p = bcdl::voxelizePillars(points.data(), points.shape(0),
+                                                points.shape(1), cfg);
+        const size_t mp = static_cast<size_t>(cfg.max_pillars);
+        auto voxels = toNumpy(std::move(p.voxels),
+                              {mp, static_cast<size_t>(cfg.max_points_per_pillar),
+                               static_cast<size_t>(cfg.num_features)});
+        auto npts = toNumpy(std::move(p.num_points), {mp});
+        auto coords = toNumpy(std::move(p.coords), {mp, 4});
+        p.voxels.clear();
+        p.num_points.clear();
+        p.coords.clear();
+        return nb::make_tuple(voxels, npts, coords, p);
+      },
+      "points"_a, "config"_a = bcdl::VoxelConfig{},
+      "Encode an ego-frame point cloud into (voxels, num_points, coords, stats). "
+      "The caps are real: `stats` reports what was dropped.");
+
+  m.def(
+      "pillar_point_features",
+      [](nb::ndarray<const float, nb::c_contig> voxels,
+         nb::ndarray<const float, nb::c_contig> num_points,
+         nb::ndarray<const float, nb::c_contig> coords, int num_pillars,
+         const bcdl::VoxelConfig& cfg) {
+        if (voxels.ndim() != 3 || num_points.ndim() != 1 || coords.ndim() != 2 ||
+            coords.shape(1) != 4) {
+          throw std::invalid_argument(
+              "pillar_point_features: voxels (P, N, F), num_points (P,) and "
+              "coords (P, 4) expected");
+        }
+        std::vector<float> feats = bcdl::pillarPointFeatures(
+            voxels.data(), num_points.data(), coords.data(), num_pillars, cfg);
+        return toNumpy(std::move(feats),
+                       {1, static_cast<size_t>(cfg.num_features + 6),
+                        static_cast<size_t>(cfg.max_pillars),
+                        static_cast<size_t>(cfg.max_points_per_pillar)});
+      },
+      "voxels"_a, "num_points"_a, "coords"_a, "num_pillars"_a,
+      "config"_a = bcdl::VoxelConfig{},
+      "Expand pillar points into the (1, F+6, max_pillars, max_points) feature "
+      "image a 1x1-convolution VFE takes: raw point, offset from the pillar's "
+      "centroid, offset from its centre.");
+
+  m.def(
+      "scatter_pillars",
+      [](nb::ndarray<const float, nb::c_contig> features,
+         nb::ndarray<const float, nb::c_contig> coords, int num_pillars,
+         const bcdl::VoxelConfig& cfg) {
+        if (features.ndim() != 2 || coords.ndim() != 2 || coords.shape(1) != 4) {
+          throw std::invalid_argument(
+              "scatter_pillars: features (P, C) and coords (P, 4) expected");
+        }
+        const int channels = static_cast<int>(features.shape(1));
+        std::vector<float> canvas = bcdl::scatterPillars(features.data(), coords.data(),
+                                                         num_pillars, channels, cfg);
+        return toNumpy(std::move(canvas), {1, static_cast<size_t>(channels),
+                                           static_cast<size_t>(cfg.gridY()),
+                                           static_cast<size_t>(cfg.gridX())});
+      },
+      "features"_a, "coords"_a, "num_pillars"_a, "config"_a = bcdl::VoxelConfig{},
+      "Scatter (P, C) pillar features onto the dense (1, C, gridY, gridX) canvas.");
+
+  nb::class_<bcdl::Box3D>(m, "Box3D")
+      .def(nb::init<>())
+      .def_rw("x", &bcdl::Box3D::x)
+      .def_rw("y", &bcdl::Box3D::y)
+      .def_rw("z", &bcdl::Box3D::z)
+      .def_rw("dx", &bcdl::Box3D::dx)
+      .def_rw("dy", &bcdl::Box3D::dy)
+      .def_rw("dz", &bcdl::Box3D::dz)
+      .def_rw("heading", &bcdl::Box3D::heading)
+      .def_rw("label", &bcdl::Box3D::label)
+      .def_rw("score", &bcdl::Box3D::score)
+      .def("__repr__", [](const bcdl::Box3D& b) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "Box3D(cls=%d score=%.2f xyz=(%.2f,%.2f,%.2f) "
+                      "size=(%.2f,%.2f,%.2f) yaw=%+.3f)",
+                      b.label, b.score, b.x, b.y, b.z, b.dx, b.dy, b.dz, b.heading);
+        return std::string(buf);
+      });
+
+  nb::class_<bcdl::Anchor3dConfig>(m, "Anchor3dConfig")
+      .def(nb::init<>())
+      .def_rw("min_x", &bcdl::Anchor3dConfig::min_x)
+      .def_rw("max_x", &bcdl::Anchor3dConfig::max_x)
+      .def_rw("min_y", &bcdl::Anchor3dConfig::min_y)
+      .def_rw("max_y", &bcdl::Anchor3dConfig::max_y)
+      .def_rw("grid_x", &bcdl::Anchor3dConfig::grid_x)
+      .def_rw("grid_y", &bcdl::Anchor3dConfig::grid_y)
+      .def_rw("sizes", &bcdl::Anchor3dConfig::sizes)
+      .def_rw("centers", &bcdl::Anchor3dConfig::centers)
+      .def_rw("rotations", &bcdl::Anchor3dConfig::rotations);
+
+  nb::class_<bcdl::Det3dConfig>(m, "Det3dConfig")
+      .def(nb::init<>())
+      .def_rw("score_thresh", &bcdl::Det3dConfig::score_thresh)
+      .def_rw("nms_iou", &bcdl::Det3dConfig::nms_iou)
+      .def_rw("max_boxes", &bcdl::Det3dConfig::max_boxes)
+      .def_rw("apply_sigmoid", &bcdl::Det3dConfig::apply_sigmoid)
+      .def_rw("anchors", &bcdl::Det3dConfig::anchors);
+
+  m.def(
+      "generate_anchors_3d",
+      [](const bcdl::Anchor3dConfig& cfg) {
+        std::vector<float> a = bcdl::generateAnchors3d(cfg);
+        const size_t rows = a.size() / 7;
+        return toNumpy(std::move(a), {rows, 7});
+      },
+      "config"_a = bcdl::Anchor3dConfig{},
+      "The anchor grid as (N, 7): x, y, z, dx, dy, dz, yaw.");
+
+  m.def(
+      "decode_det3d",
+      [](nb::ndarray<const float, nb::c_contig> cls,
+         nb::ndarray<const float, nb::c_contig> box,
+         std::optional<nb::ndarray<const float, nb::c_contig>> dir,
+         nb::ndarray<const float, nb::c_contig> anchors, const bcdl::Det3dConfig& cfg) {
+        if (cls.ndim() != 4 || box.ndim() != 4) {
+          throw std::invalid_argument("decode_det3d: cls and box must be {1,C,H,W}");
+        }
+        const int h = static_cast<int>(cls.shape(2)), w = static_cast<int>(cls.shape(3));
+        const int num_anchors = static_cast<int>(cfg.anchors.sizes.size() *
+                                                 cfg.anchors.rotations.size());
+        if (num_anchors == 0 || cls.shape(1) % num_anchors != 0) {
+          throw std::invalid_argument(
+              "decode_det3d: class channels are not a multiple of the anchors per cell");
+        }
+        return bcdl::decodeDet3d(cls.data(), box.data(), dir ? dir->data() : nullptr,
+                                 static_cast<int>(cls.shape(1)) / num_anchors, h, w,
+                                 anchors.data(), cfg);
+      },
+      "cls"_a, "box"_a, "dir"_a = nb::none(), "anchors"_a,
+      "config"_a = bcdl::Det3dConfig{},
+      "Decode the three head tensors into Box3D list (anchor decode + BEV NMS).");
+
+  m.def("bev_iou", &bcdl::bevIou, "a"_a, "b"_a,
+        "Rotated IoU of two boxes' BEV footprints.");
+  m.def("nms3d", &bcdl::nms3d, "boxes"_a, "iou_thresh"_a, "max_boxes"_a,
+        "Greedy per-class NMS on BEV IoU.");
+
+  nb::class_<bcdl::LidarDetector3d>(m, "LidarDetector3d")
+      .def(nb::init<bcdl::Engine&, bcdl::Det3dConfig, int, int, int>(), "engine"_a,
+           "config"_a = bcdl::Det3dConfig{}, "cls_index"_a = 0, "box_index"_a = 1,
+           "dir_index"_a = 2, nb::keep_alive<1, 2>())
+      .def("postprocess", &bcdl::LidarDetector3d::postprocess)
+      .def_prop_ro("config", &bcdl::LidarDetector3d::config)
+      .def_prop_ro(
+          "anchors",
+          [](const bcdl::LidarDetector3d& d) {
+            return toNumpy(std::vector<float>(d.anchors()), {d.anchors().size() / 7, 7});
+          },
+          nb::rv_policy::reference);
+
+  // ===========================================================================
+  // Industrial anomaly detection (one-class)
+  // ===========================================================================
+  nb::class_<bcdl::AnomalyConfig>(m, "AnomalyConfig")
+      .def(nb::init<>())
+      .def_rw("out_width", &bcdl::AnomalyConfig::out_width)
+      .def_rw("out_height", &bcdl::AnomalyConfig::out_height)
+      .def_rw("blur_kernel", &bcdl::AnomalyConfig::blur_kernel)
+      .def_rw("blur_sigma", &bcdl::AnomalyConfig::blur_sigma)
+      .def_rw("threshold", &bcdl::AnomalyConfig::threshold);
+
+  nb::class_<bcdl::AnomalyMap>(m, "AnomalyMap")
+      .def(nb::init<>())
+      .def_ro("width", &bcdl::AnomalyMap::width)
+      .def_ro("height", &bcdl::AnomalyMap::height)
+      .def_ro("score", &bcdl::AnomalyMap::score)
+      .def_prop_ro(
+          "data",
+          [](const bcdl::AnomalyMap& a) {
+            return toNumpy(std::vector<float>(a.data),
+                           {static_cast<size_t>(a.height), static_cast<size_t>(a.width)});
+          },
+          // Owned-via-capsule ndarray; override the property default policy.
+          nb::rv_policy::reference,
+          "Per-pixel anomaly score as an (H, W) float32 array.")
+      .def("__repr__", [](const bcdl::AnomalyMap& a) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "AnomalyMap(%dx%d, score=%.4f)", a.width, a.height,
+                      a.score);
+        return std::string(buf);
+      });
+
+  m.def(
+      "decode_anomaly",
+      [](nb::ndarray<const float, nb::c_contig> arr, const bcdl::AnomalyConfig& cfg) {
+        std::vector<int> shape;
+        shape.reserve(arr.ndim());
+        for (size_t d = 0; d < arr.ndim(); ++d) shape.push_back(static_cast<int>(arr.shape(d)));
+        return bcdl::decodeAnomaly(arr.data(), shape, cfg);
+      },
+      "output"_a, "config"_a = bcdl::AnomalyConfig{},
+      "Upsample + smooth a patch score grid into an AnomalyMap (score = its max).");
+
+  m.def(
+      "anomaly_mask",
+      [](const bcdl::AnomalyMap& map, float threshold) {
+        return toNumpy(bcdl::anomalyMask(map, threshold),
+                       {static_cast<size_t>(map.height), static_cast<size_t>(map.width)});
+      },
+      "map"_a, "threshold"_a,
+      "Threshold a map into an (H, W) uint8 0/255 mask.");
+
+  m.def(
+      "anomaly_preprocess",
+      [](nb::ndarray<const uint8_t, nb::c_contig> bgr, int in_w, int in_h) {
+        if (bgr.ndim() != 3 || bgr.shape(2) != 3) {
+          throw std::invalid_argument("anomaly_preprocess: expected an (H, W, 3) uint8 BGR image");
+        }
+        std::vector<float> out;
+        bcdl::anomalyPreprocess(bgr.data(), static_cast<int>(bgr.shape(1)),
+                                static_cast<int>(bgr.shape(0)),
+                                static_cast<int>(bgr.shape(1)) * 3, in_w, in_h, out);
+        return toNumpy(std::move(out), {3, static_cast<size_t>(in_h), static_cast<size_t>(in_w)});
+      },
+      "bgr"_a, "in_w"_a, "in_h"_a,
+      "Resize + BGR->RGB + /255 + ImageNet mean/std into the model's (3,H,W) input.");
+
+  nb::class_<bcdl::AnomalyDetector>(m, "AnomalyDetector")
+      .def(nb::init<bcdl::Engine&, bcdl::AnomalyConfig, int, int>(), "engine"_a,
+           "config"_a = bcdl::AnomalyConfig{}, "output_index"_a = 0, "input_index"_a = 0,
+           nb::keep_alive<1, 2>())
+      .def(
+          "detect",
+          [](bcdl::AnomalyDetector& self, nb::ndarray<const uint8_t, nb::c_contig> bgr,
+             int timeout_ms) {
+            if (bgr.ndim() != 3 || bgr.shape(2) != 3) {
+              throw std::invalid_argument("detect: expected an (H, W, 3) uint8 BGR image");
+            }
+            return self.detect(bgr.data(), static_cast<int>(bgr.shape(1)),
+                               static_cast<int>(bgr.shape(0)),
+                               static_cast<int>(bgr.shape(1)) * 3, timeout_ms);
+          },
+          "bgr"_a, "timeout_ms"_a = 0, "One BGR image in, an AnomalyMap out.")
+      .def("postprocess", &bcdl::AnomalyDetector::postprocess)
+      .def_prop_ro("input_width", &bcdl::AnomalyDetector::inputWidth)
+      .def_prop_ro("input_height", &bcdl::AnomalyDetector::inputHeight)
+      .def_prop_ro("config", &bcdl::AnomalyDetector::config);
+
+  // ===========================================================================
+  // Dense optical flow (two frames -> per-pixel displacement)
+  // ===========================================================================
+  nb::class_<bcdl::FlowConfig>(m, "FlowConfig")
+      .def(nb::init<>())
+      .def_rw("scale_x", &bcdl::FlowConfig::scale_x)
+      .def_rw("scale_y", &bcdl::FlowConfig::scale_y)
+      .def_rw("channels_first", &bcdl::FlowConfig::channels_first);
+
+  nb::class_<bcdl::FlowField>(m, "FlowField")
+      .def(nb::init<>())
+      .def_ro("width", &bcdl::FlowField::width)
+      .def_ro("height", &bcdl::FlowField::height)
+      .def_prop_ro(
+          "data",
+          [](const bcdl::FlowField& f) {
+            return toNumpy(std::vector<float>(f.data),
+                           {static_cast<size_t>(f.height), static_cast<size_t>(f.width), 2});
+          },
+          // Owned-via-capsule ndarray; override the property default policy.
+          nb::rv_policy::reference,
+          "Flow as an (H, W, 2) float32 array of (u, v) pixel displacements.");
+
+  m.def(
+      "decode_flow",
+      [](nb::ndarray<const float, nb::c_contig> arr, const bcdl::FlowConfig& cfg) {
+        std::vector<int> shape;
+        shape.reserve(arr.ndim());
+        for (size_t d = 0; d < arr.ndim(); ++d) shape.push_back(static_cast<int>(arr.shape(d)));
+        return bcdl::decodeFlow(arr.data(), shape, cfg);
+      },
+      "output"_a, "config"_a = bcdl::FlowConfig{},
+      "De-planarize a flow tensor into a FlowField, applying the pixel scale.");
+
+  m.def(
+      "flow_colorize",
+      [](const bcdl::FlowField& f, float max_magnitude) {
+        return toNumpy(bcdl::flowColorize(f, max_magnitude),
+                       {static_cast<size_t>(f.height), static_cast<size_t>(f.width), 3});
+      },
+      "flow"_a, "max_magnitude"_a = 0.0f,
+      "Middlebury colour wheel -> (H, W, 3) uint8 BGR. 0 normalises by the "
+      "field's own 99th-percentile magnitude.");
+
+  m.def("flow_endpoint_error", &bcdl::flowEndpointError, "a"_a, "b"_a,
+        "Mean endpoint error (pixels) between two same-sized fields.");
+
+  m.def(
+      "flow_preprocess",
+      [](nb::ndarray<const uint8_t, nb::c_contig> bgr, int in_w, int in_h) {
+        if (bgr.ndim() != 3 || bgr.shape(2) != 3) {
+          throw std::invalid_argument("flow_preprocess: expected an (H, W, 3) uint8 BGR image");
+        }
+        std::vector<float> out;
+        bcdl::flowPreprocess(bgr.data(), static_cast<int>(bgr.shape(1)),
+                             static_cast<int>(bgr.shape(0)),
+                             static_cast<int>(bgr.shape(1)) * 3, in_w, in_h, out);
+        return toNumpy(std::move(out), {3, static_cast<size_t>(in_h), static_cast<size_t>(in_w)});
+      },
+      "bgr"_a, "in_w"_a, "in_h"_a,
+      "Resize one frame into the model's (3, H, W) float input. Stays BGR and "
+      "0-255 — the graph normalises internally.");
+
+  nb::class_<bcdl::OpticalFlowEstimator>(m, "OpticalFlowEstimator")
+      .def(nb::init<bcdl::Engine&, bcdl::FlowConfig, int, int, int>(), "engine"_a,
+           "config"_a = bcdl::FlowConfig{}, "output_index"_a = 0, "input0_index"_a = 0,
+           "input1_index"_a = 1, nb::keep_alive<1, 2>())
+      .def(
+          "estimate",
+          [](bcdl::OpticalFlowEstimator& self, nb::ndarray<const uint8_t, nb::c_contig> a,
+             nb::ndarray<const uint8_t, nb::c_contig> b, int timeout_ms) {
+            if (a.ndim() != 3 || a.shape(2) != 3 || b.ndim() != 3 || b.shape(2) != 3 ||
+                a.shape(0) != b.shape(0) || a.shape(1) != b.shape(1)) {
+              throw std::invalid_argument(
+                  "estimate: expected two same-sized (H, W, 3) uint8 BGR images");
+            }
+            return self.estimate(a.data(), b.data(), static_cast<int>(a.shape(1)),
+                                 static_cast<int>(a.shape(0)),
+                                 static_cast<int>(a.shape(1)) * 3, timeout_ms);
+          },
+          "frame0"_a, "frame1"_a, "timeout_ms"_a = 0,
+          "Two BGR frames in, a FlowField in SOURCE pixels out.")
+      .def("postprocess", &bcdl::OpticalFlowEstimator::postprocess)
+      .def_prop_ro("input_width", &bcdl::OpticalFlowEstimator::inputWidth)
+      .def_prop_ro("input_height", &bcdl::OpticalFlowEstimator::inputHeight)
+      .def_prop_ro("config", &bcdl::OpticalFlowEstimator::config);
+
+  // ===========================================================================
+  // End-to-end driving: camera + lidar -> planned trajectory
+  // ===========================================================================
+  nb::class_<bcdl::LidarBevConfig>(m, "LidarBevConfig")
+      .def(nb::init<>())
+      .def_rw("min_x", &bcdl::LidarBevConfig::min_x)
+      .def_rw("max_x", &bcdl::LidarBevConfig::max_x)
+      .def_rw("min_y", &bcdl::LidarBevConfig::min_y)
+      .def_rw("max_y", &bcdl::LidarBevConfig::max_y)
+      .def_rw("pixels_per_meter", &bcdl::LidarBevConfig::pixels_per_meter)
+      .def_rw("max_height", &bcdl::LidarBevConfig::max_height)
+      .def_rw("split_height", &bcdl::LidarBevConfig::split_height)
+      .def_rw("hist_max_per_pixel", &bcdl::LidarBevConfig::hist_max_per_pixel)
+      .def_rw("use_ground_plane", &bcdl::LidarBevConfig::use_ground_plane);
+
+  m.def(
+      "lidar_bev_histogram",
+      [](nb::ndarray<const float, nb::c_contig> points, const bcdl::LidarBevConfig& cfg) {
+        if (points.ndim() != 2 || points.shape(1) < 3) {
+          throw std::invalid_argument(
+              "lidar_bev_histogram: expected an (N, >=3) float32 array of x, y, z");
+        }
+        bcdl::LidarBev bev = bcdl::lidarBevHistogram(
+            points.data(), points.shape(0), points.shape(1), cfg);
+        return toNumpy(std::move(bev.data), {static_cast<size_t>(bev.channels),
+                                             static_cast<size_t>(bev.height),
+                                             static_cast<size_t>(bev.width)});
+      },
+      "points"_a, "config"_a = bcdl::LidarBevConfig{},
+      "Rasterize an (N,>=3) ego-frame lidar sweep into the model's (C,H,W) BEV "
+      "occupancy histogram. Axis 0 of the grid is x (forward), axis 1 is y.");
+
+  nb::class_<bcdl::DriveCameraConfig>(m, "DriveCameraConfig")
+      .def(nb::init<>())
+      .def_rw("crop_top", &bcdl::DriveCameraConfig::crop_top)
+      .def_rw("crop_bottom", &bcdl::DriveCameraConfig::crop_bottom)
+      .def_rw("crop_side", &bcdl::DriveCameraConfig::crop_side)
+      .def_rw("out_width", &bcdl::DriveCameraConfig::out_width)
+      .def_rw("out_height", &bcdl::DriveCameraConfig::out_height);
+
+  m.def(
+      "stitch_drive_cameras",
+      [](nb::ndarray<const uint8_t, nb::c_contig> left,
+         nb::ndarray<const uint8_t, nb::c_contig> front,
+         nb::ndarray<const uint8_t, nb::c_contig> right,
+         const bcdl::DriveCameraConfig& cfg) {
+        auto check = [](const nb::ndarray<const uint8_t, nb::c_contig>& a, const char* who) {
+          if (a.ndim() != 3 || a.shape(2) != 3) {
+            throw std::invalid_argument(std::string("stitch_drive_cameras: ") + who +
+                                        " must be an (H, W, 3) uint8 BGR image");
+          }
+        };
+        check(left, "left");
+        check(front, "front");
+        check(right, "right");
+        std::vector<float> out = bcdl::stitchDriveCameras(
+            left.data(), static_cast<int>(left.shape(1)), static_cast<int>(left.shape(0)),
+            static_cast<int>(left.shape(1)) * 3, front.data(),
+            static_cast<int>(front.shape(1)), static_cast<int>(front.shape(0)),
+            static_cast<int>(front.shape(1)) * 3, right.data(),
+            static_cast<int>(right.shape(1)), static_cast<int>(right.shape(0)),
+            static_cast<int>(right.shape(1)) * 3, cfg);
+        return toNumpy(std::move(out), {3, static_cast<size_t>(cfg.out_height),
+                                        static_cast<size_t>(cfg.out_width)});
+      },
+      "left"_a, "front"_a, "right"_a, "config"_a = bcdl::DriveCameraConfig{},
+      "Crop + stitch three BGR cameras into the model's (3, H, W) RGB float "
+      "canvas scaled to [0,1].");
+
+  nb::class_<bcdl::DrivePose>(m, "DrivePose")
+      .def_ro("x", &bcdl::DrivePose::x)
+      .def_ro("y", &bcdl::DrivePose::y)
+      .def_ro("heading", &bcdl::DrivePose::heading)
+      .def("__repr__", [](const bcdl::DrivePose& p) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "DrivePose(x=%.2f, y=%.2f, heading=%.3f)", p.x, p.y,
+                      p.heading);
+        return std::string(buf);
+      });
+
+  nb::class_<bcdl::DriveAgent>(m, "DriveAgent")
+      .def_ro("x", &bcdl::DriveAgent::x)
+      .def_ro("y", &bcdl::DriveAgent::y)
+      .def_ro("heading", &bcdl::DriveAgent::heading)
+      .def_ro("length", &bcdl::DriveAgent::length)
+      .def_ro("width", &bcdl::DriveAgent::width)
+      .def_ro("score", &bcdl::DriveAgent::score)
+      .def("__repr__", [](const bcdl::DriveAgent& a) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "DriveAgent(x=%.2f, y=%.2f, heading=%.3f, l=%.2f, w=%.2f, score=%.2f)",
+                      a.x, a.y, a.heading, a.length, a.width, a.score);
+        return std::string(buf);
+      });
+
+  nb::class_<bcdl::DriveResult>(m, "DriveResult")
+      .def_ro("trajectory", &bcdl::DriveResult::trajectory)
+      .def_ro("agents", &bcdl::DriveResult::agents)
+      .def_ro("bev", &bcdl::DriveResult::bev);
+
+  nb::class_<bcdl::DriveConfig>(m, "DriveConfig")
+      .def(nb::init<>())
+      .def_rw("agent_score_thresh", &bcdl::DriveConfig::agent_score_thresh)
+      .def_rw("bev", &bcdl::DriveConfig::bev);
+
+  nb::class_<bcdl::DriveStatus>(m, "DriveStatus")
+      .def(nb::init<>())
+      .def_rw("driving_command", &bcdl::DriveStatus::driving_command)
+      .def_rw("velocity_x", &bcdl::DriveStatus::velocity_x)
+      .def_rw("velocity_y", &bcdl::DriveStatus::velocity_y)
+      .def_rw("accel_x", &bcdl::DriveStatus::accel_x)
+      .def_rw("accel_y", &bcdl::DriveStatus::accel_y);
+
+  nb::class_<bcdl::DriveAnchorConfig>(m, "DriveAnchorConfig")
+      .def(nb::init<>())
+      .def_rw("x_offset", &bcdl::DriveAnchorConfig::x_offset)
+      .def_rw("x_span", &bcdl::DriveAnchorConfig::x_span)
+      .def_rw("y_offset", &bcdl::DriveAnchorConfig::y_offset)
+      .def_rw("y_span", &bcdl::DriveAnchorConfig::y_span)
+      .def_rw("truncated_timestep", &bcdl::DriveAnchorConfig::truncated_timestep)
+      .def_rw("num_train_timesteps", &bcdl::DriveAnchorConfig::num_train_timesteps)
+      .def_rw("beta_start", &bcdl::DriveAnchorConfig::beta_start)
+      .def_rw("beta_end", &bcdl::DriveAnchorConfig::beta_end)
+      .def_rw("noise_scale", &bcdl::DriveAnchorConfig::noise_scale)
+      .def_rw("seed", &bcdl::DriveAnchorConfig::seed);
+
+  nb::class_<bcdl::DriveIoConfig>(m, "DriveIoConfig")
+      .def(nb::init<>())
+      .def_rw("camera_input", &bcdl::DriveIoConfig::camera_input)
+      .def_rw("lidar_input", &bcdl::DriveIoConfig::lidar_input)
+      .def_rw("status_input", &bcdl::DriveIoConfig::status_input)
+      .def_rw("noise_input", &bcdl::DriveIoConfig::noise_input)
+      .def_rw("trajectory_output", &bcdl::DriveIoConfig::trajectory_output)
+      .def_rw("agent_states_output", &bcdl::DriveIoConfig::agent_states_output)
+      .def_rw("agent_labels_output", &bcdl::DriveIoConfig::agent_labels_output)
+      .def_rw("bev_output", &bcdl::DriveIoConfig::bev_output);
+
+  m.def(
+      "drive_status_vector",
+      [](const bcdl::DriveStatus& status, int num_commands) {
+        return toNumpy(bcdl::driveStatusVector(status, num_commands),
+                       {static_cast<size_t>(num_commands) + 4});
+      },
+      "status"_a, "num_commands"_a = 4,
+      "Pack a DriveStatus into the model's status vector (one-hot command + "
+      "vx, vy, ax, ay).");
+
+  m.def(
+      "drive_anchor_noise",
+      [](nb::ndarray<const float, nb::c_contig> anchors,
+         const bcdl::DriveAnchorConfig& cfg) {
+        if (anchors.ndim() != 3 || anchors.shape(2) != 2) {
+          throw std::invalid_argument(
+              "drive_anchor_noise: expected an (M, P, 2) float32 anchor array");
+        }
+        const size_t m_modes = anchors.shape(0), p_poses = anchors.shape(1);
+        return toNumpy(bcdl::driveAnchorNoise(anchors.data(), static_cast<int>(m_modes),
+                                              static_cast<int>(p_poses), cfg),
+                       {m_modes, p_poses, 2});
+      },
+      "anchors"_a, "config"_a = bcdl::DriveAnchorConfig{},
+      "Normalize (M,P,2) trajectory anchors into the diffusion input space and "
+      "add the truncated DDIM noise. noise_scale=0 makes it deterministic.");
+
+  // decode_drive(): numpy Python path. Pass None for a head the model lacks.
+  m.def(
+      "decode_drive",
+      [](std::optional<nb::ndarray<const float, nb::c_contig>> trajectory,
+         std::optional<nb::ndarray<const float, nb::c_contig>> agent_states,
+         std::optional<nb::ndarray<const float, nb::c_contig>> agent_labels,
+         std::optional<nb::ndarray<const float, nb::c_contig>> bev,
+         const bcdl::DriveConfig& cfg) {
+        auto shape_of = [](const std::optional<nb::ndarray<const float, nb::c_contig>>& a) {
+          std::vector<int> s;
+          if (a) {
+            s.reserve(a->ndim());
+            for (size_t d = 0; d < a->ndim(); ++d) s.push_back(static_cast<int>(a->shape(d)));
+          }
+          return s;
+        };
+        auto data_of = [](const std::optional<nb::ndarray<const float, nb::c_contig>>& a) {
+          return a ? a->data() : nullptr;
+        };
+        return bcdl::decodeDrive(data_of(trajectory), shape_of(trajectory),
+                                 data_of(agent_states), shape_of(agent_states),
+                                 data_of(agent_labels), shape_of(agent_labels),
+                                 data_of(bev), shape_of(bev), cfg);
+      },
+      "trajectory"_a = nb::none(), "agent_states"_a = nb::none(),
+      "agent_labels"_a = nb::none(), "bev"_a = nb::none(),
+      "config"_a = bcdl::DriveConfig{},
+      "Decode the four driving heads into a DriveResult. Any head may be None.");
+
+  nb::class_<bcdl::DrivePlanner>(m, "DrivePlanner")
+      .def(
+          "__init__",
+          [](bcdl::DrivePlanner* self, bcdl::Engine& engine,
+             nb::ndarray<const float, nb::c_contig> anchors, bcdl::DriveConfig cfg,
+             bcdl::DriveAnchorConfig anchor_cfg, bcdl::DriveIoConfig io) {
+            if (anchors.ndim() != 3 || anchors.shape(2) != 2) {
+              throw std::invalid_argument(
+                  "DrivePlanner: anchors must be an (M, P, 2) float32 array");
+            }
+            new (self) bcdl::DrivePlanner(engine, anchors.data(),
+                                          static_cast<int>(anchors.shape(0)),
+                                          static_cast<int>(anchors.shape(1)), cfg,
+                                          anchor_cfg, io);
+          },
+          "engine"_a, "anchors"_a, "config"_a = bcdl::DriveConfig{},
+          "anchor_config"_a = bcdl::DriveAnchorConfig{}, "io"_a = bcdl::DriveIoConfig{},
+          nb::keep_alive<1, 2>())
+      .def(
+          "plan",
+          [](bcdl::DrivePlanner& self, nb::ndarray<const float, nb::c_contig> camera,
+             nb::ndarray<const float, nb::c_contig> lidar, const bcdl::DriveStatus& status,
+             int timeout_ms) {
+            std::vector<float> cam(camera.data(), camera.data() + camera.size());
+            std::vector<float> lid(lidar.data(), lidar.data() + lidar.size());
+            return self.plan(cam, lid, status, timeout_ms);
+          },
+          "camera"_a, "lidar"_a, "status"_a, "timeout_ms"_a = 0,
+          "Write the four inputs (quantizing as the model declares), infer, decode.")
+      .def("postprocess", &bcdl::DrivePlanner::postprocess)
+      .def_prop_ro("config", &bcdl::DrivePlanner::config)
+      .def_prop_ro(
+          "diffusion_input",
+          [](const bcdl::DrivePlanner& self) {
+            return toNumpy(std::vector<float>(self.diffusionInput()),
+                           {self.diffusionInput().size()});
+          },
+          // Owned-via-capsule ndarray; override the property default policy.
+          nb::rv_policy::reference);
 }

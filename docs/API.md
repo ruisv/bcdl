@@ -102,8 +102,15 @@ outs = engine.infer([x])                     # outs[i] reshaped to output_shape(
 | `input_packed_bytes(i) -> int` | Size of input `i` as a contiguous row-major array. Smaller than `input_bytes(i)` when the model pads a dimension. |
 | `input_stride(i) -> list[int]` | Resolved byte strides of input `i`, innermost last. |
 | `output_stride(i) -> list[int]` | Resolved byte strides of output `i`. Outputs pad too — reshaping the raw buffer flat shears the tensor. |
+| `output_packed_bytes(i) -> int` | Size of output `i` as a contiguous row-major array. Smaller than the device buffer when the model pads a dimension. |
 | `input_dtype(i) / output_dtype(i) -> str` | NumPy dtype string (e.g. `"float32"`, `"float16"`, `"int8"`). |
 | `infer(inputs, timeout_ms=0) -> list[np.ndarray]` | Copy inputs into device buffers, run, return one array per output. `timeout_ms=0` blocks. |
+
+> **Padded outputs are gathered for you.** `infer()` returns packed row-major
+> arrays even when the model pads a dimension (ViTPose's `[1,133,64,48]` heatmap
+> has a 256-byte row stride against 192 valid bytes). Reading the device buffer
+> flat instead displaces row `r` by `r * pad` and yields a tensor that still
+> looks like data — it cost a day of debugging a model that was in fact correct.
 
 > The high-level task classes wrap an `Engine` and call into the native
 > post-processor directly (no per-call NumPy round-trip), so prefer them for a
@@ -403,6 +410,206 @@ mask = bcdl.decode_seg(logits.astype(np.float32), cfg)
 - **`seg_colorize(mask) -> np.ndarray`** — `(H,W,3)` uint8 fixed palette.
 - **`Segmenter(engine, config=None, output_index=0)`** — `.segment(model_input, timeout_ms=0)`,
   `.postprocess()`, `.config`.
+
+## Lidar 3-D detection
+
+Point cloud in, oriented 3-D boxes out (centre, extent, yaw in the ego frame,
+metres). A pillar detector is a **pipeline**, not one model, and the pieces stay
+separate because their costs are wildly different:
+
+```python
+cfg = bcdl.VoxelConfig()                               # KITTI geometry by default
+vox, npts, coords, stats = bcdl.voxelize_pillars(points_xyzi, cfg)
+x = bcdl.pillar_point_features(vox, npts, coords, stats.num_pillars, cfg)
+feats = vfe_engine.infer([x])[0]                       # BPU: (1, C, P, 1)
+canvas = bcdl.scatter_pillars(feats.reshape(feats.shape[1], -1).T[:stats.num_pillars],
+                              coords[:stats.num_pillars], stats.num_pillars, cfg)
+head_engine.infer([canvas])                            # BPU (backbone fused in)
+boxes = bcdl.LidarDetector3d(head_engine).postprocess()
+```
+
+**Points must already be in the ego frame** — nothing downstream can tell that a
+cloud is still in sensor coordinates. And **the caps are real**: `stats` reports
+points dropped out of range, points dropped because their pillar was full, and
+occupied columns that had no slot left, so a sweep that overflows the model says
+so instead of quietly going blind.
+
+**Two VFE forms exist and the difference is 179×.** A VFE that takes the three
+raw pillar tensors expands them into per-point features inside its own graph, and
+pays 290 ms for a 95 MFLOP MLP — `(pillars, points, 4)` is a huge pillar axis
+against a 4-wide channel axis, which is the worst shape a convolution engine can
+be given. The same MLP re-exported as a 1×1 convolution over `(1, 10, P, 32)`
+runs in 1.62 ms and takes `pillar_point_features()` instead. Feed whichever the
+model asks for: a one-input VFE is the convolution form. Likewise a head whose
+input is the scatter canvas has the backbone fused into it and needs no separate
+backbone call. See `docs/MODELS.md` for both chains and how to get them.
+
+- **`VoxelConfig`** — `min_x`/`max_x`/`min_y`/`max_y`/`min_z`/`max_z`,
+  `pillar_x`/`pillar_y`, `max_points_per_pillar`, `max_pillars`, `num_features`;
+  read-only `grid_x`/`grid_y`.
+- **`voxelize_pillars(points, config) -> (voxels, num_points, coords, Pillars)`** —
+  `points` is `(N, >=3)` float32 x, y, z[, intensity…].
+- **`pillar_point_features(voxels, num_points, coords, num_pillars, config) -> np.ndarray`**
+  — `(1, num_features+6, max_pillars, max_points)`: the raw point, its offset
+  from the pillar's centroid, its offset from the pillar's centre. Unfilled point
+  slots stay zero — they go through the MLP too, and the max over points would
+  otherwise pick up whatever the bias maps them to.
+- **`scatter_pillars(features, coords, num_pillars, config) -> np.ndarray`** —
+  `(1, C, grid_y, grid_x)`.
+- **`Box3D`** — `x`, `y`, `z`, `dx`, `dy`, `dz`, `heading`, `label`, `score`.
+- **`Anchor3dConfig`** — grid + per-class `sizes`/`centers` + `rotations`.
+  **`generate_anchors_3d(config)`** returns the `(N, 7)` grid; it reproduces the
+  published model's own anchor constants to 8e-06.
+- **`Det3dConfig`** — `score_thresh`, `nms_iou`, `max_boxes`, `apply_sigmoid`,
+  `anchors`.
+- **`decode_det3d(cls, box, dir=None, anchors=..., config=...) -> list[Box3D]`**
+  (alias `decodeDet3d`). Passing `dir=None` leaves every heading correct only
+  modulo pi.
+- **`bev_iou(a, b)`** · **`nms3d(boxes, iou_thresh, max_boxes)`** — the metric
+  this family's NMS is defined on is the BEV footprint, not the volume.
+- **`LidarDetector3d(engine, config=None, cls_index=0, box_index=1, dir_index=2)`** —
+  `.postprocess()`, `.anchors`.
+
+## Anomaly detection (one-class)
+
+"Is this part like the good ones." There is no class list and no training set of
+defects — the model is shown only **normal** examples of one product and reports
+how unlike them each patch looks.
+
+Two consequences the API cannot hide: the model is **per-product**, so the
+shipped `.hbm` is an example rather than a general detector (a new part means
+retraining); and the threshold is a **per-line decision** calibrated against that
+product's normal variation, not a library constant.
+
+```python
+det = bcdl.AnomalyDetector(engine)
+m = det.detect(bgr)                  # one (H, W, 3) uint8 BGR image
+m.score                              # image-level verdict = max of the map
+heat = m.data                        # (H, W) float32, at the model's input size
+mask = bcdl.anomaly_mask(m, 0.5)     # (H, W) uint8 0/255
+
+# numpy path:
+m = bcdl.decode_anomaly(grid.astype(np.float32), cfg)
+```
+
+The image score is the map's **maximum**, not its mean: a part is as anomalous as
+its worst patch, and a mean would let one large clean region hide a small defect
+— the case the method exists to catch.
+
+- **`AnomalyConfig`** — `out_width`/`out_height` (0 ⇒ keep the raw grid; the
+  detector defaults them to the model's input size), `blur_kernel` (odd, 0
+  disables), `blur_sigma`, `threshold`. The upsample **and** the Gaussian smoothing
+  are part of the reference post-processing, not decoration.
+- **`AnomalyMap`** — `width`, `height`, `score`, `data` (`(H,W)` float32).
+- **`decode_anomaly(output, config=AnomalyConfig()) -> AnomalyMap`** (alias
+  `decodeAnomaly`).
+- **`anomaly_mask(map, threshold) -> np.ndarray`** — `(H,W)` uint8 0/255.
+- **`anomaly_preprocess(bgr, in_w, in_h) -> np.ndarray`** — resize + BGR→RGB +
+  `/255` + ImageNet mean/std into `(3,H,W)`.
+- **`AnomalyDetector(engine, config=None, output_index=0, input_index=0)`** —
+  `.detect(bgr, timeout_ms=0)`, `.postprocess()`, `.input_size`.
+
+## Optical flow
+
+Two frames in, a per-pixel displacement field out. Vectors are in **source
+pixels**, +u right, +v down (the OpenCV convention), so the field drops straight
+into `cv2.remap` once split into x/y maps.
+
+```python
+est = bcdl.OpticalFlowEstimator(engine)
+flow = est.estimate(frame0, frame1)     # two (H, W, 3) uint8 BGR frames
+uv = flow.data                          # (H, W, 2) float32, source pixels
+bgr = bcdl.flow_colorize(flow)          # Middlebury colour wheel
+
+# numpy path:
+flow = bcdl.decode_flow(out.astype(np.float32), cfg)
+epe = bcdl.flow_endpoint_error(flow_a, flow_b)
+```
+
+Preprocessing is inside the estimator on purpose: the reference implementation
+feeds **BGR in 0-255** and divides by 255 *inside the graph*, so handing it RGB
+or pre-normalised pixels returns a plausible field rather than an error.
+
+- **`FlowConfig`** — `scale_x`, `scale_y` (model pixels → source pixels;
+  `estimate()` sets them from the sizes it was given), `channels_first`
+  (`[1,2,H,W]` vs `[1,H,W,2]`).
+- **`FlowField`** — `width`, `height`, `data` (`(H,W,2)` float32 interleaved).
+- **`decode_flow(output, config=FlowConfig()) -> FlowField`** (alias `decodeFlow`).
+- **`flow_colorize(flow, max_magnitude=0.0) -> np.ndarray`** — `(H,W,3)` uint8
+  BGR; `0` normalises by the field's own 99th-percentile magnitude so one fast
+  object cannot flatten the rest of the frame.
+- **`flow_endpoint_error(a, b) -> float`** — mean endpoint error in pixels, the
+  metric to use when scoring a build against its float reference.
+- **`flow_preprocess(bgr, in_w, in_h) -> np.ndarray`** — one frame to `(3,H,W)`
+  float, BGR and 0-255 preserved.
+- **`OpticalFlowEstimator(engine, config=None, output_index=0, input0_index=0, input1_index=1)`** —
+  `.estimate(frame0, frame1, timeout_ms=0)`, `.postprocess()`, `.input_size`.
+
+## End-to-end driving (camera + lidar → trajectory)
+
+The only head here that returns a decision rather than an observation: three
+forward cameras plus a lidar sweep in, one planned ego trajectory out, along
+with the perception heads it was trained jointly with. The multi-modal diffusion
+decoder lives inside the compiled graph — clustered trajectory anchors go in, one
+already-selected trajectory comes out.
+
+All poses are ego frame, metres, x forward / y left, heading in radians CCW, and
+are the FUTURE at a fixed interval (8 poses over 4 s for the stock model).
+
+```python
+anchors = np.load("kmeans_navsim_traj_20.npy").astype(np.float32)   # (20, 8, 2)
+planner = bcdl.DrivePlanner(engine, anchors)
+
+camera = bcdl.stitch_drive_cameras(cam_left, cam_front, cam_right)  # (3, H, W) RGB [0,1]
+lidar = bcdl.lidar_bev_histogram(points_xyz)                        # (C, H, W)
+
+status = bcdl.DriveStatus()
+status.driving_command = 0          # route hint, one-hot slot
+status.velocity_x = 5.0             # m/s
+
+r = planner.plan(camera, lidar, status)
+[(p.x, p.y, p.heading) for p in r.trajectory]   # the plan
+[(a.x, a.y, a.score) for a in r.agents]         # detected vehicles
+bgr = bcdl.seg_colorize(r.bev)                  # BEV semantic map (SegMask)
+```
+
+The two sensor builders are geometric contracts, not conveniences: a transposed
+BEV grid or a status vector in the wrong order still infers and still returns a
+smooth-looking plan.
+
+- **`lidar_bev_histogram(points, config=LidarBevConfig()) -> np.ndarray`** —
+  `(N,>=3)` ego-frame xyz → `(C,H,W)` occupancy in `[0,1]`. Grid axis 0 is **x
+  (forward)**, axis 1 is y. **`LidarBevConfig`** — `min_x`/`max_x`/`min_y`/`max_y`,
+  `pixels_per_meter`, `max_height`, `split_height`, `hist_max_per_pixel`,
+  `use_ground_plane` (false ⇒ one channel, points above the split only).
+- **`stitch_drive_cameras(left, front, right, config=DriveCameraConfig()) -> np.ndarray`** —
+  three `(H,W,3)` BGR images → `(3,out_h,out_w)` RGB float in `[0,1]`.
+  **`DriveCameraConfig`** — `crop_top`, `crop_bottom`, `crop_side` (left/right
+  cameras only), `out_width`, `out_height`. The resize happens after
+  concatenation, so pixels interpolate across the seams.
+- **`DriveStatus`** — `driving_command` (one-hot slot), `velocity_x`, `velocity_y`,
+  `accel_x`, `accel_y`. **`drive_status_vector(status, num_commands=4)`** packs it.
+- **`DriveAnchorConfig`** — normalization (`x_offset`/`x_span`/`y_offset`/`y_span`),
+  DDIM schedule (`truncated_timestep`, `num_train_timesteps`, `beta_start`,
+  `beta_end`), `noise_scale`, `seed`. **`drive_anchor_noise(anchors, config)`**
+  applies it; `noise_scale=0` zeroes the random term (reproducible comparisons)
+  while keeping the schedule's scaling.
+- **`DriveResult`** — `trajectory` (list of `DrivePose`), `agents` (list of
+  `DriveAgent`: `x`, `y`, `heading`, `length`, `width`, `score`), `bev` (a
+  `SegMask`, so `seg_colorize` works on it).
+  **The BEV map's axes are not screen axes**: row index increases with FORWARD
+  distance (row 0 is the ego end) and column index increases to the LEFT, so
+  drawing it north-up needs `bev.labels[::-1, ::-1]`. Upstream documents
+  neither, and a straight road is nearly symmetric under a 180° rotation — the
+  wrong orientation looks entirely plausible.
+- **`DriveConfig`** — `agent_score_thresh`, `bev` (a `SegConfig`).
+- **`DriveIoConfig`** — which Engine tensor is which; defaults match the stock
+  export. Set an output index to `-1` to skip that head.
+- **`decode_drive(trajectory=None, agent_states=None, agent_labels=None, bev=None, config=DriveConfig()) -> DriveResult`**
+  (alias `decodeDrive`) — the numpy path; any head may be `None`.
+- **`DrivePlanner(engine, anchors, config=None, anchor_config=None, io=None)`** —
+  `.plan(camera, lidar, status, timeout_ms=0)`, `.postprocess()`,
+  `.diffusion_input`.
 
 ## Depth
 

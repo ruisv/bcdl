@@ -24,6 +24,9 @@ import os
 
 import numpy as np
 
+import bev_svg as bv
+import kitti_frame
+
 # All models live in the repo-local models/ dir (populated by
 # scripts/fetch_models.sh from the board's source locations) — no absolute paths.
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -178,6 +181,87 @@ REID_DET = os.environ.get(
 REID_IMAGE = os.environ.get("BCDL_REID_IMAGE", "bus.jpg")
 
 
+# --- optical flow: a PAIR task, and the only one whose output is a field ------
+# The stereo pair doubles as the flow pair (same two views XFeat matches), so no
+# new asset is needed: horizontal disparity IS the displacement field, which
+# makes a colour-wheel figure that is easy to sanity-check — the whole scene
+# should push one way, with magnitude falling off with distance.
+FLOW_MODEL = os.environ.get(
+    "BCDL_FLOW_MODEL", os.path.join(MODELS, "neuflow_v2_int16_nashm_512x384.hbm"))
+FLOW_LEFT = os.environ.get("BCDL_FLOW_LEFT", STEREO_LEFT)
+FLOW_RIGHT = os.environ.get("BCDL_FLOW_RIGHT", STEREO_RIGHT)
+
+# --- one-class anomaly detection --------------------------------------------
+# The sample part image lives next to the model rather than in data/images/,
+# because it comes from MVTec AD (CC BY-NC-SA) — the model is trained on one
+# product and the figure needs THAT product, so both are staged by
+# fetch_models.sh and neither is committed here.
+ANOMALY_MODEL = os.environ.get(
+    "BCDL_ANOMALY_MODEL", os.path.join(MODELS, "glass_bottle_int8_nashm_288x288.hbm"))
+ANOMALY_IMAGE = os.environ.get(
+    "BCDL_ANOMALY_IMAGE", os.path.join(MODELS, "anomaly_sample_defect.png"))
+ANOMALY_GOOD = os.environ.get(
+    "BCDL_ANOMALY_GOOD", os.path.join(MODELS, "anomaly_sample_good.png"))
+
+# --- end-to-end driving ------------------------------------------------------
+# Four input tensors, not an image, so the sample is an .npz of exactly what the
+# model eats (one real nuScenes keyframe, staged with the model for the same
+# licence reason as above) plus the clustered trajectory anchors.
+DRIVE_MODEL = os.environ.get(
+    "BCDL_DRIVE_MODEL", os.path.join(MODELS, "diffusiondrive_r34_256x1024_s100p.hbm"))
+DRIVE_ANCHORS = os.environ.get(
+    "BCDL_DRIVE_ANCHORS", os.path.join(MODELS, "kmeans_navsim_traj_20.npy"))
+DRIVE_SAMPLE = os.environ.get(
+    "BCDL_DRIVE_SAMPLE", os.path.join(MODELS, "drive_sample_frame.npz"))
+
+
+# --- lidar 3-D detection (PointPillars) --------------------------------------
+# Compiled stages with CPU work between them, so the paths are separate: the
+# sample sweep and the published stages come straight from the model zoo
+# (fetch_models.sh), and the head is compiled separately because the published
+# one bakes its anchor decode in with ScatterND.
+#
+# TWO CHAINS run here, and the difference is 45.9x of BPU time:
+#
+#   published : vfe (3 inputs, expansion in-graph)  290.0 ms
+#               + backbone 106.2 + head 7.5         = 403.7 ms
+#   re-exported: vfe as a 1x1 convolution over
+#               (1,10,P,32)                           1.62 ms
+#               + backbone and head as one graph      7.20 ms  = 8.82 ms
+#
+# The re-exported chain is preferred when it is present, and nothing selects it
+# by file name: the stages are dispatched on the shapes the models declare (a
+# 1-input VFE wants expanded features; a head that takes the scatter canvas has
+# the backbone fused into it). Its weights are not distributed with this library
+# — they are trained on a non-commercial dataset — so the conversion recipe is
+# published instead and the published chain stays the fetchable default.
+def _lidar_stage(env, *names):
+    override = os.environ.get(env)
+    if override:
+        return override
+    for n in names:
+        p = os.path.join(MODELS, n)
+        if os.path.exists(p):
+            return p
+    return os.path.join(MODELS, names[-1])
+
+
+LIDAR_VFE = _lidar_stage("BCDL_LIDAR_VFE",
+                         "pointpillars_vfe_conv_int8_nashm.hbm", "pointpillars_vfe.hbm")
+LIDAR_BACKBONE = os.environ.get("BCDL_LIDAR_BACKBONE",
+                                os.path.join(MODELS, "pointpillars_backbone.hbm"))
+LIDAR_HEAD = _lidar_stage("BCDL_LIDAR_HEAD", "pointpillars_bbhead_int8_nashm.hbm",
+                          "pointpillars_head_int16_nashm_248x216.hbm")
+# A calibrated frame — sweep + camera image + calibration + labels — staged by
+# scripts/fetch_models.sh from your own KITTI copy. The dataset is not
+# redistributable, so this is a path, not a download; see docs/MODELS.md.
+LIDAR_FRAME = os.environ.get("BCDL_LIDAR_FRAME", os.path.join(MODELS, "kitti_frame"))
+LIDAR_VOXELS = os.environ.get("BCDL_LIDAR_VOXELS", os.path.join(MODELS, "lidar_voxels0.npy"))
+LIDAR_NUMPTS = os.environ.get("BCDL_LIDAR_NUMPTS",
+                              os.path.join(MODELS, "lidar_voxel_num_points0.npy"))
+LIDAR_NAMES = ["Car", "Pedestrian", "Cyclist"]
+
+
 def asset(name):
     return find_image(name)
 
@@ -221,6 +305,23 @@ def available(task):
     if task == "features":
         return all(os.path.exists(p) for p in
                    (FEATURES_MODEL, FEATURES_LEFT, FEATURES_RIGHT))
+    if task == "lidar3d":
+        # The backbone is a separate stage only in the published chain; the
+        # re-exported head has it fused in. LidarTask decides that from the
+        # head's declared input shape — this is only a name-based guess, because
+        # it has to answer before anything is loaded.
+        need = [LIDAR_VFE, LIDAR_HEAD, LIDAR_VOXELS, LIDAR_NUMPTS]
+        if "bbhead" not in os.path.basename(LIDAR_HEAD):
+            need.append(LIDAR_BACKBONE)
+        return all(os.path.exists(p) for p in need)
+    if task == "flow":
+        return all(os.path.exists(p) for p in (FLOW_MODEL, FLOW_LEFT, FLOW_RIGHT))
+    if task == "anomaly":
+        # The sample part is as required as the model: this head only means
+        # anything on the product it was trained on.
+        return os.path.exists(ANOMALY_MODEL) and os.path.exists(ANOMALY_IMAGE)
+    if task == "drive":
+        return all(os.path.exists(p) for p in (DRIVE_MODEL, DRIVE_ANCHORS, DRIVE_SAMPLE))
     if task in ("superres", "superres_span"):
         model = SUPERRES_MODEL if task == "superres" else SUPERRES_SPAN_MODEL
         return os.path.exists(model) and os.path.exists(find_image(SUPERRES_IMAGE))
@@ -1295,10 +1396,670 @@ class ReidTask:
         return np.hstack([_pad(vis), _pad(panel)])
 
 
+class FlowTask:
+    """Dense optical flow over a frame pair.
+
+    The pair is the repo's stereo pair, so what comes back is DISPARITY — one
+    consistent direction with magnitude falling off with distance. That makes an
+    easy figure to sanity-check, but do not read its ~90 px mean as typical of
+    consecutive video frames.
+
+    infer() is one forward pass; decode() is the same pass plus preprocessing of
+    BOTH frames and the de-planarize, so the gap between the two numbers is the
+    CPU side — which for this model is small enough that the BPU dominates."""
+
+    key = "flow"
+    names = None
+
+    def __init__(self, bcdl):
+        import cv2
+
+        self.bcdl = bcdl
+        self.model_file = FLOW_MODEL
+        self.image_file = FLOW_LEFT
+        self.a = cv2.imread(FLOW_LEFT, cv2.IMREAD_COLOR)
+        self.b = cv2.imread(FLOW_RIGHT, cv2.IMREAD_COLOR)
+        if self.a is None or self.b is None:
+            raise RuntimeError("cannot read the flow image pair")
+        self.engine = bcdl.Engine(self.model_file)
+        self.est = bcdl.OpticalFlowEstimator(self.engine)
+        self.in_w, self.in_h = self.est.input_size
+        self.x0 = np.ascontiguousarray(bcdl.flow_preprocess(self.a, self.in_w, self.in_h))
+        self.x1 = np.ascontiguousarray(bcdl.flow_preprocess(self.b, self.in_w, self.in_h))
+
+    def feed(self):
+        self.engine._e.set_input(0, self.x0)
+        self.engine._e.set_input(1, self.x1)
+
+    def infer(self):
+        self.engine._e.infer(0)
+
+    def decode(self):
+        return self.est.estimate(self.a, self.b)
+
+    def summarize(self, res):
+        mag = np.linalg.norm(res.data, axis=-1)
+        return "%dx%d field, |flow| mean %.2f px, p95 %.2f px, max %.2f px" % (
+            res.width, res.height, mag.mean(), np.percentile(mag, 95), mag.max())
+
+    def draw(self, res):
+        """Frame, colour wheel and magnitude, stacked — the wheel alone reads as
+        pretty noise unless you can see the frame it came from."""
+        import cv2
+
+        wheel = self.bcdl.flow_colorize(res)
+        mag = np.linalg.norm(res.data, axis=-1)
+        heat = cv2.applyColorMap(
+            np.clip(mag / max(np.percentile(mag, 99), 1e-6) * 255, 0, 255).astype(np.uint8),
+            cv2.COLORMAP_TURBO)
+        frame = cv2.resize(self.a, (res.width, res.height))
+        vis = np.vstack([frame, wheel, heat])
+        # Keep captions short enough to fit the panel width — the label box is
+        # not clipped to the image, it just runs off the edge.
+        put_label(vis, "frame 0 - stereo pair, so this is disparity", 8, 22,
+                  (60, 60, 60))
+        put_label(vis, "flow (Middlebury wheel: hue=direction, sat=magnitude)",
+                  8, res.height + 22, (60, 60, 60))
+        put_label(vis, "|flow| mean %.2f px, max %.2f px" % (mag.mean(), mag.max()),
+                  8, 2 * res.height + 22, (60, 60, 60))
+        return vis
+
+
+class AnomalyTask:
+    """One-class anomaly detection on the product the model was trained on.
+
+    Runs BOTH a defective and a normal sample when the pair is staged, because
+    the number that matters is not the defect's score but the GAP between the
+    two — a model that scores everything high is useless and looks fine on a
+    single defective part."""
+
+    key = "anomaly"
+    names = None
+
+    def __init__(self, bcdl):
+        import cv2
+
+        self.bcdl = bcdl
+        self.model_file = ANOMALY_MODEL
+        self.image_file = ANOMALY_IMAGE
+        self.img = cv2.imread(ANOMALY_IMAGE, cv2.IMREAD_COLOR)
+        if self.img is None:
+            raise RuntimeError(f"cannot read the anomaly sample {ANOMALY_IMAGE}")
+        self.good = cv2.imread(ANOMALY_GOOD, cv2.IMREAD_COLOR) if os.path.exists(ANOMALY_GOOD) else None
+        self.engine = bcdl.Engine(self.model_file)
+        self.det = bcdl.AnomalyDetector(self.engine)
+        self.in_w, self.in_h = self.det.input_size
+        self.x = np.ascontiguousarray(bcdl.anomaly_preprocess(self.img, self.in_w, self.in_h))
+
+    def feed(self):
+        self.engine._e.set_input(0, self.x)
+
+    def infer(self):
+        self.engine._e.infer(0)
+
+    def decode(self):
+        bad = self.det.detect(self.img)
+        good = self.det.detect(self.good) if self.good is not None else None
+        return bad, good
+
+    def summarize(self, res):
+        bad, good = res
+        s = "defect score %.3f" % bad.score
+        if good is not None:
+            s += ", normal %.3f (gap %.3f)" % (good.score, bad.score - good.score)
+        return s
+
+    def draw(self, res):
+        import cv2
+
+        bad, good = res
+        panels = []
+        for img, m, tag in ((self.img, bad, "defective"),
+                            (self.good, good, "normal")):
+            if m is None:
+                continue
+            base = cv2.resize(img, (m.width, m.height))
+            heat = cv2.applyColorMap((np.clip(m.data, 0, 1) * 255).astype(np.uint8),
+                                     cv2.COLORMAP_JET)
+            over = cv2.addWeighted(base, 0.55, heat, 0.45, 0)
+            mask = self.bcdl.anomaly_mask(m, self.det.config.threshold)
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(over, cnts, -1, (255, 255, 255), 1)
+            put_label(over, "%s  score %.3f" % (tag, m.score), 6, 20,
+                      (0, 0, 170) if tag == "defective" else (0, 130, 0))
+            panels.append(np.vstack([base, over]))
+        return np.hstack(panels) if panels else self.img
+
+
+class DriveTask:
+    """End-to-end driving: camera + lidar + ego status -> a planned trajectory.
+
+    The sample is a stored .npz of the four input tensors from one real frame,
+    because the inputs are a sensor rig, not an image — reconstructing them from
+    a photo would produce a confident trajectory for a scene the model never
+    saw."""
+
+    key = "drive"
+    names = None
+    BEV_COLORS = [(40, 40, 40), (90, 90, 90), (150, 120, 60), (60, 200, 200),
+                  (200, 200, 60), (60, 60, 220), (220, 60, 220)]
+
+    def __init__(self, bcdl):
+        self.bcdl = bcdl
+        self.model_file = DRIVE_MODEL
+        self.image_file = DRIVE_SAMPLE
+        d = np.load(DRIVE_SAMPLE)
+        # Accept the tensors with or without a leading batch axis: the planner
+        # only counts elements, but drawing needs to know which axis is channels.
+        cam, lid = d["camera"], d["lidar"]
+        self.camera = np.ascontiguousarray((cam[0] if cam.ndim == 4 else cam).astype(np.float32))
+        self.lidar = np.ascontiguousarray((lid[0] if lid.ndim == 4 else lid).astype(np.float32))
+        self.velocity = d["velocity"].astype(np.float32)
+        self.gt = d["gt"].astype(np.float32) if "gt" in d else None
+
+        self.engine = bcdl.Engine(self.model_file)
+        acfg = bcdl.DriveAnchorConfig()
+        acfg.noise_scale = 0.0            # deterministic, so the figure is stable
+        self.planner = bcdl.DrivePlanner(
+            self.engine, np.load(DRIVE_ANCHORS).astype(np.float32), anchor_config=acfg)
+        self.in_h, self.in_w = self.camera.shape[-2], self.camera.shape[-1]
+        self.status = bcdl.DriveStatus()
+        self.status.velocity_x = float(self.velocity[0])
+        self.status.velocity_y = float(self.velocity[1])
+
+    def feed(self):
+        self.planner.plan(self.camera, self.lidar, self.status)
+
+    def infer(self):
+        self.engine._e.infer(0)
+
+    def decode(self):
+        return self.planner.plan(self.camera, self.lidar, self.status)
+
+    def summarize(self, res):
+        p = np.array([[q.x, q.y] for q in res.trajectory])
+        s = "%d poses, %.1f m ahead, %d vehicle(s)" % (
+            len(res.trajectory), np.linalg.norm(np.diff(p, axis=0), axis=1).sum(),
+            len(res.agents))
+        if self.gt is not None:
+            s += ", %.2f m from the realized future" % np.linalg.norm(
+                p - self.gt[:, :2], axis=1).mean()
+        return s
+
+    def draw(self, res):
+        """One fixed-size dashboard frame — also the unit the sequence video is
+        made of, so the check image is literally one frame of it."""
+        return draw_drive_frame(self.camera, self.lidar, res, self.velocity, self.gt)
+
+
+
+# --- driving dashboard ------------------------------------------------------
+# Kept as a free function rather than a method so the sequence video and the
+# single check image are rendered by the SAME code: a check image that is not a
+# frame of what you actually ship is a check of something else.
+#
+# The canvas is FIXED at 1024x768 — a hardware encoder wants a constant size
+# (width %32, height %8), and a figure that resizes itself per frame also makes
+# consecutive frames incomparable by eye.
+DRIVE_BEV_CLASSES = ["background", "road", "walkway", "centreline",
+                     "static", "vehicle", "pedestrian"]
+# Drivable surface stays neutral so the overlays own the saturated colours; the
+# three thin classes (centreline, vehicle, pedestrian) are the ones that have to
+# survive being one pixel wide at this scale. Hex, because these go into a
+# stylesheet — bev_svg.bgr() converts for the numpy raster layers.
+DRIVE_BEV_COLORS = ["#12151a", "#3d434d", "#4a5566", "#e0d24a",
+                    "#6b7280", "#e2574c", "#d968c4"]
+DRIVE_FWD_M = 36.0       # forward window
+DRIVE_BACK_M = 4.0       # ... plus a little behind, so the ego box is not clipped
+DRIVE_LAT_M = 16.0       # +/- lateral window
+DRIVE_PPM = 12.8         # px per metre (isotropic)
+DRIVE_PANEL_W = int(2 * DRIVE_LAT_M * DRIVE_PPM)                  # 410
+DRIVE_PANEL_H = int((DRIVE_FWD_M + DRIVE_BACK_M) * DRIVE_PPM)     # 512
+DRIVE_FRAME_W, DRIVE_FRAME_H = 1024, 768
+
+
+def _drive_window(grid, src_ppm, x0_row, y0_col, fill=0):
+    """Crop a metric BEV array to the drawing window and orient it north-up.
+
+    `grid` is indexed [x_bin, y_bin] with both indices INCREASING (forward,
+    left) — the convention both the semantic map and the lidar histogram use.
+    `x0_row`/`y0_col` are the array indices of x=0 and y=0; the window starts
+    DRIVE_BACK_M behind that."""
+    import cv2
+
+    rows = int((DRIVE_FWD_M + DRIVE_BACK_M) * src_ppm)
+    half = int(DRIVE_LAT_M * src_ppm)
+    out = np.full((rows, 2 * half), fill, grid.dtype)
+    x0_row = int(x0_row - DRIVE_BACK_M * src_ppm)
+    pad = max(0, -x0_row)                     # window may start before the array
+    x0_row = max(0, x0_row)
+    r1 = min(grid.shape[0], x0_row + rows - pad)
+    c0, c1 = max(0, y0_col - half), min(grid.shape[1], y0_col + half)
+    out[pad:pad + (r1 - x0_row), (c0 - (y0_col - half)):(c1 - (y0_col - half))] = grid[x0_row:r1, c0:c1]
+    # Flip both axes: forward must go UP the image and +y (left) must go LEFT.
+    return out[::-1, ::-1]
+
+
+def _drive_view():
+    """The window both BEV panels use. Same class as the lidar detector's view,
+    so "metres" means the same thing in every figure this file draws."""
+    return bv.BevView(fwd_m=DRIVE_FWD_M, back_m=DRIVE_BACK_M, lat_m=DRIVE_LAT_M,
+                      ppm=DRIVE_PPM)
+
+
+def draw_drive_frame(camera, lidar, res, velocity, gt=None, tag=""):
+    """1024x768: the camera strip the model is fed, the BEV map it produced, the
+    lidar it was given, and the numbers — one frame of the check video.
+
+    The two BEV panels share a window, a scale and a grid on purpose: the lidar
+    is the model's other input, so putting it beside the map it produced is what
+    makes the frame self-checking rather than decorative. Anything drawn in
+    metres goes through the same `BevView` as the lidar detector's figure, so the
+    two cannot drift apart.
+    """
+    import cv2
+
+    view = _drive_view()
+    pad = 12
+    cam_h = DRIVE_FRAME_H - view.h - 3 * pad
+    doc = bv.SVG(DRIVE_FRAME_W, DRIVE_FRAME_H)
+
+    # --- camera strip --------------------------------------------------------
+    cam = np.ascontiguousarray((camera.transpose(1, 2, 0)[..., ::-1] * 255).astype(np.uint8))
+    cam = cv2.resize(cam, (DRIVE_FRAME_W - 2 * pad, cam_h))
+    cam_rgba = np.dstack([cam[..., ::-1], np.full(cam.shape[:2], 255, np.uint8)])
+    doc.add('<clipPath id="camclip"><rect x="%d" y="%d" width="%d" height="%d" rx="8"/>'
+            '</clipPath>' % (pad, pad, cam.shape[1], cam_h))
+    doc.add('<g clip-path="url(#camclip)">')
+    doc.raster(cam_rgba, pad, pad, cam.shape[1], cam_h)
+    # The strip is three cameras concatenated; an unmarked seam looks like a lens
+    # artefact. The thirds are equal by construction upstream.
+    for k in (1, 2):
+        x = pad + cam.shape[1] * k / 3.0
+        doc.line(x, pad, x, pad + cam_h, "", 'stroke="%s" stroke-opacity=".55"' % bv.BG)
+    doc.add('</g>')
+    bv.panel_title(doc, pad, pad, cam.shape[1], "camera — three views, stitched",
+                   tag or None)
+
+    # --- the two BEV panels --------------------------------------------------
+    lab = _drive_window(res.bev.labels, 4.0, 0, res.bev.width // 2)
+    occ = _drive_window(lidar[0], 4.0, lidar.shape[1] // 2, lidar.shape[2] // 2)
+    sx, sy = pad, cam_h + 2 * pad
+    lx = sx + view.w + pad
+
+    for i, (x0, title) in enumerate(((sx, "BEV semantic + plan"),
+                                     (lx, "lidar BEV — model input"))):
+        bv.panel_bg(doc, x0, sy, view.w, view.h)
+        doc.add('<clipPath id="bev%d"><rect x="%d" y="%d" width="%d" height="%d" rx="8"/>'
+                '</clipPath>' % (i, x0, sy, view.w, view.h))
+        doc.add('<g clip-path="url(#bev%d)">' % i)
+        if i == 0:
+            doc.raster(bv.labels_rgba(lab, DRIVE_BEV_COLORS), x0, sy, view.w, view.h,
+                       pixelated=True)
+        else:
+            # Occupancy is drawn in a neutral: it means "the sensor says
+            # something is here", and an accent would make it argue with the
+            # overlays it sits next to.
+            doc.raster(bv.tint_rgba(np.clip(occ, 0, 1), bv.NEUTRAL), x0, sy,
+                       view.w, view.h, pixelated=True)
+        bv.polar_grid(doc, view, x0, sy, (10, 20, 30), spokes=False)
+        # Both inputs stop at 32 m; a plan drawn past that line is extrapolation.
+        y32 = sy + view.px(32.0, 0.0)[1]
+        doc.line(x0, y32, x0 + view.w, y32, "grid2")
+        doc.text(x0 + view.w - 10, y32 - 6, "input horizon", "sm", anchor="end")
+        if i == 0:
+            for a_ in res.agents:
+                bv.box(doc, view, x0, sy, a_.x, a_.y, a_.heading, a_.length, a_.width,
+                       bv.NEUTRAL, sw=1.2)
+            bv.ribbon(doc, view, x0, sy,
+                      [(0.0, 0.0)] + [(q.x, q.y) for q in res.trajectory], bv.ACCENT)
+            if gt is not None:
+                # AFTER the plan: the two coincide when the model is right, and
+                # whichever goes down first is the one that disappears.
+                bv.dashed(doc, view, x0, sy,
+                          [(0.0, 0.0)] + [(float(q[0]), float(q[1])) for q in gt], bv.AMBER)
+        bv.ego(doc, view, x0, sy)
+        doc.add('</g>')
+        bv.panel_title(doc, x0, sy, view.w, title)
+
+    # --- readout -------------------------------------------------------------
+    p = np.array([[q.x, q.y] for q in res.trajectory])
+    plan_m = float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+    facts = [("speed", None, "%.1f m/s" % float(np.hypot(*velocity[:2]))),
+             ("plan, 4 s", bv.ACCENT, "%.0f m" % plan_m),
+             ("agents", bv.NEUTRAL, "%d" % len(res.agents))]
+    if gt is not None:
+        facts.append(("mean error", bv.AMBER,
+                      "%.2f m" % float(np.linalg.norm(p - gt[:, :2], axis=1).mean())))
+    legend = [("plan", bv.ACCENT, None)]
+    if gt is not None:
+        legend.append(("realized", bv.AMBER, None))
+    legend += [("agent", bv.NEUTRAL, None), ("ego", bv.CYAN, None), (None,),
+               ("lidar return", bv.NEUTRAL, None), (None,)]
+    legend += [(DRIVE_BEV_CLASSES[i], DRIVE_BEV_COLORS[i], None) for i in range(1, 7)]
+
+    ix = lx + view.w + pad
+    iw = DRIVE_FRAME_W - ix - pad
+    top_h = 33 + 20 + 21 * len(facts)
+    y = bv.card(doc, ix, sy, iw, top_h, "frame")
+    bv.rows(doc, ix, y, iw, facts)
+    y = bv.card(doc, ix, sy + top_h + pad, iw, view.h - top_h - pad, "legend")
+    bv.rows(doc, ix, y, iw, legend)
+    return doc.render()
+
+
+class LidarTask:
+    """PointPillars: a sweep in, 3-D boxes out, through compiled stages.
+
+    infer() times the BPU stages only; decode() is the whole chain including the
+    CPU voxelize/scatter/decode, which is why the two numbers differ by more here
+    than anywhere else in this suite.
+
+    Handles both VFE forms and both head forms, dispatched on what the models
+    declare rather than on their file names — see the note at LIDAR_VFE."""
+
+    key = "lidar3d"
+    names = LIDAR_NAMES
+
+    def __init__(self, bcdl):
+        self.bcdl = bcdl
+        self.model_file = LIDAR_VFE
+        # A calibrated frame if one is staged, else the published sample. The
+        # published one is a bare point cloud — no image, no calibration, no
+        # labels — so it can only support the bird's-eye half of the figure.
+        self.frame = None
+        if kitti_frame.KittiFrame.available(LIDAR_FRAME):
+            self.frame = kitti_frame.KittiFrame(LIDAR_FRAME)
+            self.points = np.ascontiguousarray(self.frame.points)
+            self.image_file = os.path.join(LIDAR_FRAME, "velodyne.bin")
+        else:
+            # The published sample stores pillars, not points; the points are
+            # still in there, so the chain can be driven from a real sweep.
+            v = np.load(LIDAR_VOXELS)
+            n = np.load(LIDAR_NUMPTS)
+            self.points = np.ascontiguousarray(
+                np.concatenate([v[i, :int(n[i])] for i in range(len(v))]).astype(np.float32))
+            self.image_file = LIDAR_VOXELS
+        self.cfg = bcdl.VoxelConfig()
+        self.vfe = bcdl.Engine(LIDAR_VFE)
+        self.head = bcdl.Engine(LIDAR_HEAD)
+        # A convolution-form VFE takes one expanded tensor; the published one
+        # takes the three raw pillar tensors.
+        self.vfe_conv = self.vfe.num_inputs == 1
+        # A head whose input is the scatter canvas has the backbone fused in.
+        canvas = [1, 64, self.cfg.grid_y, self.cfg.grid_x]
+        self.fused_head = self.head.input_shape(0) == canvas
+        self.backbone = None if self.fused_head else bcdl.Engine(LIDAR_BACKBONE)
+        self.det = bcdl.LidarDetector3d(self.head)
+        self.in_w, self.in_h = self.cfg.grid_x, self.cfg.grid_y
+        self.engine = self.head
+        self.vox, self.npts, self.coords, self.stats = bcdl.voxelize_pillars(
+            self.points, self.cfg)
+        self._spatial = None
+
+    def _vfe_inputs(self, vox, npts, coords, num_pillars):
+        if not self.vfe_conv:
+            return [vox, npts, coords]
+        return [self.bcdl.pillar_point_features(vox, npts, coords, num_pillars, self.cfg)]
+
+    def _pillar_features(self, out, num_pillars):
+        """Both forms end up as (P, C); the convolution form emits (1, C, P, 1)."""
+        if not self.vfe_conv:
+            return out[:num_pillars]
+        return np.ascontiguousarray(out.reshape(out.shape[1], -1).T[:num_pillars])
+
+    def feed(self):
+        for i, arr in enumerate(self._vfe_inputs(self.vox, self.npts, self.coords,
+                                                 self.stats.num_pillars)):
+            self.vfe._e.set_input(i, np.ascontiguousarray(arr))
+
+    def infer(self):
+        """The BPU stages, with the CPU scatter between them (the scatter cannot
+        be hoisted out: the backbone's input IS its result)."""
+        n = self.stats.num_pillars
+        out = self.vfe.infer(self._vfe_inputs(self.vox, self.npts, self.coords, n))[0]
+        spatial = self.bcdl.scatter_pillars(self._pillar_features(out, n),
+                                            self.coords[:n], n, self.cfg)
+        self._spatial = spatial
+        if self.backbone is not None:
+            spatial = self.backbone.infer([spatial])[0]
+        self.head.infer([spatial])
+
+    def decode(self):
+        vox, npts, coords, stats = self.bcdl.voxelize_pillars(self.points, self.cfg)
+        out = self.vfe.infer(self._vfe_inputs(vox, npts, coords, stats.num_pillars))[0]
+        feats = self._pillar_features(out, stats.num_pillars)
+        spatial = self.bcdl.scatter_pillars(feats,
+                                            coords[:stats.num_pillars],
+                                            stats.num_pillars, self.cfg)
+        if self.backbone is not None:
+            spatial = self.backbone.infer([spatial])[0]
+        self.head.infer([spatial])
+        return self.det.postprocess()
+
+    def summarize(self, res):
+        counts = [sum(1 for b in res if b.label == i) for i in range(3)]
+        return "%d pillars from %d points; %d boxes (%dC/%dP/%dY)" % (
+            self.stats.num_pillars, len(self.points), len(res), *counts)
+
+    def draw(self, res):
+        """The check figure.
+
+        With a calibrated frame staged (docs/MODELS.md) this is the pair of views
+        the field settles 3-D detection with: the boxes projected into the camera
+        image, where a box either wraps the car or does not, and the same boxes
+        over the sweep in bird's-eye view. Ground truth turns it from "plausible"
+        into matched / missed / invented.
+
+        Without one it degrades to the bird's-eye half, which is all an
+        uncalibrated point cloud can support.
+        """
+        if self.frame is not None:
+            return self._draw_calibrated(res)
+        return self._draw_bev_only(res)
+
+    # --- the calibrated figure ------------------------------------------
+    # Colour carries the verdict, not the class: a detection that matched a
+    # label, one that matched nothing, and a label nothing found are three
+    # different things, and a figure that paints them all "car green" cannot be
+    # used to judge the detector.
+    MATCHED, FALSE_POS, MISSED = bv.ACCENT, bv.PINK, bv.AMBER
+
+    def _draw_calibrated(self, res):
+        fr = self.frame
+        gts = fr.labels()
+        # Only predictions the camera could see are scored. The labels exist only
+        # for the camera's frustum, so a car detected behind the vehicle is not a
+        # false positive — it is an object nobody wrote a label for.
+        scored = [i for i, b in enumerate(res) if fr.in_camera(b)]
+        unscored = len(res) - len(scored)
+        sub = [res[i] for i in scored]
+        sub_hit, gt_hit = kitti_frame.match(sub, gts, bev_iou=self.bcdl.bev_iou)
+        pred_hit = [-2] * len(res)          # -2: outside the camera, not judged
+        for k, i in enumerate(scored):
+            pred_hit[i] = sub_hit[k]
+
+        img = fr.image()
+        pad = 16
+        cam_w = 1216
+        scale = cam_w / img.shape[1]
+        cam_h = int(round(img.shape[0] * scale))
+        view = bv.BevView(fwd_m=self.cfg.max_x, back_m=4.0, lat_m=self.cfg.max_y, ppm=7.6)
+        card_w = cam_w - view.w - pad
+        doc = bv.SVG(cam_w + 2 * pad, cam_h + view.h + 3 * pad)
+
+        # -- camera panel: the boxes over the photograph they describe --------
+        import cv2
+
+        rgba = np.dstack([cv2.resize(img, (cam_w, cam_h))[..., ::-1],
+                          np.full((cam_h, cam_w), 255, np.uint8)])
+        doc.add('<clipPath id="camc"><rect x="%d" y="%d" width="%d" height="%d" rx="8"/>'
+                '</clipPath>' % (pad, pad, cam_w, cam_h))
+        doc.add('<g clip-path="url(#camc)">')
+        doc.raster(rgba, pad, pad, cam_w, cam_h)
+
+        def to_img(box):
+            """8 projected corners, or None if the box is not in front of the
+            camera — a box behind it still projects, to a mirrored ghost."""
+            c3 = fr.box_corners(box)
+            uv, depth = fr.project(c3)
+            if depth.min() < 0.5:
+                return None
+            uv = uv * scale + pad
+            if uv[:, 0].max() < pad or uv[:, 0].min() > pad + cam_w:
+                return None
+            return uv
+
+        # Labels first and thin, so a prediction drawn over one still reads.
+        for gi, g in enumerate(gts):
+            uv = to_img(g)
+            if uv is not None and gt_hit[gi] < 0:
+                bv.cuboid(doc, uv, self.MISSED, dashed_edges=True, sw=1.3, front=False)
+        for pi in sorted(range(len(res)), key=lambda i: -res[i].z):
+            uv = to_img(res[pi])
+            if uv is None:
+                continue
+            hit = pred_hit[pi] >= 0
+            bv.cuboid(doc, uv, self.MATCHED if hit else self.FALSE_POS,
+                      dashed_edges=not hit, sw=1.7)
+        doc.add('</g>')
+        bv.panel_title(doc, pad, pad, cam_w, "camera — the model's 3-D boxes, projected",
+                       "KITTI %s" % fr.name)
+
+        # -- bird's-eye panel -------------------------------------------------
+        bx, by = pad, cam_h + 2 * pad
+        bv.panel_bg(doc, bx, by, view.w, view.h)
+        doc.add('<clipPath id="bevc"><rect x="%d" y="%d" width="%d" height="%d" rx="8"/>'
+                '</clipPath>' % (bx, by, view.w, view.h))
+        doc.add('<g clip-path="url(#bevc)">')
+        bv.polar_grid(doc, view, bx, by, (10, 20, 30, 40, 50, 60))
+        cloud, z_lo, z_hi = bv.points_rgba(view, self.points[:, :2], self.points[:, 2])
+        doc.raster(cloud, bx, by, view.w, view.h)
+        for gi, g in enumerate(gts):
+            if gt_hit[gi] < 0:
+                bv.box(doc, view, bx, by, g.x, g.y, g.heading, g.dx, g.dy,
+                       self.MISSED, sw=1.2)
+        for pi, p in enumerate(res):
+            col = (self.MATCHED if pred_hit[pi] >= 0 else
+                   bv.DIM if pred_hit[pi] == -2 else self.FALSE_POS)
+            bv.box(doc, view, bx, by, p.x, p.y, p.heading, p.dx, p.dy, col)
+        bv.ego(doc, view, bx, by)
+        bv.scale_bar(doc, view, bx, by)
+        doc.add('</g>')
+        bv.panel_title(doc, bx, by, view.w, "bird's-eye — sweep and boxes",
+                       "ego at origin · +x up")
+
+        # -- scorecard --------------------------------------------------------
+        sx = bx + view.w + pad
+        tp = sum(1 for h in pred_hit if h >= 0)
+        fp = sum(1 for h in pred_hit if h == -1)
+        fn = sum(1 for h in gt_hit if h < 0)
+        y = bv.card(doc, sx, by, card_w, view.h, "against the labels")
+        y = bv.rows(doc, sx, y, card_w, [
+            ("matched", self.MATCHED, "%d" % tp),
+            ("false positive", self.FALSE_POS, "%d" % fp),
+            ("missed", self.MISSED, "%d" % fn),
+            (None,),
+            ("outside the camera", bv.DIM, "%d" % unscored),
+            (None,),
+            ("recall", None, "%.0f%%" % (100.0 * tp / max(len(gts), 1))),
+            ("precision", None, "%.0f%%" % (100.0 * tp / max(tp + fp, 1))),
+        ])
+        for k, line in enumerate((
+                "Matched at KITTI's own BEV IoU thresholds:",
+                "0.7 for cars, 0.5 for pedestrians and cyclists.",
+                "Labels cover the camera's view only, so boxes",
+                "outside it are shown but not scored.")):
+            doc.text(sx + 14, y + 2 + 14 * k, line, "sm")
+        y += 72
+        counts = [sum(1 for b in res if b.label == i) for i in range(3)]
+        gcounts = [sum(1 for g in gts if g.label == i) for i in range(3)]
+        y = bv.rows(doc, sx, y, card_w, [("detected / labelled", None, None)] +
+                    [(LIDAR_NAMES[i], None, "%d / %d" % (counts[i], gcounts[i]))
+                     for i in range(3)] + [
+            (None,),
+            ("returns", None, "%d" % len(self.points)),
+            ("pillars", None, "%d" % self.stats.num_pillars),
+            ("out of range", None, "%d" % self.stats.points_out_of_range),
+            ("pillar full", None, "%d" % self.stats.points_dropped_full),
+            ("no slot left", None, "%d" % self.stats.pillars_dropped),
+        ])
+        doc.text(sx + 14, y + 10, "RETURN HEIGHT", "h2")
+        bv.height_ramp(doc, sx + 14, y + 22, 13,
+                       max(60, view.h - (y - by) - 46), z_lo, z_hi)
+        return doc.render()
+
+    def _draw_bev_only(self, res):
+        """Bird's-eye only: the sweep, the boxes, and the counts.
+
+        The point cloud is drawn at full density and coloured by height because
+        the only check available here is "does this box sit on a car-shaped
+        cluster", and a figure that thins the cloud or flattens it to one colour
+        cannot be used to make it.
+        """
+        cfg = self.cfg
+        view = bv.BevView(fwd_m=cfg.max_x, back_m=4.0, lat_m=cfg.max_y, ppm=9.0)
+        pad, side_w = 16, 232
+        doc = bv.SVG(pad * 3 + view.w + side_w, view.h + 2 * pad)
+        px0, py0 = pad, pad
+
+        bv.panel_bg(doc, px0, py0, view.w, view.h)
+        doc.add('<clipPath id="bevclip"><rect x="%d" y="%d" width="%d" height="%d" rx="8"/>'
+                '</clipPath>' % (px0, py0, view.w, view.h))
+        doc.add('<g clip-path="url(#bevclip)">')
+        bv.polar_grid(doc, view, px0, py0, (10, 20, 30, 40, 50, 60))
+        rgba, z_lo, z_hi = bv.points_rgba(view, self.points[:, :2], self.points[:, 2])
+        doc.raster(rgba, px0, py0, view.w, view.h)
+
+        # Boxes over the cloud they are meant to be checked against; weakest
+        # first, so a confident box is never hidden by a marginal one.
+        for b in sorted(res, key=lambda b: b.score):
+            bv.box(doc, view, px0, py0, b.x, b.y, b.heading, b.dx, b.dy,
+                   bv.CLASS_COLORS[b.label % len(bv.CLASS_COLORS)])
+        bv.ego(doc, view, px0, py0)
+        placer = bv.ChipPlacer((px0 + 4, py0 + 44, px0 + view.w - 4, py0 + view.h - 26))
+        for b in sorted(res, key=lambda b: -b.score):
+            x, y = view.px(b.x, b.y)
+            placer.add(doc, "%s %.2f" % (LIDAR_NAMES[b.label], b.score),
+                       x + px0, y + py0 - b.dx / 2 * view.ppm,
+                       bv.CLASS_COLORS[b.label % len(bv.CLASS_COLORS)])
+        bv.scale_bar(doc, view, px0, py0)
+        doc.add('</g>')
+        bv.panel_title(doc, px0, py0, view.w, "lidar BEV — PointPillars",
+                       "ego at origin · +x up · height-coloured returns")
+
+        sx = px0 + view.w + pad
+        counts = [sum(1 for b in res if b.label == i) for i in range(3)]
+        y = bv.card(doc, sx, py0, side_w, view.h, "sweep")
+        y = bv.rows(doc, sx, y, side_w, [
+            ("returns", None, "%d" % len(self.points)),
+            ("pillars", None, "%d" % self.stats.num_pillars),
+            ("boxes", None, "%d" % len(res)),
+            (None,),
+        ] + [(LIDAR_NAMES[i], bv.CLASS_COLORS[i], "%d" % counts[i]) for i in range(3)] + [
+            (None,),
+            ("out of range", None, "%d" % self.stats.points_out_of_range),
+            ("pillar full", None, "%d" % self.stats.points_dropped_full),
+            ("no slot left", None, "%d" % self.stats.pillars_dropped),
+        ])
+        doc.text(sx + 14, y + 14, "RETURN HEIGHT", "h2")
+        bv.height_ramp(doc, sx + 14, y + 26, 13, view.h - (y - py0) - 52, z_lo, z_hi)
+        return doc.render()
+
+
 def make_task(bcdl, key):
     """Factory: OcrTask for 'ocr', StereoTask for 'stereo', WholeBodyTask for
     'wholebody', FeaturesTask for 'features', SuperResTask for 'superres',
-    ReidTask for 'reid', else single-model Task."""
+    ReidTask for 'reid', FlowTask / AnomalyTask / DriveTask for the 2026-08
+    additions, else single-model Task."""
+    if key == "lidar3d":
+        return LidarTask(bcdl)
+    if key == "flow":
+        return FlowTask(bcdl)
+    if key == "anomaly":
+        return AnomalyTask(bcdl)
+    if key == "drive":
+        return DriveTask(bcdl)
     if key == "reid":
         return ReidTask(bcdl)
     if key == "features":

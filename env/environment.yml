@@ -13,3 +13,9 @@ dependencies:
   - pip
   - libopencv   # OpenCV 5 (cv::resize/findContours/minAreaRect/rotatedRectIntersection);
                 # pulls conda's newer libstdc++ (CXXABI_1.3.15) the task layer links against.
+  - librsvg     # rsvg-convert: rasterises the bird's-eye check figures, which are
+                # SVG (tests/bev_svg.py). Nothing in the library depends on it —
+                # only the figures and the driving video do.
+  - openfonts   # Ubuntu + Source Code Pro + DejaVu, the tail of the figures' font
+                # stack. Without a guaranteed font fontconfig picks whatever it
+                # finds and the same figure re-flows on another machine.

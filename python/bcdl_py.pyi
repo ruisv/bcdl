@@ -58,7 +58,20 @@ class Engine:
 
     def infer(self, timeout_ms: int = 0) -> None: ...
 
-    def output_bytes(self, index: int) -> bytes: ...
+    def output_bytes(self, index: int) -> bytes:
+        """
+        Output[i]'s device buffer verbatim, padding and all. Reshaping it flat shears a padded tensor — use output_packed() unless you are walking output_stride() yourself.
+        """
+
+    def output_packed_bytes(self, index: int) -> int:
+        """
+        Byte size of output[i] as a contiguous row-major array. Smaller than the device buffer whenever the model pads a dimension.
+        """
+
+    def output_packed(self, index: int) -> bytes:
+        """
+        Output[i] gathered into a contiguous row-major array of its declared shape and dtype (padding removed, quantisation left alone).
+        """
 
 class LetterboxInfo:
     def __init__(self) -> None: ...

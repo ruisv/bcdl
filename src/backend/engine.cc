@@ -148,6 +148,24 @@ void scatterStrided(uint8_t* dst, const uint8_t* src, const hbDNNTensorPropertie
                    dim + 1, row_bytes);
   }
 }
+
+/// The inverse: gather a strided device buffer into a packed row-major array.
+void gatherStrided(uint8_t* dst, const uint8_t* src, const hbDNNTensorProperties& p, int dim,
+                   std::size_t row_bytes) {
+  const int nd = p.validShape.numDimensions;
+  if (dim == nd - 1) {
+    std::memcpy(dst, src, row_bytes);
+    return;
+  }
+  std::size_t dst_step = row_bytes;
+  for (int d = dim + 1; d < nd - 1; ++d) {
+    dst_step *= static_cast<std::size_t>(p.validShape.dimensionSize[d]);
+  }
+  for (int k = 0; k < p.validShape.dimensionSize[dim]; ++k) {
+    gatherStrided(dst + dst_step * k, src + static_cast<std::size_t>(p.stride[dim]) * k, p,
+                  dim + 1, row_bytes);
+  }
+}
 }  // namespace
 
 void Engine::setInput(int i, const void* data, std::size_t bytes) {
@@ -179,6 +197,41 @@ void Engine::setInput(int i, const void* data, std::size_t bytes) {
                         " (packed) or " + std::to_string(device_bytes) + " (device layout)");
   }
   input_mem_[i].cleanCache();
+}
+
+std::size_t Engine::outputPackedBytes(int i) const {
+  if (i < 0 || i >= numOutputs()) throw Error(-1, "BCDL: output index out of range");
+  const auto& p = outputs_[i].properties;
+  std::size_t n = elemSize(p.tensorType);
+  for (int d = 0; d < p.validShape.numDimensions; ++d) {
+    n *= static_cast<std::size_t>(p.validShape.dimensionSize[d]);
+  }
+  return n;
+}
+
+void Engine::copyOutput(int i, void* dst, std::size_t bytes) const {
+  if (i < 0 || i >= numOutputs()) throw Error(-1, "BCDL: output index out of range");
+  const std::size_t packed_bytes = outputPackedBytes(i);
+  if (bytes != packed_bytes) {
+    throw Error(-1, "BCDL: output " + std::to_string(i) + " destination is " +
+                        std::to_string(bytes) + " bytes, expected " +
+                        std::to_string(packed_bytes) + " (packed)");
+  }
+  const auto& p = outputs_[i].properties;
+  const int nd = p.validShape.numDimensions;
+  const std::size_t elem = elemSize(p.tensorType);
+  if (nd < 1 || static_cast<std::size_t>(p.stride[nd - 1]) != elem) {
+    throw Error(-1, "BCDL: output " + std::to_string(i) +
+                        " has a non-contiguous innermost stride; read it through "
+                        "outputAsFloat() instead");
+  }
+  if (packed_bytes == output_mem_[i].size()) {  // no padding: one memcpy
+    std::memcpy(dst, output_mem_[i].data(), packed_bytes);
+    return;
+  }
+  const std::size_t row_bytes = elem * static_cast<std::size_t>(p.validShape.dimensionSize[nd - 1]);
+  gatherStrided(static_cast<uint8_t*>(dst), static_cast<const uint8_t*>(output_mem_[i].data()), p,
+                0, row_bytes);
 }
 
 void Engine::infer(int timeout_ms) {

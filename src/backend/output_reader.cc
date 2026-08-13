@@ -168,6 +168,31 @@ const float* outputAsFloat(Engine& engine, int out_idx, std::vector<float>& scra
   for (int d : shape) total *= (d > 0 ? d : 1);
   scratch.resize(static_cast<size_t>(total));
   const int num_dims = props.validShape.numDimensions;
+
+  // ROW-COPY PATH: F32 whose innermost axis is contiguous but whose outer axes
+  // are padded — the ordinary BPU output layout (a [1,18,248,216] head comes
+  // back with a 896-byte row against 864 bytes of data). The general path below
+  // decomposes an index per ELEMENT, which on a 3.9-million-element head costs
+  // ~56 ms; doing it per ROW instead is the same arithmetic 216 times less
+  // often, and the row itself is a memcpy.
+  const int row_len = num_dims > 0 ? props.validShape.dimensionSize[num_dims - 1] : 0;
+  if (props.tensorType == HB_DNN_TENSOR_TYPE_F32 && num_dims > 1 && row_len > 0 &&
+      props.stride[num_dims - 1] == static_cast<int64_t>(sizeof(float))) {
+    const int64_t rows = total / row_len;
+    for (int64_t r = 0; r < rows; ++r) {
+      int64_t byte_off = 0, rem = r;
+      for (int d = num_dims - 2; d >= 0; --d) {
+        const int size = props.validShape.dimensionSize[d] > 0
+                             ? props.validShape.dimensionSize[d] : 1;
+        byte_off += (rem % size) * props.stride[d];
+        rem /= size;
+      }
+      std::memcpy(scratch.data() + r * row_len, base + byte_off,
+                  static_cast<size_t>(row_len) * sizeof(float));
+    }
+    return scratch.data();
+  }
+
   for (int64_t i = 0; i < total; ++i) {
     scratch[static_cast<size_t>(i)] =
         readElement(base, props.tensorType, props.scale, props.quantiType,

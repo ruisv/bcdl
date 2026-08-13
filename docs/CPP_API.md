@@ -155,7 +155,8 @@ std::size_t obytes = engine.outputBytes(0);
 | `inputType(i)` / `outputType(i)` | `hbDNN` tensor type enum. |
 | `inputProperties(i)` / `outputProperties(i)` | Full `hbDNNTensorProperties` (dtype, quant, stride). |
 | `inputBytes(i)` / `outputBytes(i)` | Allocated device-buffer sizes. |
-| `inputPackedBytes(i)` | Size of input `i` as a contiguous row-major array — smaller than `inputBytes(i)` when the model pads a dimension. |
+| `inputPackedBytes(i)` / `outputPackedBytes(i)` | Size of the tensor as a contiguous row-major array — smaller than the device buffer when the model pads a dimension. |
+| `copyOutput(i, dst, bytes)` | Gather output `i` out of its padded device layout into a packed row-major array of `outputPackedBytes(i)` bytes; dtype unchanged (`outputAsFloat()` also dequantizes). |
 | `inputStride(i)` | Resolved byte strides of input `i`, innermost last. |
 | `outputStride(i)` | Resolved byte strides of output `i`. Outputs pad too; `outputAsFloat()` handles it, direct readers must not reshape flat. |
 | `setInput(i, data, bytes)` | Copy host bytes into input `i` and flush. `bytes` must be `inputPackedBytes(i)` (scattered into the device layout) or `inputBytes(i)` (taken as-is); anything else throws. |
@@ -432,6 +433,139 @@ std::vector<uint8_t> bgr = bcdl::segColorize(m);   // (H*W*3) BGR palette
 
 `num_classes=0` infers C from the tensor; `argmaxed=true` if the model already
 emits ids.
+
+## Lidar 3-D detection
+
+`bcdl/preproc/lidar_voxelize.h` + `bcdl/tasks/lidar_det3d.h` — a point cloud to
+oriented 3-D boxes, as a pipeline of compiled stages with CPU work between.
+
+```cpp
+struct Box3D { float x,y,z, dx,dy,dz, heading; int label; float score; };
+
+bcdl::VoxelConfig vcfg;                                   // KITTI geometry
+bcdl::Pillars p = bcdl::voxelizePillars(points, n, /*stride=*/4, vcfg);
+std::vector<float> x = bcdl::pillarPointFeatures(p.voxels.data(), p.num_points.data(),
+                                                 p.coords.data(), p.num_pillars, vcfg);
+// vfe engine -> pillar features
+std::vector<float> canvas = bcdl::scatterPillars(feats, p.coords.data(),
+                                                 p.num_pillars, 64, vcfg);
+// backbone+head engine
+bcdl::LidarDetector3d det(head_engine);
+std::vector<bcdl::Box3D> boxes = det.postprocess();
+// pure: generateAnchors3d(cfg) · decodeDet3d(...) · bevIou(a,b) · nms3d(...)
+```
+
+Points must already be in the EGO frame, and the caps in `VoxelConfig` are real
+— `Pillars` reports every point and column it had to drop rather than truncating
+silently.
+
+`pillarPointFeatures()` is needed only by a VFE re-exported as a 1×1 convolution
+over `(1, C, pillars, points)`; a VFE that takes the three raw pillar tensors does
+the same expansion in its own graph. It is worth 179× to move it out: that shape
+is a huge pillar axis against a 4-wide channel axis, and the in-graph version
+spends 290 ms on a 95 MFLOP MLP where the convolution form spends 1.62 ms.
+
+The anchor decode runs on the CPU on purpose: the published head bakes it into
+the graph with `ScatterND`, which compiles without an error into a model whose
+outputs are never written. `generateAnchors3d` reproduces that model's own anchor
+constants to 8e-06, which is how the ordering (class-major, then rotation, on a
+CLOSED linspace over the range) was established rather than guessed.
+
+## Anomaly detection (one-class)
+
+`bcdl/tasks/anomaly.h` — trained on one product's NORMAL images only; reports how
+unlike them each patch looks. The model is per-product and the threshold is a
+per-line decision, so the shipped model is an example, not a general detector.
+
+```cpp
+struct AnomalyConfig { int out_width=0, out_height=0; int blur_kernel=33;
+                       float blur_sigma=4.0f, threshold=0.5f; };
+struct AnomalyMap { int width, height; std::vector<float> data; float score; };
+
+bcdl::AnomalyDetector det(engine);
+bcdl::AnomalyMap m = det.detect(bgr, width, height, stride);
+std::vector<uint8_t> mask = bcdl::anomalyMask(m, 0.5f);
+// pure: decodeAnomaly(data, shape, cfg) · anomalyPreprocess(bgr, ..., out)
+```
+
+`score` is the map's **maximum** — a part is as anomalous as its worst patch, and
+a mean lets a large clean region hide a small defect. The upsample to input
+resolution and the Gaussian smoothing are the reference post-processing; setting
+`blur_kernel = 0` skips the smoothing (worth ~6 ms at 288×288) but changes the
+numbers.
+
+`anomalyPreprocess` applies BGR→RGB, `/255` and ImageNet mean/std — that
+normalisation is part of the trained contract, and the defaults are those
+statistics.
+
+## Optical flow
+
+`bcdl/tasks/optical_flow.h` — two frames to a dense displacement field. Vectors
+in source pixels, +u right / +v down (OpenCV convention).
+
+```cpp
+struct FlowConfig { float scale_x=1, scale_y=1; bool channels_first=true; };
+struct FlowField { int width, height; std::vector<float> data; /* H*W*2, (u,v) */ };
+
+bcdl::OpticalFlowEstimator est(engine);
+bcdl::FlowField f = est.estimate(bgr0, bgr1, width, height, stride);
+std::vector<uint8_t> vis = bcdl::flowColorize(f);            // BGR H*W*3
+float epe = bcdl::flowEndpointError(f, reference);
+// pure: decodeFlow(data, shape, cfg) · flowPreprocess(bgr, ..., out)
+```
+
+`estimate()` reads the model's input size from the Engine, resizes both frames,
+and rescales the returned vectors from model pixels to source pixels — a field
+left in model pixels warps everything by the wrong factor without looking wrong.
+
+**Preprocessing keeps BGR and 0-255**: the reference implementation divides by
+255 inside the graph. `flowPreprocess` is bound to the same C++ the Python path
+uses, so both feed the model identical pixels.
+
+## End-to-end driving (camera + lidar → trajectory)
+
+`bcdl/tasks/e2e_drive.h` + `bcdl/preproc/drive_inputs.h` — three forward cameras
+and a lidar sweep in, one planned ego trajectory out (plus detected vehicles and
+a BEV semantic map). Ego frame, metres, x forward / y left; the poses are the
+future at a fixed interval.
+
+```cpp
+struct DrivePose  { float x, y, heading; };
+struct DriveAgent { float x, y, heading, length, width, score; };
+struct DriveResult { std::vector<DrivePose> trajectory;
+                     std::vector<DriveAgent> agents; bcdl::SegMask bev; };
+
+bcdl::DrivePlanner planner(engine, anchors, num_modes, num_poses);
+
+std::vector<float> camera = bcdl::stitchDriveCameras(l, lw, lh, ls, f, fw, fh, fs,
+                                                     r, rw, rh, rs);   // (3,H,W) RGB [0,1]
+bcdl::LidarBev bev = bcdl::lidarBevHistogram(points, n, /*stride_floats=*/3);
+
+bcdl::DriveStatus st; st.driving_command = 0; st.velocity_x = 5.0f;
+bcdl::DriveResult res = planner.plan(camera, bev.data, st);
+// pure: decodeDrive(traj, traj_shape, agents, agent_shape, labels, label_shape,
+//                   bev, bev_shape, cfg)
+```
+
+The BEV grid's first axis is **x (forward)**, the second y — the same order as
+the upstream histogram. `LidarBevConfig::use_ground_plane=false` (the default)
+emits one channel holding only the points above `split_height`.
+
+`DriveResult::bev`'s axes are **not** screen axes: row index increases with
+FORWARD distance (row 0 is the ego end) and column index increases to the LEFT,
+so drawing it north-up means reversing both. Upstream documents neither, and a
+straight road is nearly symmetric under a 180-degree rotation — the wrong
+orientation is not visibly wrong. The map is returned as the model emits it.
+
+`DriveAnchorConfig::noise_scale = 0` zeroes the sampler's random term while
+keeping the schedule's scaling, which is the configuration to use when comparing
+against another implementation. `DriveIoConfig` maps tensors to indices; an
+output index of `-1` skips that head.
+
+Inputs are written through `setInputFromFloat` (`bcdl/backend/input_writer.h`),
+which quantizes to whatever dtype the model declared — this model's inputs are
+int16 with a per-tensor scale, and handing it raw float bytes would run happily
+on noise.
 
 ## Depth
 

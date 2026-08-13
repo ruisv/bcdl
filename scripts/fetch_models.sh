@@ -200,4 +200,89 @@ else
   download "${SIGLIP}" \
     "https://archive.d-robotics.cc/downloads/rdk_model_zoo/rdk_s100/SigLIP/${SIGLIP}"
 fi
+# M20 lidar 3-D detection (PointPillars). Three compiled stages: the published
+# VFE and 2-D backbone are downloaded as-is, the anchor head is compiled HERE
+# because the published one bakes its anchor decode into the graph with
+# ScatterND — the construct that compiles without an error into a model whose
+# outputs are never written (this repo already lost a day to it once, on YOLOP).
+# The two .npy are the zoo's own sample sweep; the points are recoverable from
+# them, so the whole chain can be driven from a real scan with nothing staged.
+PP="https://archive.d-robotics.cc/downloads/rdk_model_zoo/rdk_s100/PointPillars"
+download pointpillars_vfe.hbm              "${PP}/vfe.hbm"
+download pointpillars_backbone.hbm         "${PP}/backbone.hbm"
+download lidar_voxels0.npy                 "${PP}/voxels0.npy"
+download lidar_voxel_num_points0.npy       "${PP}/voxel_num_points0.npy"
+copy_staged pointpillars_head_int16_nashm_248x216.hbm \
+            pointpillars/out/pointpillars_head_int16_nashm_248x216.hbm
+
+# One CALIBRATED frame, which is what upgrades the check figure from "the boxes
+# sit on some points" to "the boxes wrap those cars, and here is what was missed".
+# The dataset is not redistributed — KITTI is CC BY-NC-SA — so this copies four
+# files out of a KITTI object-detection checkout you already have. Set
+# BCDL_SRC_KITTI (and optionally BCDL_KITTI_FRAME, default 000736) in
+# scripts/local.env. Without it everything still works; the figure just falls
+# back to bird's-eye only. See docs/MODELS.md.
+KITTI_SRC="${BCDL_SRC_KITTI:-}"
+KITTI_ID="${BCDL_KITTI_FRAME:-000736}"
+if [[ -n "$KITTI_SRC" && -d "$KITTI_SRC" ]]; then
+  mkdir -p "${DEPLOY}/kitti_frame"
+  ok=1
+  for pair in "velodyne/${KITTI_ID}.bin:velodyne.bin" \
+              "image_2/${KITTI_ID}.png:image_2.png" \
+              "calib/${KITTI_ID}.txt:calib.txt" \
+              "label_2/${KITTI_ID}.txt:label_2.txt"; do
+    src="${KITTI_SRC}/${pair%%:*}"; dst="${DEPLOY}/kitti_frame/${pair##*:}"
+    if [[ -f "$src" ]]; then cp -f "$src" "$dst"; else ok=0; fi
+  done
+  echo "$KITTI_ID" > "${DEPLOY}/kitti_frame/frame_id.txt"
+  if [[ $ok -eq 1 ]]; then
+    printf '  %-46s staged frame %s\n' "kitti_frame/" "$KITTI_ID"
+  else
+    # label_2 is absent for the test split; the figure copes, so say what is
+    # missing rather than failing.
+    printf '  %-46s partial (frame %s; camera view needs velodyne+image_2+calib)\n' \
+           "kitti_frame/" "$KITTI_ID"
+  fi
+else
+  printf '  %-46s SKIPPED (set BCDL_SRC_KITTI for the camera view)\n' "kitti_frame/"
+fi
+
+# M19 one-class anomaly detection, MVTec-AD "bottle". This one is an EXAMPLE,
+# not a general detector: the model is trained on a single product's normal
+# images, so deploying to another part means retraining the head. int8 is
+# deliberate — the all-int16 build of this net runs 91x slower for no gain on
+# image or pixel AUROC.
+copy_staged glass_bottle_int8_nashm_288x288.hbm \
+            glass/out_int8/glass_bottle_int8_nashm_288x288.hbm
+# Bench samples for the two tasks whose input is not a repo image: a one-class
+# model only means anything on its own product, and the driving model eats a
+# sensor rig rather than a photo. Both samples are dataset-derived (MVTec AD /
+# nuScenes, non-redistributable), which is exactly why they stage here next to
+# the models instead of being committed under data/images/.
+copy_staged anomaly_sample_defect.png samples/anomaly_sample_defect.png
+copy_staged anomaly_sample_good.png   samples/anomaly_sample_good.png
+copy_staged drive_sample_frame.npz    samples/drive_sample_frame.npz
+
+# M18 dense optical flow. int16 is not a preference here: the int8 build of this
+# net adds a flat ~1.9 px noise floor that the compiler's 0.9954 output cosine
+# does not report, which is most of the signal on slow-moving pixels.
+copy_staged neuflow_v2_int16_nashm_512x384.hbm \
+            neuflow/out_int16_named/neuflow_v2_int16_nashm_512x384.hbm
+
+# End-to-end driving (camera + lidar -> trajectory). Another official PREBUILT,
+# and the first one published per BOARD rather than per march — take the build
+# that matches the board you are on. It ships with no companion assets, so the
+# clustered trajectory anchors the diffusion decoder starts from come from the
+# upstream release; without them the planner has nothing to denoise.
+#
+# Licence chain, since these are redistributable files and not just weights we
+# run: the upstream code is MIT, but both the anchors and the compiled model
+# derive from driving datasets whose terms are non-commercial. Fetching them for
+# local use is what this script does; shipping them onward is a separate
+# question with a different answer.
+DRIVE_HBM="diffusiondrive_r34_256x1024_s100p.hbm"
+download "${DRIVE_HBM}" \
+  "https://archive.d-robotics.cc/downloads/rdk_model_zoo/rdk_s100/${DRIVE_HBM}"
+download "kmeans_navsim_traj_20.npy" \
+  "https://github.com/hustvl/DiffusionDrive/releases/download/DiffusionDrive_88p1_PDMS_Eval_file/kmeans_navsim_traj_20.npy"
 echo ">> done. ($(ls -1 "${DEST}"/*.hbm 2>/dev/null | wc -l) models)"

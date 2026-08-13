@@ -31,7 +31,7 @@ import board_models as bm  # noqa: E402
 
 TASK_ORDER = ["cls", "det", "det_dfl", "pose", "seg", "obb", "semseg", "depth", "stereo", "ocr",
               "yoloe_det", "yoloe_seg", "wholebody", "features", "superres",
-              "superres_span", "reid"]
+              "superres_span", "reid", "flow", "anomaly", "drive", "lidar3d"]
 
 
 def read_rss_mb():
