@@ -90,6 +90,24 @@ def test_output_packed_matches_infer():
     np.testing.assert_array_equal(got, packed)
 
 
+def test_the_accessors_the_api_docs_promise_are_on_the_wrapper():
+    """docs/API.md lists these in `Engine`'s member table, so they have to be on
+    the wrapper — not only on the nanobind handle underneath it.
+
+    Shipped broken once: the binding had `output_packed_bytes`, the docs
+    documented it next to `input_packed_bytes`, and the wrapper did not forward
+    it, so anyone following the documentation got an AttributeError. Every test
+    reached through `engine._e` and none of them noticed.
+    """
+    e = _engine(ANY_MODEL)
+    for name in ("input_bytes", "input_packed_bytes", "input_stride", "output_stride",
+                 "output_packed_bytes", "output_packed", "output_shape", "input_shape",
+                 "input_dtype", "output_dtype", "model_names", "infer"):
+        assert hasattr(e, name), "docs/API.md promises Engine.%s()" % name
+    assert e.output_packed_bytes(0) == e._e.output_packed_bytes(0)
+    assert e.output_packed(0) == e._e.output_packed(0)
+
+
 def test_packed_equals_device_for_a_contiguous_model():
     """The common case stays a plain memcpy — no behaviour change for the NV12
     models the whole detection path runs on."""

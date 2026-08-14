@@ -69,6 +69,20 @@ class Engine:
         """
         return self._e.output_stride(i)
 
+    def output_packed_bytes(self, i: int) -> int:
+        """Byte size of output i as a contiguous row-major array. Smaller than
+        the device buffer whenever the model pads a dimension — the mirror of
+        ``input_packed_bytes``."""
+        return self._e.output_packed_bytes(i)
+
+    def output_packed(self, i: int) -> bytes:
+        """Output i gathered into a contiguous row-major array of its declared
+        shape and dtype: padding removed, quantization left alone.
+
+        ``infer()`` already returns packed arrays, so this is for callers who
+        drive the engine themselves and want the bytes."""
+        return self._e.output_packed(i)
+
     def output_shape(self, i: int) -> list[int]:
         return self._e.output_shape(i)
 

@@ -12,6 +12,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-08
+
+### Fixed
+- **`Engine.output_packed_bytes()` and `Engine.output_packed()` were documented
+  but not there.** 0.7.1 added both to the nanobind binding and listed
+  `output_packed_bytes(i)` in `docs/API.md`'s `Engine` member table, right beside
+  the `input_packed_bytes(i)` that *is* forwarded — but the Python wrapper class
+  never forwarded them, so following the documentation got an `AttributeError`.
+  Both are now on the wrapper.
+
+  It survived because every test reached through the private `engine._e` handle
+  rather than the public class, so the binding was covered and the surface users
+  actually call was not. The new test asserts that each member the API reference
+  promises exists on the wrapper.
+
 ## [0.7.1] — 2026-08
 
 Compiled models published, so a board is now the only hardware you need.
