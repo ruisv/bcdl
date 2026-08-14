@@ -225,8 +225,16 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge libbcdl
 
 ### 2. Get a model (one minute)
 
-BCDL is a generic runtime and loads any `.hbm`. The three fastest routes:
+BCDL is a generic runtime and loads any `.hbm`. The four fastest routes:
 
+- **models we already compiled, ready to download** — OCR, zero-shot stereo,
+  RGB-D depth refinement, super-resolution, sparse features, whole-body pose,
+  real-time segmentation, panoptic driving — on Hugging Face at
+  [`ruisv/bcdl-*`](https://huggingface.co/ruisv). **No ONNX export, no
+  calibration, no `hb_compile`, no x86 conversion host**;
+  `scripts/fetch_models.sh` fetches them for you. Only models whose *weights*
+  are redistributable are there — the list and their licences are in
+  [`docs/MODELS.md`](docs/MODELS.md#prebuilt-models-on-hugging-face).
 - what the board image already ships (`/opt/hobot/model/s100/basic` — e.g. YOLOv8
   detection, DeepLabV3+);
 - the prebuilt models in D-Robotics **`rdk_model_zoo`**;

@@ -92,18 +92,56 @@ copy_staged() {
   copy "${DEPLOY}/${name}"
 }
 
+# copy_or_hf <local-path> <hf-repo> — prefer a locally staged build (a maintainer
+# rebuilding a model wants their new one), else fetch the published copy.
+copy_or_hf() {
+  local src="$1" repo="$2" name
+  name="$(basename "$src")"
+  if [[ -f "$src" ]]; then copy "$src"; else from_hf "$name" "$repo"; fi
+}
+
+# from_hf <name> <hf-repo> — a converted model published on Hugging Face.
+#
+# These are the builds whose WEIGHTS are redistributable, so anyone can have them
+# without a conversion host and without running hb_compile. Falls through to
+# copy_staged when the download fails, so a maintainer with the convert host
+# still gets a model that has not been published (or has just been rebuilt).
+from_hf() {
+  local name="$1" repo="$2" staged="${3:-}"
+  if [[ -f "${DEST}/${name}" ]]; then
+    printf '  %-46s %6.1f MB (already present)\n' "$name" \
+      "$(echo "scale=1; $(stat -c%s "${DEST}/${name}")/1048576" | bc)"
+    return
+  fi
+  local url="https://huggingface.co/${repo}/resolve/main/${name}?download=true"
+  if command -v curl >/dev/null && \
+     curl -fsSL --retry 3 -o "${DEST}/${name}.part" "$url"; then
+    mv -f "${DEST}/${name}.part" "${DEST}/${name}"
+    printf '  %-46s %6.1f MB (Hugging Face: %s)\n' "$name" \
+      "$(echo "scale=1; $(stat -c%s "${DEST}/${name}")/1048576" | bc)" "$repo"
+  else
+    rm -f "${DEST}/${name}.part"
+    if [[ -n "$staged" ]]; then
+      copy_staged "$name" "$staged"
+    else
+      printf '  %-46s MISSING (%s)\n' "$name" "$repo"
+    fi
+  fi
+}
+
+
 echo ">> fetching models into ${DEST}"
 # OCR — PP-OCRv6 (converted offline; recipes in bcdl-model-zoo). This is the
 # default stack for the demo and tests. The rec build is all-int16: faster and
 # more accurate than the compiler's default mixed-precision int8 (see
 # docs/MODELS.md). No v6 classifier exists, so the v5 PP-LCNet cls stays below.
-copy "${DEPLOY}/ppocrv6_medium_det_960x960.hbm"
-copy "${DEPLOY}/ppocrv6_medium_rec_int16_48x320.hbm"
+copy_or_hf "${DEPLOY}/ppocrv6_medium_det_960x960.hbm" ruisv/bcdl-ppocr-v6
+copy_or_hf "${DEPLOY}/ppocrv6_medium_rec_int16_48x320.hbm" ruisv/bcdl-ppocr-v6
 # PP-OCRv5 stack — kept as a fallback and for the wider textline classifier the
 # v6 line does not provide.
-copy "${DEPLOY}/ppocrv5_server_det_960x960.hbm"
-copy "${DEPLOY}/ppocrv5_server_rec_48x320.hbm"
-copy "${DEPLOY}/ppocrv5_lcnet_cls_80x160.hbm"
+copy_or_hf "${DEPLOY}/ppocrv5_server_det_960x960.hbm" ruisv/bcdl-ppocr-v5
+copy_or_hf "${DEPLOY}/ppocrv5_server_rec_48x320.hbm" ruisv/bcdl-ppocr-v5
+copy_or_hf "${DEPLOY}/ppocrv5_lcnet_cls_80x160.hbm" ruisv/bcdl-ppocr-v6
 # Detection used by det/tracking/async demos + tests
 copy "${DEPLOY}/yolo26s_det_nashm_640x640_nv12.hbm"
 # YOLO26n nash-m family (cls/det/pose/seg/obb) from rdk_model_zoo
@@ -118,13 +156,13 @@ copy "${ZOO}/depth_anything_v2/model/s100/depth_any.hbm"
 # Two calibration modes: *_int16 (resize-fit) and *_crop (center-crop-fit).
 # The stereo board test prefers the crop model on the repo's center-crop pair.
 LAS2_DIR="${BCDL_SRC_LAS2:-/path/to/converted/las2}"
-copy "${LAS2_DIR}/las2_m_int16_nashm.hbm"
-copy "${LAS2_DIR}/las2_m_crop_nashm.hbm"
+copy_or_hf "${LAS2_DIR}/las2_m_int16_nashm.hbm" ruisv/bcdl-las2-stereo
+copy_or_hf "${LAS2_DIR}/las2_m_crop_nashm.hbm" ruisv/bcdl-las2-stereo
 # RGB-D depth refinement (LingBot-Depth v0.5, 480x640) — converted offline.
 # Refines an existing noisy/holey depth map rather than estimating one; pairs
 # with either of the two models above as the depth source.
 LINGBOT_DIR="${BCDL_SRC_LINGBOT:-/path/to/converted/lingbot-depth}"
-copy "${LINGBOT_DIR}/lingbot_depth_v05_int16_nashm.hbm"
+copy_or_hf "${LINGBOT_DIR}/lingbot_depth_v05_int16_nashm.hbm" ruisv/bcdl-lingbot-depth
 # Board-shipped: DFL det (yolov8) + semantic seg (deeplabv3plus)
 copy "${HOBOT}/yolov8_640x640_nv12.hbm"
 copy "${HOBOT}/deeplabv3plus_dilation1248_1024x2048_nv12.hbm"
@@ -151,13 +189,14 @@ copy_staged arcface_r50_aligned_nashm_112x112.hbm \
 # ScatterND, which compiles with no error into a model whose objectness and class
 # columns are never written. Cutting the graph before that decode and emitting
 # the three raw heads is what works.
-copy_staged yolop_cut_nashm_640x640_nv12.hbm yolop/out_cut/yolop_cut_nashm_640x640_nv12.hbm
+from_hf yolop_cut_nashm_640x640_nv12.hbm ruisv/bcdl-yolop \
+            yolop/out_cut/yolop_cut_nashm_640x640_nv12.hbm
 # M14 real-time semantic segmentation — replaces deeplabv3plus for the semseg_rt
 # task; the deeplabv3plus copy above is kept as the slower baseline. Take "_v3":
 # the earlier builds were calibrated on data that had not been pre-normalized,
 # which also compiles cleanly and decodes to garbage.
-copy_staged pidnet_s_nashm_1024x2048_nv12_v3.hbm \
-            pidnet/out_v3/pidnet_s_nashm_1024x2048_nv12_v3.hbm
+from_hf pidnet_s_nashm_1024x2048_nv12_v3.hbm ruisv/bcdl-pidnet \
+        pidnet/out_v3/pidnet_s_nashm_1024x2048_nv12_v3.hbm
 # YOLO26n-sem semantic segmentation (Cityscapes 19-class, native 640x640, no
 # caller-side upsample needed unlike semseg_rt). Take the int16 build,
 # calibrated on real Cityscapes frames: int8 compiles clean and passes every
@@ -168,10 +207,11 @@ copy_staged yolo26n_sem_nashm_640x640_nv12.hbm \
             yolo26_sem/out_int16/yolo26n_sem_nashm_640x640_nv12.hbm
 # M15 whole-body pose (ViTPose-S, 133 keypoints). Top-down: it needs the YOLO
 # person detector above in front of it.
-copy_staged vitpose_s_wholebody_nashm_256x192.hbm \
-            vitpose/out/vitpose_s_wholebody_nashm_256x192.hbm
+from_hf vitpose_s_wholebody_nashm_256x192.hbm ruisv/bcdl-vitpose-wholebody \
+        vitpose/out/vitpose_s_wholebody_nashm_256x192.hbm
 # M16 sparse local features (XFeat, 640x480).
-copy_staged xfeat_nashm_640x480.hbm xfeat/out/xfeat_nashm_640x480.hbm
+from_hf xfeat_nashm_640x480.hbm ruisv/bcdl-xfeat \
+            xfeat/out/xfeat_nashm_640x480.hbm
 # M10 person ReID (OSNet-AIN, 256x128 crops -> 512-d). This is the appearance
 # half of tracking: the YOLO detector above supplies the boxes, this turns each
 # crop into a vector, and ByteTracker's two-argument update() associates on both.
@@ -184,12 +224,13 @@ copy_staged osnet_ain_qat_nashm_256x128.hbm \
 # M17 x4 super-resolution. The 128 tile is deliberate: the compiled instruction
 # stream scales with tile AREA, so the same net at 256 is a 148 MB .hbm against
 # 37 MB here for identical per-pixel throughput.
-copy_staged realesr_general_x4v3_nashm_128.hbm \
-            superres/out_128/realesr_general_x4v3_nashm_128.hbm
+from_hf realesr_general_x4v3_nashm_128.hbm ruisv/bcdl-superres \
+        superres/out_128/realesr_general_x4v3_nashm_128.hbm
 # M17 second upscaler. Not a replacement for the one above: SPAN is
 # fidelity-oriented and wins on clean input at a sixth of the size, while the
 # Compact model is perceptual and wins on blurred / compressed input.
-copy_staged spanx4_ch48_nashm_128.hbm span/out/spanx4_ch48_nashm_128.hbm
+from_hf spanx4_ch48_nashm_128.hbm ruisv/bcdl-superres \
+            span/out/spanx4_ch48_nashm_128.hbm
 # M12 image embeddings (SigLIP). This one is an official PREBUILT model rather
 # than anything converted here, so prefer a copy already sitting in the model zoo
 # checkout and otherwise pull it from the public archive.
@@ -252,8 +293,8 @@ fi
 # images, so deploying to another part means retraining the head. int8 is
 # deliberate — the all-int16 build of this net runs 91x slower for no gain on
 # image or pixel AUROC.
-copy_staged glass_bottle_int8_nashm_288x288.hbm \
-            glass/out_int8/glass_bottle_int8_nashm_288x288.hbm
+from_hf glass_bottle_int8_nashm_288x288.hbm ruisv/bcdl-glass-bottle \
+        glass/out_int8/glass_bottle_int8_nashm_288x288.hbm
 # Bench samples for the two tasks whose input is not a repo image: a one-class
 # model only means anything on its own product, and the driving model eats a
 # sensor rig rather than a photo. Both samples are dataset-derived (MVTec AD /

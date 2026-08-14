@@ -13,6 +13,7 @@ copies of the same numbers is how they drift.
 - [The catalogue](#the-catalogue)
 - [Which build to take](#which-build-to-take)
 - [Getting the models](#getting-the-models)
+- [Prebuilt models on Hugging Face](#prebuilt-models-on-hugging-face)
 - [Reading the lidar check figure](#reading-the-lidar-check-figure)
 - [Licensing](#licensing)
 
@@ -276,6 +277,54 @@ rather than rebuilt.
 Each `.hbm` is compiled for a specific BPU **march**, so run the build compiled
 for your board — S100 and S100P share the Nash march, S600 is compiled for its
 own. The BCDL runtime itself is identical across the S-series.
+
+## Prebuilt models on Hugging Face
+
+Most of the **converted** rows above are published as ready-to-load `.hbm`, so
+you can skip the toolchain entirely — no ONNX export, no calibration, no
+`hb_compile`, no x86 host. `scripts/fetch_models.sh` pulls them automatically;
+they are listed here so you can also just download one by hand.
+
+| repo | contents | size | licence |
+|---|---|---|---|
+| [`ruisv/bcdl-ppocr-v6`](https://huggingface.co/ruisv/bcdl-ppocr-v6) | OCR det + rec + angle cls, **with the 18710-class dictionary** | 49 MB | Apache-2.0 |
+| [`ruisv/bcdl-ppocr-v5`](https://huggingface.co/ruisv/bcdl-ppocr-v5) | OCR v5 det + rec + cls, with its 18385 dictionary | 61 MB | Apache-2.0 |
+| [`ruisv/bcdl-las2-stereo`](https://huggingface.co/ruisv/bcdl-las2-stereo) | zero-shot stereo, both calibration modes | 78 MB | MIT |
+| [`ruisv/bcdl-lingbot-depth`](https://huggingface.co/ruisv/bcdl-lingbot-depth) | RGB-D depth refinement, int16 | 1015 MB | Apache-2.0 |
+| [`ruisv/bcdl-superres`](https://huggingface.co/ruisv/bcdl-superres) | ×4 upscaling, Compact **and** SPAN | 43 MB | BSD-3 / Apache-2.0 |
+| [`ruisv/bcdl-xfeat`](https://huggingface.co/ruisv/bcdl-xfeat) | sparse features | 3 MB | Apache-2.0 |
+| [`ruisv/bcdl-glass-bottle`](https://huggingface.co/ruisv/bcdl-glass-bottle) | one-class anomaly detection, MVTec `bottle` | 92 MB | **CC BY-NC-SA 4.0** |
+| [`ruisv/bcdl-vitpose-wholebody`](https://huggingface.co/ruisv/bcdl-vitpose-wholebody) | 133-keypoint whole-body pose | 28 MB | **non-commercial** |
+| [`ruisv/bcdl-pidnet`](https://huggingface.co/ruisv/bcdl-pidnet) | real-time semantic segmentation | 18 MB | **non-commercial** |
+| [`ruisv/bcdl-yolop`](https://huggingface.co/ruisv/bcdl-yolop) | panoptic driving, 3 heads | 11 MB | **non-commercial** |
+
+```bash
+# one model, by hand
+curl -fL -o xfeat_nashm_640x480.hbm \
+  https://huggingface.co/ruisv/bcdl-xfeat/resolve/main/xfeat_nashm_640x480.hbm
+```
+
+**Only models whose *weights* are redistributable are here**, which is a
+different question from the upstream repository's badge — see
+[Licensing](#licensing). That is why this list is shorter than the catalogue: the
+Ultralytics-derived builds are AGPL, the face models and PointPillars carry
+non-commercial *weights*, and **NeuFlow v2**, EdgeSAM and OSNet are unresolved.
+Those stay recipe-only, and `fetch_models.sh` still stages them from your own
+conversion.
+
+NeuFlow is the instructive one: Apache-2.0 code *with the weights committed in
+the same repository*, which normally settles it — but it is trained on
+FlyingThings3D, whose terms are research-only and say **nothing at all** about
+models trained on the data. Neither extending the restriction nor granting
+permission. Silence is not permission, so the optical-flow model is recipe-only
+even though everything visible about it looks permissive.
+
+The rows marked **non-commercial** may be redistributed and used for research;
+they may not be used commercially. Each model card says why in a banner at the
+top, not a footnote. GLASS additionally carries **share-alike** (MVTec AD is
+CC BY-NC-SA 4.0) — though note that restriction does not reach a deployment
+retrained on your own parts, which is how this model is actually meant to be
+used.
 
 ## Reading the lidar check figure
 

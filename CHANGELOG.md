@@ -12,6 +12,40 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-08
+
+Compiled models published, so a board is now the only hardware you need.
+
+### Added
+- **Prebuilt models on Hugging Face — no toolchain needed.** Nine packages under
+  [`ruisv/bcdl-*`](https://huggingface.co/ruisv) carry ready-to-load `.hbm` for
+  OCR (v6 and v5, **with the matching dictionary**), zero-shot stereo, RGB-D
+  depth refinement, ×4 super-resolution, sparse features, whole-body pose,
+  real-time segmentation and panoptic driving. `scripts/fetch_models.sh` pulls
+  them automatically and falls back to a locally staged build, so a maintainer
+  rebuilding a model still gets their own copy.
+
+  Only models whose **weights** are redistributable are published — a different
+  question from the upstream repository's licence, settled per model in the
+  conversion recipes. The Ultralytics-derived builds (AGPL), the face models and
+  PointPillars (non-commercial weights), and EdgeSAM and OSNet (unresolved) stay
+  recipe-only. Four of the ten are redistributable but **non-commercial**, and
+  each of those cards says so in a banner at the top rather than in a footnote.
+- **The anomaly detector is published too**
+  ([`ruisv/bcdl-glass-bottle`](https://huggingface.co/ruisv/bcdl-glass-bottle)),
+  under CC BY-NC-SA 4.0 — MIT code and weights, but trained on MVTec AD, which
+  is CC BY-NC-SA and so reaches the trained model, share-alike included. That
+  restriction does not reach a real deployment: a deployed GLASS is retrained on
+  your own defect-free parts, so what is encumbered is the example checkpoint.
+
+  **The optical-flow model is not published, and the reason is worth reading**
+  before assuming a permissive badge settles anything. NeuFlow v2 is Apache-2.0
+  *with its weights committed in the same repository* — normally the end of the
+  question — but it is trained on FlyingThings3D, whose terms are research-only
+  and say nothing whatever about models trained on the data. Neither extending
+  the restriction nor granting permission. Silence is not permission, so it stays
+  recipe-only. Both recipes now exist in the companion model-zoo.
+
 ## [0.7.0] — 2026-08
 
 Four new task heads — optical flow, industrial anomaly detection, end-to-end

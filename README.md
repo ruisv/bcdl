@@ -209,8 +209,14 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge libbcdl
 
 ### 2. 拿一个模型（一分钟）
 
-BCDL 是通用运行时，能加载任意 `.hbm`。最快的三条路：
+BCDL 是通用运行时，能加载任意 `.hbm`。最快的四条路：
 
+- **我们编译好的，直接下载** —— OCR、双目立体、RGB-D 深度精修、超分、特征点、
+  全身姿态、实时分割、全景驾驶，都在 Hugging Face 上：
+  [`ruisv/bcdl-*`](https://huggingface.co/ruisv)。**不用导 ONNX、不用校准、
+  不用 `hb_compile`、不用 x86 转换机**；`scripts/fetch_models.sh` 会自动去取。
+  只有**权重本身可再分发**的模型在那里，清单与许可证见
+  [`docs/MODELS.md`](docs/MODELS.md#prebuilt-models-on-hugging-face)。
 - 板上系统镜像自带的（`/opt/hobot/model/s100/basic`，如 YOLOv8 检测、DeepLabV3+）；
 - D-Robotics **`rdk_model_zoo`** 里预编译好的；
 - 自己转：完整配方（导出、校准、`hb_compile` 配置、精度/延迟实测）在配套仓库
