@@ -259,6 +259,26 @@ The Python snippet at the top is the whole program. On the C++ side,
 ./build/video_det_demo  stream.h264 model.hbm    # VPU decode -> BPU detect
 ```
 
+## Community
+
+Join the **BCDL (BPU) tech chat group** to discuss RDK / BPU deployment and using
+this project.
+
+<img src="https://ruisv.oss-cn-beijing.aliyuncs.com/public/rdk/images/bllm-qrcode.jpg" alt="BCDL chat group QR" width="240">
+
+> WeChat group QR codes expire; the image above is refreshed in place at the same
+> link. If scanning still fails, open an [Issue](../../issues) — you're also
+> welcome to just discuss there.
+
+Want large language models on the same board? The sister project
+[**BLLM**](https://github.com/ruisv/bllm) is an on-board LLM / VLM runtime for the
+BPU built with the same design taste — the two share the BPU and can be scheduled
+against each other.
+
+If BCDL saved you time, a **Star** is genuinely useful to us — it is how we
+judge which directions are worth continuing, and it helps other RDK developers
+find the project. Questions and requests are just as welcome as issues.
+
 ## Examples
 
 Everything under [`examples/`](examples/) is a standalone runnable program:
@@ -588,22 +608,6 @@ The 261 that need no `.hbm` are deliberately the thick half: a decoder's
 arithmetic can be caught without a board, while board tests are slow and depend
 on which models have been downloaded.
 
-## Community
-
-Join the **BCDL (BPU) tech chat group** to discuss RDK / BPU deployment and using
-this project.
-
-<img src="https://ruisv.oss-cn-beijing.aliyuncs.com/public/rdk/images/bllm-qrcode.jpg" alt="BCDL chat group QR" width="240">
-
-> WeChat group QR codes expire; the image above is refreshed in place at the same
-> link. If scanning still fails, open an [Issue](../../issues) — you're also
-> welcome to just discuss there.
-
-Want large language models on the same board? The sister project
-[**BLLM**](https://github.com/ruisv/bllm) is an on-board LLM / VLM runtime for the
-BPU built with the same design taste — the two share the BPU and can be scheduled
-against each other.
-
 ## Contributing
 
 Contributions are welcome — issues and pull requests alike. See
@@ -636,6 +640,8 @@ Contributions are welcome — issues and pull requests alike. See
   **PaddleOCR / PaddlePaddle** (PP-OCRv6 / v5, PP-LCNet), **Ultralytics** (YOLO
   family), **Depth-Anything-V2**, and **DeepLabV3+**. See [Models](#models) for
   their licenses; BCDL bundles none of these weights.
+
+If this project helped you, consider giving it a **Star** ⭐ — thanks for reading this far.
 
 ## License
 

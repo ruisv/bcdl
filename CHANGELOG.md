@@ -12,6 +12,31 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.3] — 2026-08
+
+### Changed
+- **The community section moved up, to just after the quickstart.** It sat below
+  the test tables, which is the wrong place for it: the moment someone most wants
+  a way to ask a question is right after running the three install commands —
+  either it worked and they want more, or it did not and they are stuck. The
+  sections it now precedes are browsing material they can come back to.
+
+### Added
+- **The C++ API reference is now checked against the headers.** `docs/CPP_API.md`
+  and its Chinese twin promise a set of members and `bcdl::` types; a test reads
+  the member tables and the `// pure:` lines and asserts each one is declared in
+  a public header. It also asserts the two languages promise the *same* API — a
+  translation that drifts tells one reader about something the other never hears
+  about.
+
+  This is the C++ half of the hole 0.7.2 closed on the Python side, and the
+  quieter half: a documented-but-absent Python attribute raises at the call, while
+  a documented-but-absent C++ member is only discovered by whoever tries to
+  compile against it. The check runs on any machine — it reads files, no board and
+  no model — and it verifies itself by breaking a copy of the doc on purpose and
+  confirming it is caught, because a member-existence check that cannot fail
+  proves nothing.
+
 ## [0.7.2] — 2026-08
 
 ### Fixed

@@ -237,6 +237,22 @@ build、许可证如何，见 [`docs/MODELS.md`](docs/MODELS.md)。
 ./build/video_det_demo  stream.h264 model.hbm    # VPU 解码 -> BPU 检测
 ```
 
+## 社区交流
+
+欢迎加入 **BCDL (BPU) 技术交流群**，一起讨论 RDK / BPU 部署与本项目的使用。
+
+<img src="https://ruisv.oss-cn-beijing.aliyuncs.com/public/rdk/images/bllm-qrcode.jpg" alt="BCDL 交流群二维码" width="240">
+
+> 微信群二维码有有效期，上面这张会在同一链接上原地更新；若扫码仍失效，
+> 请在 [Issues](../../issues) 留言，也欢迎直接在 Issues 交流。
+
+同一块板子上想跑大语言模型？姊妹项目
+[**BLLM**](https://github.com/ruisv/bllm) 是同一套设计取向的 BPU 端侧 LLM / VLM
+运行时，两者共享 BPU 并可协同调度。
+
+如果 BCDL 帮你省下了时间，欢迎点一个 **Star** —— 这是我们判断哪些方向值得继续投入的
+主要依据，也让更多 RDK 开发者能找到它。有问题、有需求，同样欢迎开 Issue。
+
 ## 示例
 
 [`examples/`](examples/) 下都是可独立运行的程序，按用途分：
@@ -520,19 +536,6 @@ PYTHONPATH=build:python pytest tests/
 不需要 `.hbm` 的那 261 项是刻意做厚的：解码器的数学错误不需要板子就能抓，
 而板端测试跑得慢、又依赖模型是否已下载。
 
-## 社区交流
-
-欢迎加入 **BCDL (BPU) 技术交流群**，一起讨论 RDK / BPU 部署与本项目的使用。
-
-<img src="https://ruisv.oss-cn-beijing.aliyuncs.com/public/rdk/images/bllm-qrcode.jpg" alt="BCDL 交流群二维码" width="240">
-
-> 微信群二维码有有效期，上面这张会在同一链接上原地更新；若扫码仍失效，
-> 请在 [Issues](../../issues) 留言，也欢迎直接在 Issues 交流。
-
-同一块板子上想跑大语言模型？姊妹项目
-[**BLLM**](https://github.com/ruisv/bllm) 是同一套设计取向的 BPU 端侧 LLM / VLM
-运行时，两者共享 BPU 并可协同调度。
-
 ## 参与贡献
 
 欢迎贡献 —— issue 与 pull request 皆可。完整指南见
@@ -561,6 +564,8 @@ PYTHONPATH=build:python pytest tests/
 - BCDL 重新实现了其后处理的上游模型作者 —— **PaddleOCR / PaddlePaddle**
   （PP-OCRv6 / v5、PP-LCNet）、**Ultralytics**（YOLO 系列）、**Depth-Anything-V2**
   与 **DeepLabV3+**。其许可证见[模型](#模型)；BCDL 不打包这些权重中的任何一个。
+
+如果这个项目对你有帮助，欢迎给它一个 **Star** ⭐ —— 谢谢你读到这里。
 
 ## 许可证
 
