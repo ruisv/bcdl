@@ -12,6 +12,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Everything 0.7.0 added was missing from `bcdl.__all__`** — all 45 names
+  across the four task heads (lidar 3-D, anomaly, optical flow, end-to-end
+  driving), the four wrapper classes included. The classes are plain module
+  attributes, so `bcdl.AnomalyDetector` worked, every example and board test
+  kept passing, and the documented snippets in `docs/API.md` ran exactly as
+  written. What disagreed with the reference was `from bcdl import *` and any
+  type checker reading `__all__` as the public surface of a `py.typed` package.
+  Found by installing the published conda package into an empty environment and
+  asking the package what it exports, rather than by calling it.
+
+  `tests/test_python_exports.py` closes it from two directions: every
+  `bcdl.Something` the API reference names must be in `__all__` (needs the
+  package importable — it is what a user hits), and every public class defined
+  in the wrapper must be in `__all__` (static, so the next one is caught on the
+  machine it was written on rather than on a board). Same family as the 0.7.2
+  fix and the 0.7.3 C++ check: the documentation named a symbol, and nothing
+  asserted the package agreed.
+
 ## [0.7.3] — 2026-08
 
 ### Changed
