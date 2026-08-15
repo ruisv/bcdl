@@ -12,6 +12,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.4] — 2026-08
+
+### Changed
+- **The conda package declares the OpenCV Python bindings it has always used.**
+  Seven documented functions — `letterbox_numpy`, `letterbox_chw_float`,
+  `bgr_to_nv12`, `jpeg_encode`, `face_letterbox`, `embed_preprocess` and
+  `SamSession` — import `cv2` lazily, and the package never said so. It went
+  unnoticed because the OpenCV build the channel carried happened to bundle the
+  Python bindings inside the C++ package, so `cv2` arrived by accident with the
+  library every install needs. The channel now uses the upstream OpenCV, which
+  splits the two the way conda-forge does, and `bcdl` depends on `py-opencv`
+  explicitly. The extra download is the bindings alone: the C++ side was already
+  being installed for `libbcdl`.
+
+  A caller who feeds the engine tensors it prepared elsewhere never touches
+  those seven functions, but the letterbox helpers are the front door of nearly
+  every pipeline here, and a documented function that raises `ImportError` on a
+  default install is not optional in any sense a user would recognise.
+
 ### Fixed
 - **Everything 0.7.0 added was missing from `bcdl.__all__`** — all 45 names
   across the four task heads (lidar 3-D, anomaly, optical flow, end-to-end

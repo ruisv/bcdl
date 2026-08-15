@@ -185,8 +185,8 @@ conda config --env --add channels conda-forge
 python -c "import bcdl, bcdl_py; print('bcdl', bcdl.__version__); print(bcdl_py.__file__)"
 ```
 
-这会把整个栈解析为四个包 —— Python 绑定、C++ 库，以及它们链接的、打包好的
-D-Robotics hobot SDK：
+这会把整个栈解析为四个 bcdl 包 —— Python 绑定、C++ 库，以及它们链接的、打包好的
+D-Robotics hobot SDK —— 外加来自 conda-forge 的 OpenCV：
 
 | 包 | 内容 |
 |---------|-------|
@@ -194,6 +194,7 @@ D-Robotics hobot SDK：
 | **libbcdl** | C++ 库 —— `libbcdl.so`、公共头文件，以及 `find_package(bcdl)` 的 CMake 配置 |
 | **hobot-dnn** | BPU/DNN 运行时 SDK（`libdnn`、`libhbucp`、`libhbvp`…）+ `hobot/` 头文件 |
 | **hobot-media** | 多媒体/编解码线（`libffmedia`、`libgdcbin`、`libmultimedia`…）+ 多媒体开发头文件 |
+| **libopencv** / **py-opencv** | OpenCV，来自 conda-forge。C++ 那半是 `libbcdl` 链接的；绑定那半是 letterbox、NV12、JPEG 这些辅助函数 import 的 |
 
 如果只是 **纯 C++** 的使用方，只装库即可，并用 `find_package(bcdl)` 来构建
 （它会一并拉入 `libbcdl` + `hobot-dnn` + `hobot-media`）：

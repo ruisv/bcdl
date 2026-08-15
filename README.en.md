@@ -201,8 +201,9 @@ native extension path):
 python -c "import bcdl, bcdl_py; print('bcdl', bcdl.__version__); print(bcdl_py.__file__)"
 ```
 
-That resolves the whole stack as four packages — the Python bindings, the C++
-library, and the packaged D-Robotics hobot SDK they link against:
+That resolves the whole stack as four bcdl packages — the Python bindings, the
+C++ library, and the packaged D-Robotics hobot SDK they link against — plus
+OpenCV from conda-forge:
 
 | package | ships |
 |---------|-------|
@@ -210,6 +211,7 @@ library, and the packaged D-Robotics hobot SDK they link against:
 | **libbcdl** | the C++ library — `libbcdl.so`, public headers, and the `find_package(bcdl)` CMake config |
 | **hobot-dnn** | the BPU/DNN runtime SDK (`libdnn`, `libhbucp`, `libhbvp`, …) + `hobot/` headers |
 | **hobot-media** | the media/codec line (`libffmedia`, `libgdcbin`, `libmultimedia`, …) + media dev headers |
+| **libopencv** / **py-opencv** | OpenCV, from conda-forge. The C++ side is what `libbcdl` links; the bindings are what the letterbox, NV12 and JPEG helpers import |
 
 For a **C++-only** consumer, install just the library and build against it with
 `find_package(bcdl)` (it pulls `libbcdl` + `hobot-dnn` + `hobot-media`):
