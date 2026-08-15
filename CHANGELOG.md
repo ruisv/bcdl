@@ -115,6 +115,40 @@ check figures rebuilt around what actually settles a detection.
   through the native `outputAsFloat()`, which honored the stride all along.
 
 ### Added
+- **Four new task heads**, the four named in the summary above.
+  - **`tasks/optical_flow.h`** — dense optical flow. The first task here that
+    takes *two* images and answers a question about the pair rather than about
+    either one: where did each pixel go. Everything else in this library reduces
+    a frame to a description; this one keeps the frame's shape and fills it with
+    motion.
+  - **`tasks/anomaly.h`** — industrial anomaly detection, one-class. There is no
+    class list and no training set of defects: the model is shown only *normal*
+    examples of one product and reports how unlike them each patch looks. Two
+    consequences a caller has to respect: the model is per-product, so the
+    shipped `.hbm` is an example rather than a general-purpose detector and a
+    new part means retraining; and the score is calibrated against that
+    product's own normal variation, so the threshold is a per-line decision, not
+    a library default.
+  - **`tasks/e2e_drive.h`** — end-to-end driving, camera plus lidar to a planned
+    trajectory. Unlike every other task in this library, this model does not
+    report what it sees and leave the decision to you; it emits the ego
+    trajectory to drive. The diffusion decoder that denoises the clustered
+    trajectory anchors lives inside the compiled graph — anchors go in, one
+    already-selected trajectory comes out, alongside the perception heads the
+    planner was trained jointly with. Poses are the future at a fixed interval
+    (the stock model: 8 poses over 4 s), not a spatial path.
+  - **`tasks/lidar_det3d.h`** — lidar 3-D detection, anchor-based, PointPillars
+    family. The first task here whose output is a box in *space* rather than in
+    an image: centre, extent and yaw in the ego frame, in metres. The head
+    predicts a residual against a fixed grid of anchors, so decoding needs the
+    same anchor set the model was trained with — get it wrong and the boxes come
+    out plausible, well-formed and in the wrong places. The decode runs on the
+    CPU deliberately: the published head bakes it into the graph with ScatterND,
+    which compiles without a single error into a model whose outputs are never
+    written.
+
+  `docs/MODELS.md` carries the measured latency and accuracy of each, and which
+  of them arrive as a downloadable model rather than as a conversion recipe.
 - **Check figures that can be used to judge the model, not just admire it.** The
   two bird's-eye figures are now drawn as SVG and rasterised with librsvg
   (`tests/bev_svg.py`) — real typography, vectors and CSS, with only the
