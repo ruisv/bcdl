@@ -5,7 +5,7 @@
 // Reserves a few blocks up front, then runs an acquire/release loop and prints
 // blockCount/freeCount/bytesPooled to show that steady-state acquires reuse
 // existing blocks (blockCount stays flat once warm) rather than allocating.
-// Includes the core header directly (MemPool is not yet re-exported via bcdl.h).
+// Includes just the one sub-header it needs; "bcdl/bcdl.h" re-exports it too.
 
 #include <cstdint>
 #include <cstdio>

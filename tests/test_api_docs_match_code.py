@@ -111,3 +111,28 @@ def test_the_check_would_catch_a_broken_promise(tmp_path):
     missing = sorted(n for n in _documented_functions(str(broken))
                      if not re.search(r"\b%s\s*\(" % re.escape(n), hdr))
     assert missing == ["modelNaem", "outputAlignedBytes"], missing
+
+
+def test_umbrella_header_includes_every_public_header():
+    """`docs/CPP_API.md` tells users that including `bcdl/bcdl.h` is enough.
+
+    It was not: the umbrella carried 27 of the 45 installed headers, so a user
+    following the doc got `undeclared identifier` for TrackingPipeline,
+    outputAsFloat, AnomalyDetector and 15 more. The examples hid it by including
+    sub-headers directly. A new header under include/ ships automatically, so
+    nothing but this test notices when it is not re-exported.
+    """
+    inc = os.path.join(_REPO, "include")
+    umbrella = os.path.join(inc, "bcdl", "bcdl.h")
+    installed = {
+        os.path.relpath(f, inc).replace(os.sep, "/")
+        for f in glob.glob(os.path.join(inc, "bcdl", "**", "*.h"), recursive=True)
+    } - {"bcdl/bcdl.h"}
+    assert installed, "no public headers found — the path assumption is wrong"
+
+    included = set(re.findall(r'#include\s+"(bcdl/[^"]+)"',
+                              open(umbrella, encoding="utf-8").read()))
+    missing = sorted(installed - included)
+    assert not missing, "bcdl/bcdl.h does not re-export: %s" % missing
+    stale = sorted(included - installed)
+    assert not stale, "bcdl/bcdl.h includes headers that no longer exist: %s" % stale
