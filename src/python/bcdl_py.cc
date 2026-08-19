@@ -158,7 +158,11 @@ NB_MODULE(bcdl_py, m) {
             e.setInput(i, arr.data(), arr.nbytes());
           },
           "index"_a, "array"_a)
-      .def("infer", &bcdl::Engine::infer, "timeout_ms"_a = 0)
+      // GIL released: infer() blocks in hbUCPWaitTaskDone for as long as the
+      // model takes (116 ms for depth, 271 ms for SMOKE) and touches nothing
+      // Python. Holding it there stalls every other thread in the interpreter.
+      .def("infer", &bcdl::Engine::infer, "timeout_ms"_a = 0,
+           nb::call_guard<nb::gil_scoped_release>())
       .def(
           "output_bytes",
           [](bcdl::Engine& e, int i) {
@@ -419,7 +423,11 @@ NB_MODULE(bcdl_py, m) {
       .def(
           "encode",
           [](bcdl::JpegEncoder& e, const bcdl::VpImage& src) {
-            std::vector<uint8_t> b = e.encode(src);
+            std::vector<uint8_t> b;
+            {
+              nb::gil_scoped_release rel;  // JPU round trip
+              b = e.encode(src);
+            }
             return nb::bytes(reinterpret_cast<const char*>(b.data()), b.size());
           },
           "image"_a, "Encode one VpImage to JPEG bytes.")
@@ -432,8 +440,11 @@ NB_MODULE(bcdl_py, m) {
       .def(
           "decode",
           [](bcdl::JpegDecoder& d, nb::bytes data) {
-            return d.decode(reinterpret_cast<const uint8_t*>(data.c_str()),
-                            data.size());
+            // bytes are immutable, so the pointer stays valid without the GIL.
+            const auto* p = reinterpret_cast<const uint8_t*>(data.c_str());
+            const std::size_t n = data.size();
+            nb::gil_scoped_release rel;  // JPU round trip
+            return d.decode(p, n);
           },
           "data"_a, "Decode JPEG bytes into an owned NV12 VpImage.")
       .def_prop_ro("out_format", &bcdl::JpegDecoder::outFormat);
@@ -448,6 +459,7 @@ NB_MODULE(bcdl_py, m) {
       .def(
           "run",
           [](bcdl::GdcLetterbox& g, const bcdl::VpImage& src) {
+            nb::gil_scoped_release rel;  // copies + GDC hardware wait, no Python
             bcdl::VpImage dst(g.outputWidth(), g.outputHeight(), HB_VP_IMAGE_FORMAT_NV12);
             g.run(src, dst);
             return dst;
@@ -517,7 +529,11 @@ NB_MODULE(bcdl_py, m) {
       .def(
           "encode",
           [](bcdl::VideoEncoder& e, const bcdl::VpImage& frame) {
-            std::vector<uint8_t> b = e.encode(frame);
+            std::vector<uint8_t> b;
+            {
+              nb::gil_scoped_release rel;  // VPU: queue + wait for a packet
+              b = e.encode(frame);
+            }
             return nb::bytes(reinterpret_cast<const char*>(b.data()), b.size());
           },
           "frame"_a,
@@ -526,6 +542,7 @@ NB_MODULE(bcdl_py, m) {
       .def(
           "feed",
           [](bcdl::VideoEncoder& e, const bcdl::VpImage& frame, uint64_t pts_us) {
+            nb::gil_scoped_release rel;  // blocks up to 1 s on a free input buffer
             return e.feed(frame, pts_us);
           },
           "frame"_a, nb::arg("pts_us") = 0,
@@ -536,7 +553,12 @@ NB_MODULE(bcdl_py, m) {
           "receive",
           [](bcdl::VideoEncoder& e, int timeout_ms) -> std::optional<nb::bytes> {
             std::vector<uint8_t> b;
-            if (!e.receive(b, timeout_ms)) return std::nullopt;
+            bool ok;
+            {
+              nb::gil_scoped_release rel;  // waits up to timeout_ms on the VPU
+              ok = e.receive(b, timeout_ms);
+            }
+            if (!ok) return std::nullopt;
             return nb::bytes(reinterpret_cast<const char*>(b.data()), b.size());
           },
           nb::arg("timeout_ms") = 0,
@@ -545,12 +567,18 @@ NB_MODULE(bcdl_py, m) {
           "flush",
           [](bcdl::VideoEncoder& e) -> std::optional<nb::bytes> {
             std::vector<uint8_t> b;
-            if (!e.flush(b)) return std::nullopt;
+            bool ok;
+            {
+              nb::gil_scoped_release rel;  // drains the tail: up to 300 ms
+              ok = e.flush(b);
+            }
+            if (!ok) return std::nullopt;
             return nb::bytes(reinterpret_cast<const char*>(b.data()), b.size());
           },
           "Signal end-of-stream, then drain the remaining packets; call until "
           "it returns None.")
       .def("feed_end_of_stream", &bcdl::VideoEncoder::feedEndOfStream,
+           nb::call_guard<nb::gil_scoped_release>(),
            "Queue an end-of-stream marker without draining. Idempotent.")
       .def_prop_ro("type", &bcdl::VideoEncoder::type)
       .def_prop_ro("width", &bcdl::VideoEncoder::width)
@@ -569,10 +597,16 @@ NB_MODULE(bcdl_py, m) {
           "decode",
           [](bcdl::VideoDecoder& d,
              nb::bytes data) -> std::optional<bcdl::VpImage> {
+            // bytes are immutable, so the pointer stays valid without the GIL.
+            const auto* p = reinterpret_cast<const uint8_t*>(data.c_str());
+            const std::size_t n = data.size();
             bcdl::VpImage out;
-            if (d.decode(reinterpret_cast<const uint8_t*>(data.c_str()),
-                         data.size(), out))
-              return std::optional<bcdl::VpImage>(std::move(out));
+            bool ok;
+            {
+              nb::gil_scoped_release rel;  // VPU: queue + wait for a frame
+              ok = d.decode(p, n, out);
+            }
+            if (ok) return std::optional<bcdl::VpImage>(std::move(out));
             return std::nullopt;
           },
           "data"_a,
@@ -581,14 +615,22 @@ NB_MODULE(bcdl_py, m) {
       .def(
           "feed",
           [](bcdl::VideoDecoder& d, nb::bytes data) {
-            return d.feed(reinterpret_cast<const uint8_t*>(data.c_str()), data.size());
+            const auto* p = reinterpret_cast<const uint8_t*>(data.c_str());
+            const std::size_t n = data.size();
+            nb::gil_scoped_release rel;  // blocks up to 1 s on a free input buffer
+            return d.feed(p, n);
           },
           "data"_a, "Queue one access unit for decoding (does not wait for output).")
       .def(
           "receive",
           [](bcdl::VideoDecoder& d, int timeout_ms) -> std::optional<bcdl::VpImage> {
             bcdl::VpImage out;
-            if (d.receive(out, timeout_ms)) return std::optional<bcdl::VpImage>(std::move(out));
+            bool ok;
+            {
+              nb::gil_scoped_release rel;  // waits up to timeout_ms on the VPU
+              ok = d.receive(out, timeout_ms);
+            }
+            if (ok) return std::optional<bcdl::VpImage>(std::move(out));
             return std::nullopt;
           },
           "timeout_ms"_a = 0,
@@ -598,7 +640,12 @@ NB_MODULE(bcdl_py, m) {
           "flush",
           [](bcdl::VideoDecoder& d) -> std::optional<bcdl::VpImage> {
             bcdl::VpImage out;
-            if (d.flush(out)) return std::optional<bcdl::VpImage>(std::move(out));
+            bool ok;
+            {
+              nb::gil_scoped_release rel;  // drains the reorder tail: up to 300 ms
+              ok = d.flush(out);
+            }
+            if (ok) return std::optional<bcdl::VpImage>(std::move(out));
             return std::nullopt;
           },
           "After the last feed(): drain the reorder tail; call until it returns None.")
@@ -800,6 +847,7 @@ NB_MODULE(bcdl_py, m) {
               throw std::invalid_argument("run() expects an (H, W, 3) BGR array");
             if (depth_m.ndim() != 2)
               throw std::invalid_argument("run() expects an (H, W) float depth array");
+            nb::gil_scoped_release rel;  // preproc + BPU infer + decode
             return self.run(bgr.data(), static_cast<int>(bgr.shape(1)),
                             static_cast<int>(bgr.shape(0)), static_cast<int>(bgr.shape(1)) * 3,
                             depth_m.data(), static_cast<int>(depth_m.shape(1)));
@@ -917,6 +965,7 @@ NB_MODULE(bcdl_py, m) {
               throw std::runtime_error("left/right must have identical dimensions");
             const int h = static_cast<int>(left.shape(0));
             const int w = static_cast<int>(left.shape(1));
+            nb::gil_scoped_release rel;  // preproc + BPU infer + decode
             return p.process(left.data(), right.data(), w, h);
           },
           "left"_a, "right"_a,
@@ -2089,6 +2138,7 @@ NB_MODULE(bcdl_py, m) {
             }
             const int h = static_cast<int>(bgr.shape(0));
             const int w = static_cast<int>(bgr.shape(1));
+            nb::gil_scoped_release rel;  // detect + (optional) re-ID + associate
             return p.process(bgr.data(), w, h);
           },
           "bgr"_a, "Detect + track one HxWx3 uint8 BGR frame; returns list[Track].")
