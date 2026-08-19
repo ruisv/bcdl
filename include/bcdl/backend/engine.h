@@ -39,16 +39,40 @@ class Engine {
   int numInputs() const noexcept { return static_cast<int>(inputs_.size()); }
   int numOutputs() const noexcept { return static_cast<int>(outputs_.size()); }
 
-  const hbDNNTensorProperties& inputProperties(int i) const { return inputs_[i].properties; }
-  const hbDNNTensorProperties& outputProperties(int i) const { return outputs_[i].properties; }
+  // Every index below is range-checked (throws bcdl::Error). These accessors are
+  // re-exported straight to Python, where an out-of-range index used to build a
+  // bytes object over a garbage pointer and take the interpreter down with it.
+  const hbDNNTensorProperties& inputProperties(int i) const {
+    checkInput(i);
+    return inputs_[i].properties;
+  }
+  const hbDNNTensorProperties& outputProperties(int i) const {
+    checkOutput(i);
+    return outputs_[i].properties;
+  }
 
-  std::vector<int> inputShape(int i) const { return shapeOf(inputs_[i].properties); }
-  std::vector<int> outputShape(int i) const { return shapeOf(outputs_[i].properties); }
-  int inputType(int i) const { return inputs_[i].properties.tensorType; }
-  int outputType(int i) const { return outputs_[i].properties.tensorType; }
+  std::vector<int> inputShape(int i) const {
+    checkInput(i);
+    return shapeOf(inputs_[i].properties);
+  }
+  std::vector<int> outputShape(int i) const {
+    checkOutput(i);
+    return shapeOf(outputs_[i].properties);
+  }
+  int inputType(int i) const {
+    checkInput(i);
+    return inputs_[i].properties.tensorType;
+  }
+  int outputType(int i) const {
+    checkOutput(i);
+    return outputs_[i].properties.tensorType;
+  }
 
   /// Allocated byte size of input[i]'s device buffer (post stride-resolution).
-  std::size_t inputBytes(int i) const { return input_mem_[i].size(); }
+  std::size_t inputBytes(int i) const {
+    checkInput(i);
+    return input_mem_[i].size();
+  }
 
   /// Byte size of input[i] as a PACKED (contiguous, row-major) host array —
   /// product of the valid dims times the element size. Differs from
@@ -78,7 +102,10 @@ class Engine {
 
   /// Read-only view of input[i]'s device buffer, in the device layout. For
   /// diagnostics — the way to see how setInput() laid a packed array out.
-  const void* inputData(int i) const { return input_mem_[i].data(); }
+  const void* inputData(int i) const {
+    checkInput(i);
+    return input_mem_[i].data();
+  }
 
   /// Submit + wait + invalidate output caches. timeout_ms == 0 blocks forever.
   void infer(int timeout_ms = 0);
@@ -86,8 +113,14 @@ class Engine {
   /// Output buffer after infer() (cache already invalidated). Note: this is the
   /// aligned device buffer; honor outputProperties(i).stride for non-contiguous
   /// layouts.
-  const void* outputData(int i) const { return output_mem_[i].data(); }
-  std::size_t outputBytes(int i) const { return output_mem_[i].size(); }
+  const void* outputData(int i) const {
+    checkOutput(i);
+    return output_mem_[i].data();
+  }
+  std::size_t outputBytes(int i) const {
+    checkOutput(i);
+    return output_mem_[i].size();
+  }
 
   /// Byte size of output[i] as a PACKED (contiguous, row-major) host array.
   /// The mirror of inputPackedBytes(); differs from outputBytes(i) whenever the
@@ -109,6 +142,11 @@ class Engine {
   static std::size_t elemSize(int tensor_type);
 
  private:
+  /// Throw bcdl::Error unless the index names a real input / output. Defined out
+  /// of line so this header need not pull in core/status.h.
+  void checkInput(int i) const;
+  void checkOutput(int i) const;
+
   static std::vector<int> shapeOf(const hbDNNTensorProperties& p);
   void allocTensors();
 

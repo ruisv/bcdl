@@ -8,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -245,6 +246,21 @@ bool AsyncDetectionPipeline::submit(const uint8_t* bgr, int width, int height) {
   return impl_->raw.push(std::move(f));
 }
 
+namespace {
+/// Reject anything that did not come from a successful acquireSlot(). -1 is the
+/// documented "pipeline finished" return, and `slots[-1]` is
+/// std::vector::operator[](SIZE_MAX) — the header's own three-step snippet used
+/// to show the call without a check in between.
+void checkSlot(int slot, int depth, const char* fn) {
+  if (slot < 0 || slot >= depth) {
+    throw Error(-1, std::string("AsyncDetectionPipeline::") + fn + ": slot " +
+                        std::to_string(slot) + " is out of range [0, " +
+                        std::to_string(depth) +
+                        ") — acquireSlot() returns -1 once the pipeline is finished");
+  }
+}
+}  // namespace
+
 int AsyncDetectionPipeline::acquireSlot() {
   int slot;
   if (!impl_->freeq.pop(slot)) return -1;  // finished / shutting down
@@ -256,6 +272,7 @@ LetterboxInfo AsyncDetectionPipeline::letterboxIntoSlot(int slot, const VpImage&
   if (!nv12.valid() || nv12.format() != HB_VP_IMAGE_FORMAT_NV12) {
     throw Error(-1, "AsyncDetectionPipeline: NV12 submit needs a valid NV12 VpImage");
   }
+  checkSlot(slot, static_cast<int>(impl_->slots.size()), "letterboxIntoSlot");
   const auto t0 = std::chrono::steady_clock::now();
   const LetterboxInfo lb = impl_->letterboxInto(impl_->slots[slot], nv12, range);
   // Single-writer still holds: a pipeline is driven either by submit() (preproc
@@ -266,10 +283,14 @@ LetterboxInfo AsyncDetectionPipeline::letterboxIntoSlot(int slot, const VpImage&
 }
 
 bool AsyncDetectionPipeline::commitSlot(int slot, const LetterboxInfo& lb) {
+  checkSlot(slot, static_cast<int>(impl_->slots.size()), "commitSlot");
   return impl_->ready.push(Ready{slot, lb});
 }
 
-void AsyncDetectionPipeline::releaseSlot(int slot) { impl_->freeq.push(slot); }
+void AsyncDetectionPipeline::releaseSlot(int slot) {
+  checkSlot(slot, static_cast<int>(impl_->slots.size()), "releaseSlot");
+  impl_->freeq.push(slot);
+}
 
 bool AsyncDetectionPipeline::submitNv12(const VpImage& nv12, YuvRange range) {
   const int slot = acquireSlot();

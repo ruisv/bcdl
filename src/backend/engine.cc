@@ -105,8 +105,22 @@ void Engine::allocTensors() {
   }
 }
 
+void Engine::checkInput(int i) const {
+  if (i < 0 || i >= numInputs()) {
+    throw Error(-1, "BCDL: input index " + std::to_string(i) + " out of range [0, " +
+                        std::to_string(numInputs()) + ")");
+  }
+}
+
+void Engine::checkOutput(int i) const {
+  if (i < 0 || i >= numOutputs()) {
+    throw Error(-1, "BCDL: output index " + std::to_string(i) + " out of range [0, " +
+                        std::to_string(numOutputs()) + ")");
+  }
+}
+
 std::size_t Engine::inputPackedBytes(int i) const {
-  if (i < 0 || i >= numInputs()) throw Error(-1, "BCDL: input index out of range");
+  checkInput(i);
   const auto& p = inputs_[i].properties;
   std::size_t n = elemSize(p.tensorType);
   for (int d = 0; d < p.validShape.numDimensions; ++d) {
@@ -116,13 +130,13 @@ std::size_t Engine::inputPackedBytes(int i) const {
 }
 
 std::vector<std::int64_t> Engine::inputStride(int i) const {
-  if (i < 0 || i >= numInputs()) throw Error(-1, "BCDL: input index out of range");
+  checkInput(i);
   const auto& p = inputs_[i].properties;
   return {p.stride, p.stride + p.validShape.numDimensions};
 }
 
 std::vector<std::int64_t> Engine::outputStride(int i) const {
-  if (i < 0 || i >= numOutputs()) throw Error(-1, "BCDL: output index out of range");
+  checkOutput(i);
   const auto& p = outputs_[i].properties;
   return {p.stride, p.stride + p.validShape.numDimensions};
 }
@@ -169,7 +183,7 @@ void gatherStrided(uint8_t* dst, const uint8_t* src, const hbDNNTensorProperties
 }  // namespace
 
 void Engine::setInput(int i, const void* data, std::size_t bytes) {
-  if (i < 0 || i >= numInputs()) throw Error(-1, "BCDL: input index out of range");
+  checkInput(i);
   const std::size_t device_bytes = input_mem_[i].size();
   const std::size_t packed_bytes = inputPackedBytes(i);
 
@@ -200,7 +214,7 @@ void Engine::setInput(int i, const void* data, std::size_t bytes) {
 }
 
 std::size_t Engine::outputPackedBytes(int i) const {
-  if (i < 0 || i >= numOutputs()) throw Error(-1, "BCDL: output index out of range");
+  checkOutput(i);
   const auto& p = outputs_[i].properties;
   std::size_t n = elemSize(p.tensorType);
   for (int d = 0; d < p.validShape.numDimensions; ++d) {
@@ -210,7 +224,7 @@ std::size_t Engine::outputPackedBytes(int i) const {
 }
 
 void Engine::copyOutput(int i, void* dst, std::size_t bytes) const {
-  if (i < 0 || i >= numOutputs()) throw Error(-1, "BCDL: output index out of range");
+  checkOutput(i);
   const std::size_t packed_bytes = outputPackedBytes(i);
   if (bytes != packed_bytes) {
     throw Error(-1, "BCDL: output " + std::to_string(i) + " destination is " +

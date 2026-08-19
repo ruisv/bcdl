@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -212,6 +213,30 @@ std::vector<Mono3dBox> Mono3dDetector::postprocess(int origW, int origH,
   }
   if (nc <= 0 || H <= 0 || W <= 0) {
     throw Error(-1, "BCDL Mono3dDetector: degenerate cls shape");
+  }
+
+  // decodeMono3d reads reg as kRegChannels planes of H*W taken from the CLS
+  // tensor's H and W. A reg head that is smaller, or on a different feature
+  // grid, would walk off the end of the dequant scratch and return
+  // plausible-looking garbage boxes instead of an error, so check it here.
+  constexpr int kRegChannels = 8;  // z, dx, dy, l, h, w, sin, cos
+  int rc_ = 0, rh = 0, rw = 0;
+  if (reg_shape.size() == 4) {
+    rc_ = reg_shape[1];
+    rh = reg_shape[2];
+    rw = reg_shape[3];
+  } else if (reg_shape.size() == 3) {
+    rc_ = reg_shape[0];
+    rh = reg_shape[1];
+    rw = reg_shape[2];
+  } else {
+    throw Error(-1, "BCDL Mono3dDetector: unexpected reg tensor rank");
+  }
+  if (rc_ < kRegChannels || rh != H || rw != W) {
+    throw Error(-1, "BCDL Mono3dDetector: reg head is [" + std::to_string(rc_) + "," +
+                        std::to_string(rh) + "," + std::to_string(rw) +
+                        "], expected at least [" + std::to_string(kRegChannels) + "," +
+                        std::to_string(H) + "," + std::to_string(W) + "] to match cls");
   }
 
   Mono3dConfig eff = cfg_;

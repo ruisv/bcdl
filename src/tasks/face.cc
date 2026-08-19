@@ -13,6 +13,11 @@ namespace bcdl {
 
 namespace {
 
+/// SCRFD regression-head layout, per prediction: 4 box distances and 5 landmark
+/// (x,y) pairs. Both the decoder and the caller's shape check depend on these.
+constexpr int kScrfdBoxCoords = 4;
+constexpr int kScrfdLandmarks = 5;
+
 /// Integer square root, exact-only: returns -1 unless `n` is a perfect square.
 /// Used to recover the grid side from a flattened prediction count, so a wrong
 /// num_anchors (or a non-square export) is caught instead of silently
@@ -76,7 +81,7 @@ std::vector<FaceDetection> decodeScrfd(
       const float cx = static_cast<float>(gx) * stride;
       const float cy = static_cast<float>(gy) * stride;
 
-      const float* b = bbox[s] + static_cast<size_t>(i) * 4;
+      const float* b = bbox[s] + static_cast<size_t>(i) * kScrfdBoxCoords;
       Detection d;
       d.x1 = lb.clampX(lb.invX(cx - b[0] * stride));
       d.y1 = lb.clampY(lb.invY(cy - b[1] * stride));
@@ -85,9 +90,9 @@ std::vector<FaceDetection> decodeScrfd(
       d.score = conf;
       d.class_id = 0;
 
-      const float* k = kps[s] + static_cast<size_t>(i) * 10;
-      std::vector<std::pair<float, float>> pts(5);
-      for (int p = 0; p < 5; ++p) {
+      const float* k = kps[s] + static_cast<size_t>(i) * (kScrfdLandmarks * 2);
+      std::vector<std::pair<float, float>> pts(kScrfdLandmarks);
+      for (int p = 0; p < kScrfdLandmarks; ++p) {
         // Landmarks are NOT clamped: a partly out-of-frame face still yields a
         // usable alignment from the points that are inside, and clamping would
         // drag the off-frame ones onto the border and skew the warp.
@@ -261,18 +266,43 @@ std::vector<FaceDetection> FaceDetector::postprocess(const LetterboxInfo& lb) co
   std::vector<const float*> score(ns), bbox(ns), kps(ns);
   std::vector<int> counts(ns);
 
+  auto elemCount = [](const std::vector<int>& s) {
+    int64_t t = 1;
+    for (int d : s) t *= (d > 0 ? d : 1);
+    return t;
+  };
+
   for (size_t i = 0; i < ns; ++i) {
     std::vector<int> shape;
     // Outputs come in three groups: every score, then every bbox, then every kps.
     score[i] = outputAsFloat(engine_, out_base_ + static_cast<int>(i), scratch[i], shape);
-    int64_t total = 1;
-    for (int d : shape) total *= (d > 0 ? d : 1);
-    counts[i] = static_cast<int>(total);
+    const int64_t n_score = elemCount(shape);
 
     bbox[i] = outputAsFloat(engine_, out_base_ + static_cast<int>(ns + i),
                             scratch[ns + i], shape);
+    const int64_t n_bbox = elemCount(shape);
+
     kps[i] = outputAsFloat(engine_, out_base_ + static_cast<int>(2 * ns + i),
                            scratch[2 * ns + i], shape);
+    const int64_t n_kps = elemCount(shape);
+
+    // The decoder reads bbox[j*4] and kps[j*10] for every j < counts[i], but the
+    // count can only come from the SCORE tensor. Cross-check the two regression
+    // heads against it: a model whose outputs are grouped per-scale instead of
+    // per-type, or that predicts fewer than 5 landmarks, would otherwise over-read
+    // the heap by up to 10x with no error at all.
+    const int64_t need_bbox = n_score * kScrfdBoxCoords;
+    const int64_t need_kps = n_score * kScrfdLandmarks * 2;
+    if (n_bbox < need_bbox || n_kps < need_kps) {
+      throw Error(-1, "BCDL face detect: scale " + std::to_string(i) + " has " +
+                          std::to_string(n_score) + " scores, so bbox needs " +
+                          std::to_string(need_bbox) + " and kps " +
+                          std::to_string(need_kps) + " elements, but they hold " +
+                          std::to_string(n_bbox) + " and " + std::to_string(n_kps) +
+                          "; check output_base and that the model emits all scores, "
+                          "then all bboxes, then all kps");
+    }
+    counts[i] = static_cast<int>(n_score);
   }
   return decodeScrfd(score, bbox, kps, counts, cfg_, lb);
 }

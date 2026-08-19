@@ -78,8 +78,12 @@ class AsyncDetectionPipeline {
   /// then takes a frame, letterboxes it, releases the frame, and commits.
   ///
   ///   int slot = acquireSlot();                    // blocks; -1 once finished
+  ///   if (slot < 0) return;                        // finished: no slot to fill
   ///   auto lb  = letterboxIntoSlot(slot, nv12);    // frame no longer needed after
   ///   commitSlot(slot, lb);                        // hand it to the infer stage
+  ///
+  /// The `slot < 0` check is not optional — the three calls below throw
+  /// `bcdl::Error` on anything that is not a live slot index.
   ///
   /// Every acquireSlot() >= 0 must be paired with exactly one commitSlot() or
   /// releaseSlot().

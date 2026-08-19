@@ -208,9 +208,15 @@ struct AsyncVideoDetectionPipeline::Impl {
   // boundary, and whatever follows the last one is the final AU.
   // Returns false if the pipeline is shutting down.
   bool drainAus(bool final) {
-    // Start-code offsets (3-byte 00 00 01) across the current buffer.
+    // Start-code offsets (3-byte 00 00 01) across the current buffer. The bound
+    // is `< buf.size()`, not `<=`: the loop below reads the NAL header at p + 3,
+    // so a start code flush against the end of the buffer is not yet a usable
+    // boundary. At EOS drainAus(true) walks every entry including the last, and
+    // with `<=` a final chunk ending exactly on a start code read one byte past
+    // the vector. Dropping it loses nothing — while streaming the bytes stay
+    // buffered for the next submit(), and at EOS they fall inside the last AU.
     std::vector<std::size_t> sc;
-    for (std::size_t i = 0; i + 3 <= buf.size(); ++i)
+    for (std::size_t i = 0; i + 3 < buf.size(); ++i)
       if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1) sc.push_back(i);
     if (sc.empty()) {
       if (final) buf.clear();  // no NALs at all: nothing decodable
