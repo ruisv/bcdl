@@ -53,5 +53,39 @@ void allocCustomGridCfg(const std::vector<point_t>& pts, int gw, int gh, int in_
 /// content/pad edge interpolate across clamped nodes). Always >= 1.
 int gridStepFor(std::initializer_list<int> dims_that_must_divide);
 
+/// Scope guard for one frame taken from a vnode's output pool.
+///
+/// The copy-out that follows hbn_vnode_getframe() allocates a VpImage and
+/// flushes its cache, and both of those throw bcdl::Error. The pool holds three
+/// buffers and a frame that is never released is never coming back, so three
+/// such failures leave getframe() blocking for its full timeout forever. Release
+/// on every exit path, not just the happy one.
+class VnodeFrame {
+ public:
+  VnodeFrame(hbn_vnode_handle_t vnode, int chn) : vnode_(vnode), chn_(chn) {}
+  ~VnodeFrame() {
+    if (held_) hbn_vnode_releaseframe(vnode_, chn_, &img_);
+  }
+
+  VnodeFrame(const VnodeFrame&) = delete;
+  VnodeFrame& operator=(const VnodeFrame&) = delete;
+
+  /// hbn_vnode_getframe(), returning its status verbatim so the caller can wrap
+  /// it in its own CHECK macro. Only a successful call arms the release.
+  int32_t acquire(int timeout_ms) {
+    const int32_t rc = hbn_vnode_getframe(vnode_, chn_, timeout_ms, &img_);
+    held_ = (rc == 0);
+    return rc;
+  }
+
+  const hbn_vnode_image_t& operator*() const { return img_; }
+
+ private:
+  hbn_vnode_handle_t vnode_;
+  int chn_;
+  bool held_ = false;
+  hbn_vnode_image_t img_{};
+};
+
 }  // namespace gdcbin
 }  // namespace bcdl

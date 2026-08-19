@@ -218,9 +218,10 @@ LetterboxInfo GdcLetterbox::run(const VpImage& src, VpImage& dst) {
   auto t1 = now();
 
   // GDC hardware transform.
-  hbn_vnode_image_t out{};
   GDC_CHECK(hbn_vnode_sendframe(p_->vnode, 0, &p_->in));
-  GDC_CHECK(hbn_vnode_getframe(p_->vnode, 0, 1000, &out));
+  gdcbin::VnodeFrame frame(p_->vnode, 0);  // releases on every exit path
+  GDC_CHECK(frame.acquire(1000));
+  const hbn_vnode_image_t& out = *frame;
   auto t2 = now();
 
   // dst = out_w x out_h NV12, prefilled with flat pad, then the content window
@@ -247,7 +248,6 @@ LetterboxInfo GdcLetterbox::run(const VpImage& src, VpImage& dst) {
   }
   dst.cleanCache();
 
-  hbn_vnode_releaseframe(p_->vnode, 0, &out);
   if (tm) {
     auto t3 = now();
     std::printf("[gdc] copy-in+flush %.2f  gdc-op(send+get) %.2f  copy-out %.2f  total %.2f ms\n",

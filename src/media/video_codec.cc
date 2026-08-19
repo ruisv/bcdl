@@ -181,10 +181,20 @@ struct VideoEncoder::Impl {
     }
 
     BCDL_CHECK(hb_mm_mc_initialize(&ctx));
-    BCDL_CHECK(hb_mm_mc_configure(&ctx));
-    mc_av_codec_startup_params_t su{};
-    su.video_enc_startup_params.receive_frame_number = 0;  // unbounded
-    BCDL_CHECK(hb_mm_mc_start(&ctx, &su));
+    // initialize() has taken a codec instance. A constructor that throws never
+    // runs ~Impl, so from here on every failure must hand the instance back by
+    // hand — otherwise a rejected config leaks one VPU instance per attempt and
+    // a retry loop exhausts them until reboot.
+    try {
+      BCDL_CHECK(hb_mm_mc_configure(&ctx));
+      mc_av_codec_startup_params_t su{};
+      su.video_enc_startup_params.receive_frame_number = 0;  // unbounded
+      BCDL_CHECK(hb_mm_mc_start(&ctx, &su));
+    } catch (...) {
+      hb_mm_mc_stop(&ctx);  // best-effort; a no-op when start() never succeeded
+      hb_mm_mc_release(&ctx);
+      throw;
+    }
     started = true;
   }
 
@@ -412,9 +422,18 @@ struct VideoDecoder::Impl {
       p->h264_dec_config.skip_mode = 0;
     }
     BCDL_CHECK(hb_mm_mc_initialize(&ctx));
-    BCDL_CHECK(hb_mm_mc_configure(&ctx));
-    mc_av_codec_startup_params_t su{};
-    BCDL_CHECK(hb_mm_mc_start(&ctx, &su));
+    // See the encoder: a throw between initialize() and `started = true` never
+    // reaches ~Impl, so the codec instance has to be released here or it leaks
+    // until reboot.
+    try {
+      BCDL_CHECK(hb_mm_mc_configure(&ctx));
+      mc_av_codec_startup_params_t su{};
+      BCDL_CHECK(hb_mm_mc_start(&ctx, &su));
+    } catch (...) {
+      hb_mm_mc_stop(&ctx);  // best-effort; a no-op when start() never succeeded
+      hb_mm_mc_release(&ctx);
+      throw;
+    }
     started = true;
   }
 

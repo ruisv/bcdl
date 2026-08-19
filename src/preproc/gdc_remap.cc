@@ -175,9 +175,10 @@ void GdcRemap::run(const VpImage& src, VpImage& dst) {
   auto t1 = now();
 
   // GDC hardware transform.
-  hbn_vnode_image_t out{};
   GDC_CHECK(hbn_vnode_sendframe(p_->vnode, 0, &p_->in));
-  GDC_CHECK(hbn_vnode_getframe(p_->vnode, 0, 1000, &out));
+  gdcbin::VnodeFrame frame(p_->vnode, 0);  // releases on every exit path
+  GDC_CHECK(frame.acquire(1000));
+  const hbn_vnode_image_t& out = *frame;
   auto t2 = now();
 
   // Copy the full output frame out of the vnode buffer.
@@ -196,7 +197,6 @@ void GdcRemap::run(const VpImage& src, VpImage& dst) {
     std::memcpy(duv + (size_t)y * dr.uvStride, ouv + (size_t)y * os, out_w_);
   dst.cleanCache();
 
-  hbn_vnode_releaseframe(p_->vnode, 0, &out);
   if (tm) {
     auto t3 = now();
     std::printf("[gdc-remap] copy-in+flush %.2f  gdc-op %.2f  copy-out %.2f  total %.2f ms\n",

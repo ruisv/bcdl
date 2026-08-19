@@ -12,6 +12,23 @@ namespace bcdl {
 
 namespace {
 
+/// Drop stale CPU cache lines over a codec-owned buffer before the CPU reads it.
+///
+/// The JPU (device) wrote these bytes, and the rule in core/sys_mem.h applies
+/// just the same — but the buffer belongs to the Task, not to one of our SysMem
+/// blocks, so SysMem::invalidateCache() cannot reach it. It matters most exactly
+/// where this class is fastest: the Task frees its buffer on release and the
+/// next call gets the same virtual addresses back, so without this the memcpy
+/// below can read the PREVIOUS frame's cache lines on the reused-decoder path.
+void invalidateDeviceRange(uint64_t phy_addr, void* vir_addr, uint64_t bytes) {
+  if (vir_addr == nullptr || bytes == 0) return;
+  hbUCPSysMem mem{};
+  mem.phyAddr = phy_addr;
+  mem.virAddr = vir_addr;
+  mem.memSize = bytes;
+  BCDL_CHECK(hbUCPMemFlush(&mem, HB_SYS_MEM_CACHE_INVALIDATE));
+}
+
 bool isSupportedJpegFormat(hbVPImageFormat f) {
   switch (f) {
     case HB_VP_IMAGE_FORMAT_NV12:
@@ -123,6 +140,7 @@ std::vector<uint8_t> JpegEncoder::encode(const VpImage& src) {
 
   hbVPArray out{};
   BCDL_CHECK(hbVPGetJPEGEncOutputBuffer(&out, task.get()));
+  invalidateDeviceRange(out.phyAddr, out.virAddr, out.size);
 
   std::vector<uint8_t> jpeg;
   if (out.virAddr && out.size > 0) {
@@ -203,6 +221,12 @@ VpImage JpegDecoder::decode(const uint8_t* data, std::size_t size) {
     throw Error(-1, "BCDL: JpegDecoder.decode produced an invalid image");
   }
 
+  // The JPU wrote both planes; drop stale lines before the memcpys read them.
+  invalidateDeviceRange(out.dataPhyAddr, out.dataVirAddr,
+                        static_cast<uint64_t>(out.stride) * out.height);
+  invalidateDeviceRange(out.uvPhyAddr, out.uvVirAddr,
+                        static_cast<uint64_t>(out.uvStride) * (out.height / 2));
+
   // Build an owned NV12 image and copy plane rows, honouring both strides.
   VpImage img(out.width, out.height, HB_VP_IMAGE_FORMAT_NV12);
   const hbVPImage& dst = img.raw();
@@ -232,6 +256,9 @@ VpImage JpegDecoder::decode(const uint8_t* data, std::size_t size) {
     }
   }
 
+  // The CPU just wrote both planes; flush so a device consumer (a VP/GDC
+  // letterbox, or setInput()) reads pixels rather than whatever is in DRAM.
+  img.cleanCache();
   return img;
 }
 
