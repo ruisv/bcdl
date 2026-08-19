@@ -9,9 +9,9 @@ run anywhere — no board, no .hbm model.
 
 The module-level ``ref_*`` functions double as the documented "numpy Python
 path": given a raw model-output tensor + config they produce the same DepthMap /
-SegMask the C++ tasks do. If the C++ bindings later expose ``decodeDepth`` /
-``decodeSeg`` they are exercised opportunistically (guarded import), but the
-core assertions never depend on them.
+SegMask the C++ tasks do, and the last two tests check the shipped
+``decode_depth`` / ``decode_seg`` against them when the compiled module is
+importable. The reference assertions themselves never depend on it.
 """
 
 import numpy as np
@@ -260,12 +260,51 @@ def test_seg_num_classes_override():
 # Opportunistic checks against C++ bindings if exposed. Core tests never       #
 # depend on these.                                                             #
 # --------------------------------------------------------------------------- #
-def test_cpp_bindings_if_available():
-    try:
-        import bcdl  # noqa: F401
-        has = hasattr(bcdl, "decodeDepth") and hasattr(bcdl, "decodeSeg")
-    except Exception:
-        has = False
-    if not has:
-        pytest.skip("bcdl.decodeDepth/decodeSeg bindings not exposed")
-    # If/when bound, a parity check would go here.
+def test_cpp_decoders_match_the_numpy_reference():
+    """The oracles above are only worth having if the shipped decoders agree.
+
+    This used to probe `decodeDepth` / `decodeSeg` — camelCase names that existed
+    solely so this hasattr() would pass — and then skip with a "not exposed"
+    message even though `decode_depth` / `decode_seg` had been bound all along.
+    So it never once compared anything. Probe the real names and do the parity
+    check the placeholder promised.
+    """
+    bcdl = pytest.importorskip("bcdl")
+
+    rng = np.random.default_rng(7)
+
+    # depth: normalize on, with clipping, over a {1,1,H,W} head
+    shape = [1, 1, 6, 8]
+    raw = rng.uniform(-2.0, 12.0, size=int(np.prod(shape))).astype(np.float32)
+    dcfg = bcdl.DepthConfig()
+    dcfg.normalize = True
+    dcfg.clip_lo, dcfg.clip_hi = 0.0, 10.0
+    got = bcdl.decode_depth(raw.reshape(shape), dcfg)
+    want = ref_decode_depth(raw, shape, {"normalize": True, "clip_lo": 0.0, "clip_hi": 10.0})
+    assert (got.width, got.height) == (want["width"], want["height"])
+    assert got.vmin == pytest.approx(want["vmin"], abs=1e-5)
+    assert got.vmax == pytest.approx(want["vmax"], abs=1e-5)
+    np.testing.assert_allclose(np.ravel(got.data), want["data"], atol=1e-5)
+
+    # segmentation: channels-first logits {1,C,H,W} -> argmax ids
+    shape = [1, 4, 5, 7]
+    logits = rng.normal(size=int(np.prod(shape))).astype(np.float32)
+    scfg = bcdl.SegConfig()
+    scfg.channels_first = True
+    got = bcdl.decode_seg(logits.reshape(shape), scfg)
+    want = ref_decode_seg(logits, shape, {"channels_first": True})
+    assert (got.width, got.height) == (want["width"], want["height"])
+    assert got.num_classes == want["num_classes"]
+    np.testing.assert_array_equal(np.ravel(got.labels), want["labels"])
+
+
+def test_the_camelcase_aliases_are_deprecated_but_still_resolve():
+    """Nine decoders carried a second camelCase name in an otherwise snake_case
+    package. They are out of `__all__` and out of the docs now; existing code
+    that imports them still works, and is told what to use instead."""
+    bcdl = pytest.importorskip("bcdl")
+    assert "decodeDepth" not in bcdl.__all__
+    with pytest.warns(DeprecationWarning, match="use bcdl.decode_depth"):
+        assert bcdl.decodeDepth is bcdl.decode_depth
+    with pytest.raises(AttributeError):
+        bcdl.decodeNoSuchThing

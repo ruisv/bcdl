@@ -22,8 +22,8 @@
 - 多媒体：[图像与编解码](#图像与编解码)
 
 > 命名：snake_case 的函数名与 `lower_case` 的配置字段，是 C++ camelCase 成员的
-> Python 写法。少数解码器另有 camelCase 别名（`decodeDepth`、`decodeSeg`），
-> 以便与 C++ 名字对齐。
+> Python 写法，无一例外。曾有九个解码器另带 camelCase 别名；这些名字已废弃，
+> 调用时会给出 `DeprecationWarning`，本手册不再收录。
 
 ## 安装
 
@@ -391,7 +391,7 @@ mask = bcdl.decode_seg(logits.astype(np.float32), cfg)
 - **`SegConfig`** —— `num_classes`、`channels_first`（NCHW vs NHWC）、
   `argmaxed`（模型已经输出 id 时设 `True`）。
 - **`SegMask`** —— `width`、`height`、`num_classes`、`labels`（`(H,W)` int32）。
-- **`decode_seg(output, config) -> SegMask`**（别名 `decodeSeg`）。
+- **`decode_seg(output, config) -> SegMask`**。
 - **`seg_colorize(mask) -> np.ndarray`** —— `(H,W,3)` uint8 固定调色板。
 - **`Segmenter(engine, config=None, output_index=0)`** —— `.segment(model_input, timeout_ms=0)`、
   `.postprocess()`、`.config`。
@@ -440,7 +440,7 @@ boxes = bcdl.LidarDetector3d(head_engine).postprocess()
   **逐位吻合到 8e-06**。
 - **`Det3dConfig`** —— `score_thresh`、`nms_iou`、`max_boxes`、`apply_sigmoid`、`anchors`。
 - **`decode_det3d(cls, box, dir=None, anchors=..., config=...) -> list[Box3D]`**
-  (别名 `decodeDet3d`)。`dir=None` 时每个朝向**只在模 π 意义下正确**。
+  `dir=None` 时每个朝向**只在模 π 意义下正确**。
 - **`bev_iou(a, b)`** · **`nms3d(boxes, iou_thresh, max_boxes)`** ——
   这一族的 NMS 定义在 **BEV 投影**上,不是体积。
 - **`LidarDetector3d(engine, config=None, cls_index=0, box_index=1, dir_index=2)`** ——
@@ -472,7 +472,7 @@ m = bcdl.decode_anomaly(grid.astype(np.float32), cfg)
   `blur_kernel`(奇数,0 关闭)、`blur_sigma`、`threshold`。上采样**和**高斯平滑都是参考实现
   后处理的一部分,不是装饰。
 - **`AnomalyMap`** —— `width`、`height`、`score`、`data`(`(H,W)` float32)。
-- **`decode_anomaly(output, config=AnomalyConfig()) -> AnomalyMap`**(别名 `decodeAnomaly`)。
+- **`decode_anomaly(output, config=AnomalyConfig()) -> AnomalyMap`**。
 - **`anomaly_mask(map, threshold) -> np.ndarray`** —— `(H,W)` uint8 0/255。
 - **`anomaly_preprocess(bgr, in_w, in_h) -> np.ndarray`** —— resize + BGR→RGB + `/255` +
   ImageNet mean/std,输出 `(3,H,W)`。
@@ -501,7 +501,7 @@ epe = bcdl.flow_endpoint_error(flow_a, flow_b)
 - **`FlowConfig`** —— `scale_x`、`scale_y`(模型像素 → 源图像素,`estimate()` 会按传入尺寸自动设)、
   `channels_first`(`[1,2,H,W]` vs `[1,H,W,2]`)。
 - **`FlowField`** —— `width`、`height`、`data`(`(H,W,2)` float32,uv 交错)。
-- **`decode_flow(output, config=FlowConfig()) -> FlowField`**(别名 `decodeFlow`)。
+- **`decode_flow(output, config=FlowConfig()) -> FlowField`**。
 - **`flow_colorize(flow, max_magnitude=0.0) -> np.ndarray`** —— `(H,W,3)` uint8 BGR;
   传 `0` 用该场自身 99 分位幅值归一化,免得一个快速物体把整帧压成灰的。
 - **`flow_endpoint_error(a, b) -> float`** —— 平均端点误差(像素),拿量化版对浮点参考打分就用它。
@@ -561,7 +561,7 @@ bgr = bcdl.seg_colorize(r.bev)                  # BEV 语义图（SegMask）
 - **`DriveConfig`** —— `agent_score_thresh`、`bev`（一个 `SegConfig`）。
 - **`DriveIoConfig`** —— 哪个张量是哪个，默认值对齐现货导出；把某个输出下标设成 `-1` 即跳过该头。
 - **`decode_drive(trajectory=None, agent_states=None, agent_labels=None, bev=None, config=DriveConfig()) -> DriveResult`**
-  （别名 `decodeDrive`）—— numpy 路径，任一头都可以传 `None`。
+  —— numpy 路径，任一头都可以传 `None`。
 - **`DrivePlanner(engine, anchors, config=None, anchor_config=None, io=None)`** ——
   `.plan(camera, lidar, status, timeout_ms=0)`、`.postprocess()`、`.diffusion_input`。
 
@@ -584,7 +584,7 @@ dm = bcdl.decode_depth(out.astype(np.float32), cfg)
 - **`DepthConfig`** —— `width`、`height`、`normalize`（缩放到 [0,1]）、
   `clip_lo`、`clip_hi`。
 - **`DepthMap`** —— `width`、`height`、`vmin`、`vmax`、`data`（`(H,W)` float32）。
-- **`decode_depth(output, config) -> DepthMap`**（别名 `decodeDepth`）。
+- **`decode_depth(output, config) -> DepthMap`**。
 - **`depth_colorize(dm) -> np.ndarray`** · **`depth_to_gray8(dm) -> np.ndarray`**。
 - **`DepthEstimator(engine, config=None, output_index=0)`** —— `.estimate(model_input, timeout_ms=0)`、
   `.postprocess()`、`.config`。

@@ -6,6 +6,8 @@ exchanges raw bytes; this wrapper reshapes outputs into numpy arrays.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 import bcdl_py
@@ -365,11 +367,9 @@ def jpeg_decode(data) -> "VpImage":
 # --- depth + segmentation post-processing ----------------------------------
 # decode_depth/decode_seg are the "numpy Python path" (mirror of the native
 # DepthEstimator/Segmenter): pass a float32 engine output, get a DepthMap/SegMask.
-# camelCase aliases match the C++ names the tests probe for.
 DepthConfig = bcdl_py.DepthConfig
 DepthMap = bcdl_py.DepthMap
 decode_depth = bcdl_py.decode_depth
-decodeDepth = bcdl_py.decode_depth
 depth_colorize = bcdl_py.depth_colorize
 depth_to_gray8 = bcdl_py.depth_to_gray8
 
@@ -381,18 +381,14 @@ DepthRefineConfig = bcdl_py.DepthRefineConfig
 RefinedDepth = bcdl_py.RefinedDepth
 Intrinsics = bcdl_py.Intrinsics
 scale_intrinsics = bcdl_py.scale_intrinsics
-scaleIntrinsics = bcdl_py.scale_intrinsics
 preprocess_refine_image = bcdl_py.preprocess_refine_image
 preprocess_refine_depth = bcdl_py.preprocess_refine_depth
 decode_refined_depth = bcdl_py.decode_refined_depth
-decodeRefinedDepth = bcdl_py.decode_refined_depth
 depth_to_pointcloud = bcdl_py.depth_to_pointcloud
-depthToPointCloud = bcdl_py.depth_to_pointcloud
 
 SegConfig = bcdl_py.SegConfig
 SegMask = bcdl_py.SegMask
 decode_seg = bcdl_py.decode_seg
-decodeSeg = bcdl_py.decode_seg
 seg_colorize = bcdl_py.seg_colorize
 
 # Lidar: pillar encoding and 3-D detection. The pipeline is deliberately several
@@ -418,7 +414,6 @@ Anchor3dConfig = bcdl_py.Anchor3dConfig
 Det3dConfig = bcdl_py.Det3dConfig
 generate_anchors_3d = bcdl_py.generate_anchors_3d
 decode_det3d = bcdl_py.decode_det3d
-decodeDet3d = bcdl_py.decode_det3d
 bev_iou = bcdl_py.bev_iou
 nms3d = bcdl_py.nms3d
 
@@ -428,7 +423,6 @@ nms3d = bcdl_py.nms3d
 AnomalyConfig = bcdl_py.AnomalyConfig
 AnomalyMap = bcdl_py.AnomalyMap
 decode_anomaly = bcdl_py.decode_anomaly
-decodeAnomaly = bcdl_py.decode_anomaly
 anomaly_mask = bcdl_py.anomaly_mask
 anomaly_preprocess = bcdl_py.anomaly_preprocess
 
@@ -439,7 +433,6 @@ anomaly_preprocess = bcdl_py.anomaly_preprocess
 FlowConfig = bcdl_py.FlowConfig
 FlowField = bcdl_py.FlowField
 decode_flow = bcdl_py.decode_flow
-decodeFlow = bcdl_py.decode_flow
 flow_colorize = bcdl_py.flow_colorize
 flow_endpoint_error = bcdl_py.flow_endpoint_error
 flow_preprocess = bcdl_py.flow_preprocess
@@ -462,7 +455,6 @@ DriveIoConfig = bcdl_py.DriveIoConfig
 drive_status_vector = bcdl_py.drive_status_vector
 drive_anchor_noise = bcdl_py.drive_anchor_noise
 decode_drive = bcdl_py.decode_drive
-decodeDrive = bcdl_py.decode_drive
 
 
 class DepthEstimator:
@@ -1644,7 +1636,6 @@ __all__ = [
     "DepthMap",
     "DepthEstimator",
     "decode_depth",
-    "decodeDepth",
     "depth_colorize",
     "depth_to_gray8",
     # depth refinement (RGB-D)
@@ -1653,19 +1644,15 @@ __all__ = [
     "DepthRefiner",
     "Intrinsics",
     "scale_intrinsics",
-    "scaleIntrinsics",
     "preprocess_refine_image",
     "preprocess_refine_depth",
     "decode_refined_depth",
-    "decodeRefinedDepth",
     "depth_to_pointcloud",
-    "depthToPointCloud",
     # segmentation
     "SegConfig",
     "SegMask",
     "Segmenter",
     "decode_seg",
-    "decodeSeg",
     "seg_colorize",
     # stereo
     "StereoFit",
@@ -1751,7 +1738,6 @@ __all__ = [
     "Det3dConfig",
     "generate_anchors_3d",
     "decode_det3d",
-    "decodeDet3d",
     "bev_iou",
     "nms3d",
     "LidarDetector3d",
@@ -1759,7 +1745,6 @@ __all__ = [
     "AnomalyConfig",
     "AnomalyMap",
     "decode_anomaly",
-    "decodeAnomaly",
     "anomaly_mask",
     "anomaly_preprocess",
     "AnomalyDetector",
@@ -1767,7 +1752,6 @@ __all__ = [
     "FlowConfig",
     "FlowField",
     "decode_flow",
-    "decodeFlow",
     "flow_colorize",
     "flow_endpoint_error",
     "flow_preprocess",
@@ -1787,6 +1771,41 @@ __all__ = [
     "drive_status_vector",
     "drive_anchor_noise",
     "decode_drive",
-    "decodeDrive",
     "DrivePlanner",
 ]
+
+
+# --- deprecated camelCase aliases -------------------------------------------
+# Nine decoders once carried a second, camelCase name mirroring their C++
+# spelling, in a package that is otherwise strictly snake_case. They covered 9 of
+# ~40 comparable decode_* functions, so they read as a distinction rather than a
+# convention, and every reader had to work out that the two names were one
+# function. They resolve here instead of in the namespace: still importable, no
+# longer part of the documented surface, and they say what to use instead.
+_DEPRECATED_ALIASES = {
+    "decodeDepth": "decode_depth",
+    "decodeSeg": "decode_seg",
+    "decodeDet3d": "decode_det3d",
+    "decodeAnomaly": "decode_anomaly",
+    "decodeFlow": "decode_flow",
+    "decodeDrive": "decode_drive",
+    "decodeRefinedDepth": "decode_refined_depth",
+    "depthToPointCloud": "depth_to_pointcloud",
+    "scaleIntrinsics": "scale_intrinsics",
+}
+
+
+def __getattr__(name):  # PEP 562
+    target = _DEPRECATED_ALIASES.get(name)
+    if target is None:
+        raise AttributeError("module %r has no attribute %r" % (__name__, name))
+    warnings.warn(
+        "bcdl.%s is deprecated; use bcdl.%s (this package is snake_case)" % (name, target),
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return globals()[target]
+
+
+def __dir__():
+    return sorted(list(globals()) + list(_DEPRECATED_ALIASES))

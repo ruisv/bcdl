@@ -23,8 +23,9 @@ under [`include/bcdl/`](../include/bcdl/) are the source of truth); the names ma
 - Media: [Images & codecs](#images--codecs)
 
 > Naming: snake_case functions and `lower_case` config fields are the Python
-> spelling of the C++ camelCase members. A few decoders also have a camelCase
-> alias (`decodeDepth`, `decodeSeg`) for parity with the C++ names.
+> spelling of the C++ camelCase members — without exception. Nine decoders used
+> to carry a camelCase alias as well; those names are deprecated, resolve with a
+> `DeprecationWarning`, and are no longer part of this reference.
 
 ## Install
 
@@ -406,7 +407,7 @@ mask = bcdl.decode_seg(logits.astype(np.float32), cfg)
 - **`SegConfig`** — `num_classes`, `channels_first` (NCHW vs NHWC),
   `argmaxed` (set `True` if the model already emits ids).
 - **`SegMask`** — `width`, `height`, `num_classes`, `labels` (`(H,W)` int32).
-- **`decode_seg(output, config) -> SegMask`** (alias `decodeSeg`).
+- **`decode_seg(output, config) -> SegMask`**.
 - **`seg_colorize(mask) -> np.ndarray`** — `(H,W,3)` uint8 fixed palette.
 - **`Segmenter(engine, config=None, output_index=0)`** — `.segment(model_input, timeout_ms=0)`,
   `.postprocess()`, `.config`.
@@ -463,7 +464,7 @@ backbone call. See `docs/MODELS.md` for both chains and how to get them.
 - **`Det3dConfig`** — `score_thresh`, `nms_iou`, `max_boxes`, `apply_sigmoid`,
   `anchors`.
 - **`decode_det3d(cls, box, dir=None, anchors=..., config=...) -> list[Box3D]`**
-  (alias `decodeDet3d`). Passing `dir=None` leaves every heading correct only
+  Passing `dir=None` leaves every heading correct only
   modulo pi.
 - **`bev_iou(a, b)`** · **`nms3d(boxes, iou_thresh, max_boxes)`** — the metric
   this family's NMS is defined on is the BEV footprint, not the volume.
@@ -501,8 +502,7 @@ its worst patch, and a mean would let one large clean region hide a small defect
   disables), `blur_sigma`, `threshold`. The upsample **and** the Gaussian smoothing
   are part of the reference post-processing, not decoration.
 - **`AnomalyMap`** — `width`, `height`, `score`, `data` (`(H,W)` float32).
-- **`decode_anomaly(output, config=AnomalyConfig()) -> AnomalyMap`** (alias
-  `decodeAnomaly`).
+- **`decode_anomaly(output, config=AnomalyConfig()) -> AnomalyMap`**.
 - **`anomaly_mask(map, threshold) -> np.ndarray`** — `(H,W)` uint8 0/255.
 - **`anomaly_preprocess(bgr, in_w, in_h) -> np.ndarray`** — resize + BGR→RGB +
   `/255` + ImageNet mean/std into `(3,H,W)`.
@@ -534,7 +534,7 @@ or pre-normalised pixels returns a plausible field rather than an error.
   `estimate()` sets them from the sizes it was given), `channels_first`
   (`[1,2,H,W]` vs `[1,H,W,2]`).
 - **`FlowField`** — `width`, `height`, `data` (`(H,W,2)` float32 interleaved).
-- **`decode_flow(output, config=FlowConfig()) -> FlowField`** (alias `decodeFlow`).
+- **`decode_flow(output, config=FlowConfig()) -> FlowField`**.
 - **`flow_colorize(flow, max_magnitude=0.0) -> np.ndarray`** — `(H,W,3)` uint8
   BGR; `0` normalises by the field's own 99th-percentile magnitude so one fast
   object cannot flatten the rest of the frame.
@@ -606,7 +606,7 @@ smooth-looking plan.
 - **`DriveIoConfig`** — which Engine tensor is which; defaults match the stock
   export. Set an output index to `-1` to skip that head.
 - **`decode_drive(trajectory=None, agent_states=None, agent_labels=None, bev=None, config=DriveConfig()) -> DriveResult`**
-  (alias `decodeDrive`) — the numpy path; any head may be `None`.
+  — the numpy path; any head may be `None`.
 - **`DrivePlanner(engine, anchors, config=None, anchor_config=None, io=None)`** —
   `.plan(camera, lidar, status, timeout_ms=0)`, `.postprocess()`,
   `.diffusion_input`.
@@ -630,7 +630,7 @@ dm = bcdl.decode_depth(out.astype(np.float32), cfg)
 - **`DepthConfig`** — `width`, `height`, `normalize` (scale to [0,1]),
   `clip_lo`, `clip_hi`.
 - **`DepthMap`** — `width`, `height`, `vmin`, `vmax`, `data` (`(H,W)` float32).
-- **`decode_depth(output, config) -> DepthMap`** (alias `decodeDepth`).
+- **`decode_depth(output, config) -> DepthMap`**.
 - **`depth_colorize(dm) -> np.ndarray`** · **`depth_to_gray8(dm) -> np.ndarray`**.
 - **`DepthEstimator(engine, config=None, output_index=0)`** — `.estimate(model_input, timeout_ms=0)`,
   `.postprocess()`, `.config`.
