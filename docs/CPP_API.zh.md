@@ -200,6 +200,13 @@ bcdl::LetterboxInfo lb = bcdl::letterboxToNv12Cpu(nv12, src, /*padValue=*/114);
 **hbVP 路径**（`bcdl/preproc/letterbox.h`，需要 DSP）：`letterbox(dst, src,
 padValue, interp)`、`cvtColor(dst, src)`、`resizeExact(dst, src, interp)`。
 
+> 这三个**未经验证——请优先用上面的 CPU 路径或 GDC 路径**。它们跑在 vDSP 上，
+> 而 S100P 4.0.5 系统镜像上 vDSP 并未上线：`/dev/vdsp0` 存在，但即使以 root 运行
+> 内核也报 OFFLINE，且 `/lib/firmware` 里没有 DSP 固件，所以这些调用会抛
+> `bcdl::Error` 而不是真正执行。特别是 `letterbox()` 的仿射约定（正向 src→dst
+> 矩阵、`isInverse=0`）只是照 SDK 头文件写的，从未见它真的出过一帧。若在某块
+> DSP 能起来的板子上使用，请先检查首帧有没有镜像或缩放错误再信任它。
+
 **GDC 硬件路径**（`bcdl/preproc/gdc_letterbox.h`、`gdc_remap.h`；仅在带
 `BCDL_HAVE_GDC` 构建时可用）—— VPS GDC 引擎上的固定变换，NV12 进 / NV12 出，
 算子执行期间 CPU 空闲。语义与逆向出来的 CUSTOM 网格笔记见

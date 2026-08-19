@@ -203,6 +203,15 @@ verify against your model's calibrated range.
 **hbVP path** (`bcdl/preproc/letterbox.h`, DSP required): `letterbox(dst, src,
 padValue, interp)`, `cvtColor(dst, src)`, `resizeExact(dst, src, interp)`.
 
+> These three are **unverified — prefer the CPU or GDC path above.** They run on
+> the vDSP, and the vDSP is not online on the S100P 4.0.5 image: `/dev/vdsp0`
+> exists but the core reports OFFLINE even as root, and no DSP firmware ships in
+> `/lib/firmware`, so the calls throw `bcdl::Error` instead of executing. In
+> particular `letterbox()`'s affine convention (forward src→dst matrix,
+> `isInverse=0`) follows the SDK header but has never been observed producing a
+> frame. On a board where the DSP does come up, check the first output for
+> mirroring or a wrong scale before trusting it.
+
 **GDC hardware path** (`bcdl/preproc/gdc_letterbox.h`, `gdc_remap.h`; only
 when built with `BCDL_HAVE_GDC`) — fixed transforms on the VPS GDC engine,
 NV12 in/out, CPU idle during the op. Semantics + reverse-engineered

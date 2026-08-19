@@ -39,10 +39,13 @@ LetterboxInfo letterbox(VpImage& dst, const VpImage& src, uint8_t padValue,
   //   [ scale  0     padX ]
   //   [ 0      scale  padY ]
   // isInverse=0 declares this as the forward (src->dst) matrix; the VP unit
-  // inverts it internally to sample dst from src.
-  // NOTE: verify the isInverse convention on-board — if output is mirrored /
-  // wrongly scaled, the VP expects the inverse (dst->src) matrix here instead
-  // (set isInverse=1, or supply [1/scale,0,-padX/scale; 0,1/scale,-padY/scale]).
+  // inverts it internally to sample dst from src. This follows the SDK header
+  // and has NOT been observed running: the vDSP is offline on the S100P 4.0.5
+  // image (see the caveat on letterbox() in the header), so hbVPWarpAffine
+  // throws here before it can produce a frame to check. If it ever does run and
+  // the output is mirrored / wrongly scaled, the VP wants the inverse (dst->src)
+  // matrix instead: set isInverse=1, or supply
+  // [1/scale,0,-padX/scale; 0,1/scale,-padY/scale].
   hbVPAffineParam param{};
   param.transformMatrix[0] = lb.scale;
   param.transformMatrix[1] = 0.0f;
