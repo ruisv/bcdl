@@ -221,12 +221,25 @@ inline float boxIoU(const Box& a, const Box& b) {
   return iou(da, db);
 }
 
+// Smallest box side a tracklet may carry. The Kalman state is [cx, cy, w/h, h],
+// so a zero-height box makes the aspect term infinite and tlwh() then computes
+// w = inf * 0 = NaN. Detectors do produce zero-side boxes: decodeDet clamps a
+// box lying entirely above the frame to y1 == y2 == 0, and makeStrack passes
+// that straight through. The NaN box then reaches shapeSimilarity(), which has
+// no NaN guard, so a whole row of the assignment cost goes NaN and the solver
+// indexes p[-1] — a heap overflow ASAN catches on an otherwise ordinary
+// update(). Clamp at the source. Sub-pixel, so it costs real boxes nothing; a
+// clamped box still has ~zero area and simply ages out.
+constexpr double kMinBoxSide = 1e-3;
+
+inline double clampBoxSide(double v) { return v > kMinBoxSide ? v : kMinBoxSide; }
+
 class STrack {
  public:
   // A detection turned into a (not-yet-activated) tracklet candidate.
   STrack(float tlwh_x, float tlwh_y, float tlwh_w, float tlwh_h, float score,
          int class_id, std::vector<float> feat = {})
-      : tlwh_init_{tlwh_x, tlwh_y, tlwh_w, tlwh_h},
+      : tlwh_init_{tlwh_x, tlwh_y, clampBoxSide(tlwh_w), clampBoxSide(tlwh_h)},
         score_(score),
         class_id_(class_id),
         curr_feat_(std::move(feat)) {
@@ -251,9 +264,12 @@ class STrack {
                static_cast<float>(t[0] + t[2]), static_cast<float>(t[1] + t[3])};
   }
 
-  // tlwh -> xyah (center x, center y, aspect = w/h, height).
+  // tlwh -> xyah (center x, center y, aspect = w/h, height). The height is
+  // clamped away from zero on BOTH the divisor and the measurement it feeds, so
+  // the state never carries an infinite aspect (see kMinBoxSide).
   static std::array<double, 4> tlwhToXyah(const std::array<double, 4>& t) {
-    return {t[0] + t[2] / 2.0, t[1] + t[3] / 2.0, t[2] / t[3], t[3]};
+    const double h = clampBoxSide(t[3]);
+    return {t[0] + t[2] / 2.0, t[1] + h / 2.0, clampBoxSide(t[2]) / h, h};
   }
   std::array<double, 4> toXyah() const { return tlwhToXyah(tlwh()); }
 
@@ -359,6 +375,9 @@ class STrack {
       const double d = meas[i] - mean_[i];
       acc += d * d / var;
     }
+    // A non-finite state would otherwise leak NaN into the similarity softmax
+    // and from there into a whole column of the assignment cost.
+    if (!std::isfinite(acc)) return std::numeric_limits<double>::max();
     return acc;
   }
 
@@ -538,13 +557,13 @@ std::vector<double> mahalanobisSimilarity(const std::vector<double>& dist, int R
     double sum = 0.0;
     for (int i = 0; i < R; ++i) {
       const double d = dist[i * C + j];
-      if (d > kMahalanobisLimit) continue;
+      if (!(d <= kMahalanobisLimit)) continue;  // NaN-safe: also skips non-finite
       sum += std::exp(kMahalanobisLimit - d);
     }
     if (sum <= 0.0) continue;
     for (int i = 0; i < R; ++i) {
       const double d = dist[i * C + j];
-      if (d > kMahalanobisLimit) continue;
+      if (!(d <= kMahalanobisLimit)) continue;  // NaN-safe: also skips non-finite
       sim[i * C + j] = std::exp(kMahalanobisLimit - d) / sum;
     }
   }
@@ -595,6 +614,17 @@ Assignment linearAssignment(const std::vector<double>& cost, int R, int C,
       int j1 = -1;
       for (int j = 1; j <= n; ++j) {
         if (used[j]) continue;
+        // First free column, kept as a fallback target. With finite costs one of
+        // the comparisons below always fires, but a non-finite cost makes BOTH
+        // false for every j — and then j1 stayed -1, so `j0 = j1` below read
+        // p[-1] and the next iteration wrote used[-1]. Not hypothetical:
+        // ASAN reports a heap-buffer-overflow READ here from a plain
+        // ByteTracker::update() fed a zero-height detection box with the
+        // BoostTrack cost paths on (shapeSimilarity() has no NaN guard and
+        // mahalanobisSq() returns NaN from a non-finite state). The clamp at
+        // kMinBoxSide removes that source; this makes the solver safe whatever
+        // it is handed.
+        if (j1 < 0) j1 = j;
         const double cur = a[i0][j] - u[i0] - v[j];
         if (cur < minv[j]) {
           minv[j] = cur;
@@ -605,6 +635,13 @@ Assignment linearAssignment(const std::vector<double>& cost, int R, int C,
           j1 = j;
         }
       }
+      // Only reachable if every column is already used, which cannot happen
+      // while row i is unmatched — bail rather than index with -1.
+      if (j1 < 0) break;
+      // No finite candidate (all-NaN row): a zero potential shift keeps u/v
+      // finite so later rows still solve normally. The pair is dropped anyway —
+      // the gate below rejects NaN costs.
+      if (!(delta < INF)) delta = 0.0;
       for (int j = 0; j <= n; ++j) {
         if (used[j]) {
           u[p[j]] += delta;
