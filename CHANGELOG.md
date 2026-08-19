@@ -12,6 +12,96 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.5] — 2026-08
+
+### Fixed
+- **A zero-height detection box overflowed the tracker's assignment solver.**
+  A box lying entirely above the frame clamps to `y1 == y2 == 0`, and the
+  Kalman state is `[cx, cy, w/h, h]` — so `h == 0` made the aspect term
+  infinite and the box came back out as NaN. The shape-similarity term has no
+  NaN guard, so a whole row of the assignment cost went NaN; in the Hungarian
+  solver every comparison against NaN is false, the target column index stayed
+  at its `-1` initialiser, and the code read `p[-1]` and wrote `used[-1]`.
+  AddressSanitizer reports it as a heap-buffer-overflow from an ordinary
+  `update()` call. Box sides are now clamped to a sub-pixel floor where the
+  state is built, and the solver stays in bounds whatever it is handed. Beyond
+  the overflow this restores association: on the same input the tracker
+  recovers four tracks where the NaN cost row had collapsed it to one.
+
+- **Ten `Engine` accessors indexed their tensor vectors without a range
+  check**, beside five that did. All ten are re-exported to Python, where
+  `engine.output_bytes(99)` built a bytes object over a garbage pointer and
+  segfaulted the interpreter. Three task heads also passed a caller-supplied
+  index through before validating it.
+
+- **SCRFD face decoding trusted one tensor's shape for three.** The per-scale
+  prediction count came from the score head, and the two regression heads were
+  then indexed at four and ten floats per prediction without ever being
+  measured. A model grouped per-scale rather than per-type, or with fewer than
+  five landmarks, over-read the heap by up to ten times with no error. The
+  monocular 3-D detector had the same shape: it fetched the regression tensor's
+  shape and never used it, sizing eight channel planes from the *classification*
+  tensor instead and returning plausible-looking garbage boxes.
+
+- **Three copies of the tensor element reader had missed a bounds fix.** Depth,
+  refined depth and segmentation each carried a copy-pasted `readElement`
+  predating the clamp that the shared reader added, so a per-channel-quantised
+  output read past the SDK's scale array. All three now call the shared
+  `outputAsFloat()`, which also takes its zero-copy path for a packed F32 head.
+
+- **A failed codec constructor leaked a VPU instance.** `hb_mm_mc_initialize`
+  had already taken one when a rejected configuration threw, and a constructor
+  that throws never runs its destructor — a retry loop exhausts all 32 and they
+  do not come back before a reboot. The GDC paths leaked an output frame the
+  same way when the copy-out threw: three of those and the next frame request
+  blocks for its full timeout forever.
+
+- **The JPU's output was copied out with no cache invalidate**, against the
+  rule this project states in `core/sys_mem.h` and honours elsewhere. The
+  codec-owned buffer is reallocated per call, so the same addresses return with
+  the previous frame's cache lines still valid — an intermittent stale-pixel
+  read on exactly the reused-decoder path that class exists to make fast.
+
+- **The umbrella header re-exported 27 of 46 public headers.** The C++ API
+  reference says including `bcdl/bcdl.h` is enough; for `TrackingPipeline`,
+  `outputAsFloat`, `AnomalyDetector` and sixteen more it was not, and the
+  examples had quietly worked around it by including sub-headers directly. A
+  test now compares the umbrella against the install tree in both directions.
+
+- **A truncated video chunk read one byte past the buffer.** The Annex-B
+  start-code scan accepted an offset with no NAL header byte after it, which
+  `finish()` then dereferenced. The async pipeline's documented three-step slot
+  protocol also showed `acquireSlot()` feeding straight into
+  `letterboxIntoSlot()` with no check between them, one line below the sentence
+  saying `acquireSlot` returns `-1` once finished; the calls now validate.
+
+### Changed
+- **Python releases the GIL around every blocking call.** `Engine.infer` held
+  it for the full inference — 116 ms for the depth model, 271 ms for the
+  monocular 3-D one — as did the JPU and VPU codecs, the GDC letterbox, the
+  depth refiner, and the stereo and tracking pipelines. A camera-reader or HTTP
+  thread stopped dead for the duration of every frame. Measured on the board
+  with a helper thread ticking every 0.5 ms across ten depth inferences
+  (1046 ms): 10 ticks before, 1851 after, against 1871 if the interpreter were
+  entirely free.
+
+- **The nine camelCase decoder aliases are deprecated.** `decodeDepth`,
+  `decodeSeg`, `decodeDet3d`, `decodeAnomaly`, `decodeFlow`, `decodeDrive`,
+  `decodeRefinedDepth`, `depthToPointCloud` and `scaleIntrinsics` covered nine
+  of roughly forty comparable `decode_*` functions in a package that is
+  otherwise strictly snake_case, so they read as a distinction rather than a
+  convention. They still resolve and now warn with the name to use instead;
+  what goes away is the doubled surface, out of `__all__` and out of the API
+  reference.
+
+- **The hbVP preprocessing path is documented as unverified.** `letterbox()`,
+  `cvtColor()` and `resizeExact()` run on the vDSP, and the vDSP is not online
+  on this software release: the device node exists but the core reports OFFLINE
+  even as root, and no DSP firmware is installed, so the calls throw rather
+  than execute. The affine convention has therefore never been observed
+  producing a frame. The header and both API references now say so and name the
+  two measured alternatives — the CPU letterbox and the GDC engine.
+
 ## [0.7.4] — 2026-08
 
 ### Changed
