@@ -3,10 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <string>
 
 #include "bcdl/backend/engine.h"
+#include "bcdl/backend/output_reader.h"
 #include "bcdl/core/status.h"
 #include "hobot/dnn/hb_dnn.h"
 
@@ -16,120 +16,6 @@ namespace {
 
 constexpr float kImageMean[3] = {0.485f, 0.456f, 0.406f};  // RGB order
 constexpr float kImageStd[3] = {0.229f, 0.224f, 0.225f};
-
-/// IEEE-754 binary16 -> binary32. hbDNN F16 outputs are little-endian uint16.
-inline float half2float(uint16_t h) {
-  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
-  const uint32_t exp = (h >> 10) & 0x1Fu;
-  const uint32_t mant = h & 0x3FFu;
-  uint32_t bits;
-  if (exp == 0) {
-    if (mant == 0) {
-      bits = sign;
-    } else {
-      int e = -1;
-      uint32_t m = mant;
-      do {
-        m <<= 1;
-        ++e;
-      } while ((m & 0x400u) == 0);
-      m &= 0x3FFu;
-      const uint32_t fexp = static_cast<uint32_t>(127 - 15 - e);
-      bits = sign | (fexp << 23) | (m << 13);
-    }
-  } else if (exp == 0x1Fu) {
-    bits = sign | 0x7F800000u | (mant << 13);
-  } else {
-    const uint32_t fexp = exp - 15 + 127;
-    bits = sign | (fexp << 23) | (mant << 13);
-  }
-  float f;
-  std::memcpy(&f, &bits, sizeof(f));
-  return f;
-}
-
-/// Read element `linear` (logical row-major flat index over validShape) from a
-/// raw device buffer, honoring byte strides and dequantizing per the tensor's
-/// quant params. Mirrors the depth / detection task helpers.
-float readElement(const uint8_t* base, int tensor_type, const hbDNNQuantiScale& q,
-                  hbDNNQuantiType quanti, int quant_axis, int num_dims,
-                  const int32_t* dims, const int64_t* strides, int64_t linear) {
-  int64_t byte_off = 0;
-  int64_t rem = linear;
-  int axis_coord = 0;
-  for (int d = num_dims - 1; d >= 0; --d) {
-    const int64_t coord = dims[d] > 0 ? (rem % dims[d]) : 0;
-    rem = dims[d] > 0 ? (rem / dims[d]) : rem;
-    byte_off += coord * strides[d];
-    if (d == quant_axis) axis_coord = static_cast<int>(coord);
-  }
-  const uint8_t* p = base + byte_off;
-
-  double raw;
-  switch (tensor_type) {
-    case HB_DNN_TENSOR_TYPE_F32: {
-      float v;
-      std::memcpy(&v, p, sizeof(v));
-      return v;
-    }
-    case HB_DNN_TENSOR_TYPE_F16: {
-      uint16_t v;
-      std::memcpy(&v, p, sizeof(v));
-      return half2float(v);
-    }
-    case HB_DNN_TENSOR_TYPE_S8: {
-      int8_t v;
-      std::memcpy(&v, p, sizeof(v));
-      raw = v;
-      break;
-    }
-    case HB_DNN_TENSOR_TYPE_U8: {
-      uint8_t v;
-      std::memcpy(&v, p, sizeof(v));
-      raw = v;
-      break;
-    }
-    case HB_DNN_TENSOR_TYPE_S16: {
-      int16_t v;
-      std::memcpy(&v, p, sizeof(v));
-      raw = v;
-      break;
-    }
-    case HB_DNN_TENSOR_TYPE_U16: {
-      uint16_t v;
-      std::memcpy(&v, p, sizeof(v));
-      raw = v;
-      break;
-    }
-    case HB_DNN_TENSOR_TYPE_S32: {
-      int32_t v;
-      std::memcpy(&v, p, sizeof(v));
-      raw = v;
-      break;
-    }
-    case HB_DNN_TENSOR_TYPE_U32: {
-      uint32_t v;
-      std::memcpy(&v, p, sizeof(v));
-      raw = v;
-      break;
-    }
-    default:
-      throw Error(-1, "BCDL depth_refine: unsupported output tensor type " +
-                          std::to_string(tensor_type));
-  }
-
-  if (quanti != SCALE || q.scaleLen <= 0 || q.scaleData == nullptr) {
-    return static_cast<float>(raw);
-  }
-  const int si = q.scaleLen == 1 ? 0 : axis_coord;
-  double scaled = raw;
-  if (q.zeroPointLen > 0 && q.zeroPointData != nullptr) {
-    const int zi = q.zeroPointLen == 1 ? 0 : axis_coord;
-    scaled -= q.zeroPointData[zi];
-  }
-  scaled *= q.scaleData[si];
-  return static_cast<float>(scaled);
-}
 
 /// One output sample's contribution window along an axis: source range plus the
 /// per-source-pixel weights, exactly cv::resize(INTER_AREA)'s table.
@@ -402,24 +288,27 @@ RefinedDepth DepthRefiner::postprocess() const {
   if (H <= 0 || W <= 0) throw Error(-1, "BCDL depth_refine: cannot resolve output HxW");
 
   const int64_t n = static_cast<int64_t>(H) * W;
-  auto read_output = [&](int idx, std::vector<float>& into) {
-    const hbDNNTensorProperties& props = engine_.outputProperties(idx);
-    const auto* base = static_cast<const uint8_t*>(engine_.outputData(idx));
-    into.resize(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; ++i) {
-      into[static_cast<size_t>(i)] =
-          readElement(base, props.tensorType, props.scale, props.quantiType,
-                      props.quantizeAxis, props.validShape.numDimensions,
-                      props.validShape.dimensionSize, props.stride, i);
+  // Shared reader: handles stride padding and per-channel dequant (with the
+  // scale-array bounds clamp), and takes the zero-copy path for packed F32.
+  // It may return a pointer into the device buffer, so keep the scratch alive
+  // for as long as the pointer is used.
+  auto read_output = [&](int idx, std::vector<float>& scratch) -> const float* {
+    std::vector<int> out_shape;
+    const float* p = outputAsFloat(engine_, idx, scratch, out_shape);
+    int64_t total = 1;
+    for (int d : out_shape) total *= (d > 0 ? d : 1);
+    if (total < n) {
+      throw Error(-1, "BCDL depth_refine: output " + std::to_string(idx) +
+                          " holds fewer than HxW elements");
     }
+    return p;
   };
 
-  std::vector<float> depth;
-  read_output(depth_out_, depth);
-  std::vector<float> mask;
-  if (mask_out_ >= 0) read_output(mask_out_, mask);
+  std::vector<float> depth_scratch, mask_scratch;
+  const float* depth = read_output(depth_out_, depth_scratch);
+  const float* mask = mask_out_ >= 0 ? read_output(mask_out_, mask_scratch) : nullptr;
 
-  return decodeRefinedDepth(depth.data(), mask_out_ >= 0 ? mask.data() : nullptr, H, W, cfg_);
+  return decodeRefinedDepth(depth, mask, H, W, cfg_);
 }
 
 }  // namespace bcdl
