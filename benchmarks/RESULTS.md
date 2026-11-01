@@ -12,7 +12,7 @@ RDK S100P (BPU) · sw_version=4.0.5-Beta. Models: official YOLO26n **nash-m** fr
 | obb | `yolo26n_obb_nashm_640x640_nv12.hbm` | 640x640 | 9 | 1.16 | 861 | 1.71 | 586 | 5.79 | 47.6 | 31 rotated box(es) |
 | semseg | `deeplabv3plus_dilation1248_1024x2048_nv12.hbm` | 2048x1024 | 1 | 46.87 | 21 | 55.98 | 18 | 39.1 | 28.2 | 2048x1024 seg, 16 classes |
 | depth | `depth_any.hbm` | 686x518 | 1 | 104.53 | 10 | 109.06 | 9 | 121.82 | 18.5 | 686x518 depth [0.58,17.96] |
-| stereo | `las2_m_crop_nashm.hbm` | 640x480 | 1 | 13.85 | 72 | 21.44 | 47 | 40.7 | 17.6 | disp [44.4,129.0] mean 93.4px; 85% valid |
+| stereo | `las2_m_crop2_nashm.hbm` | 640x480 | 1 | 13.92 | 72 | 17.53 | 57 | 40.2 | 17.6 | disp [44.7,128.8] mean 93.4px; 85% valid |
 | ocr | `ppocrv6_medium_det_960x960.hbm` | 960x960 | 1 | 8.69 | 115 | 92.53 | 11 | 23.48 | 25.5 | 16 lines; e.g. 发足够的滋养 |
 | yoloe_det | `yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm` | 640x640 | 6 | 1.93 | 519 | 2.77 | 361 | 17.07 | 12.4 | 6 box(es) |
 | yoloe_seg | `yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm` | 640x640 | 10 | 2.45 | 408 | 13.21 | 76 | 19.15 | 12.3 | 4 instance(s) |

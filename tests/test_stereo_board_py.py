@@ -10,8 +10,9 @@ images are absent.
     cd ~/projects/bcdl
     PYTHONPATH=build:python pytest -s tests/test_stereo_board_py.py
 
-Models come from scripts/fetch_models.sh (las2_m_crop_nashm.hbm preferred — its
-center-crop calibration matches this pair; las2_m_int16_nashm.hbm = resize).
+Models come from scripts/fetch_models.sh (las2_m_crop2_nashm.hbm preferred — its
+center-crop calibration matches this pair; las2_m_resize2_nashm.hbm = resize).
+test_full_disparity_range runs against every LAS2 build present (M and L).
 Env-overridable: BCDL_STEREO_MODEL / BCDL_STEREO_MODE / BCDL_STEREO_LEFT/RIGHT.
 """
 
@@ -30,6 +31,13 @@ _LEFT = os.environ.get("BCDL_STEREO_LEFT", os.path.join(_IMAGES, "stereo_left.pn
 _RIGHT = os.environ.get("BCDL_STEREO_RIGHT", os.path.join(_IMAGES, "stereo_right.png"))
 _IN_W, _IN_H = 640, 480
 
+# Every LAS2 build fetch_models.sh ships, with the letterbox mode it was
+# calibrated for. The first two (M) are the defaults for the single-model tests.
+_BUILDS = (("las2_m_crop2_nashm.hbm", bcdl.StereoFit.Crop),
+           ("las2_m_resize2_nashm.hbm", bcdl.StereoFit.Resize),
+           ("las2_l_crop2_nashm.hbm", bcdl.StereoFit.Crop),
+           ("las2_l_resize2_nashm.hbm", bcdl.StereoFit.Resize))
+
 
 def _resolve_model():
     """Pick (model_path, StereoFit) — crop-calibrated preferred, else resize.
@@ -39,8 +47,7 @@ def _resolve_model():
         mode = os.environ.get("BCDL_STEREO_MODE", "crop")
         fit = bcdl.StereoFit.Crop if mode == "crop" else bcdl.StereoFit.Resize
         return (env, fit) if os.path.exists(env) else (None, None)
-    for name, fit in (("las2_m_crop_nashm.hbm", bcdl.StereoFit.Crop),
-                      ("las2_m_int16_nashm.hbm", bcdl.StereoFit.Resize)):
+    for name, fit in _BUILDS[:2]:
         p = os.path.join(_MODELS, name)
         if os.path.exists(p):
             return p, fit
@@ -141,3 +148,51 @@ def test_depth_and_valid_mask(setup):
     # the mask drops *some* pixels (occlusions/range) but keeps a usable fraction
     cov = float(valid.mean())
     assert 0.2 < cov < 1.0
+
+
+def _shift_left(img, k):
+    """Move an image k px left, replicating the last column. Applied to the
+    right view it adds exactly k px to every disparity."""
+    if k <= 0:
+        return img
+    out = np.empty_like(img)
+    out[:, :-k] = img[:, k:]
+    out[:, -k:] = img[:, -1:]
+    return out
+
+
+def test_full_disparity_range():
+    """The output must reach the top of LAS2's 0..192 px range.
+
+    int16 output thresholds come from the calibration data, so a calibration
+    set with only near-field-free scenes silently caps the disparity: the
+    earlier builds clipped at 131 px (crop) and 47.7 px (resize), and the
+    repo pair (44..129 px) sits just under the first cap, so nothing else here
+    noticed. Shifting the right view left by k adds k to every disparity; push
+    the pair up to ~175 px and check the model follows.
+    """
+    builds = [(os.path.join(_MODELS, n), f) for n, f in _BUILDS
+              if os.path.exists(os.path.join(_MODELS, n))]
+    if not builds:
+        pytest.skip("no LAS2 .hbm on this board")
+    left, right = _load_pair()
+    for model, fit in builds:
+        eng = bcdl.Engine(model)
+        cfg = bcdl.StereoConfig()
+        cfg.fit = fit
+        pipe = bcdl.StereoPipeline(eng, cfg)
+        d0 = np.asarray(pipe.process(left, right).disparity.data)
+
+        scale = 1.0 if fit == bcdl.StereoFit.Crop else _IN_W / left.shape[1]
+        k_src = int(round((175.0 - np.percentile(d0, 99)) / scale))
+        k_in = k_src * scale
+        d1 = np.asarray(pipe.process(left, _shift_left(right, k_src)).disparity.data)
+
+        name = os.path.basename(model)
+        p99 = float(np.percentile(d1, 99))
+        assert p99 > 160.0, f"{name}: disparity capped at {p99:.1f} px"
+        # interior columns only: the left edge loses its match, the right edge
+        # of the shifted view is replicated padding
+        x0, x1 = 200, _IN_W - int(np.ceil(k_in)) - 8
+        err = np.median(np.abs(d1[:, x0:x1] - d0[:, x0:x1] - k_in))
+        assert err < 2.0, f"{name}: shifted disparity off by {err:.2f} px (k={k_in:.1f})"

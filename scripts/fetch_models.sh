@@ -153,11 +153,16 @@ copy "${ZOO}/ultralytics_yolo26/model/nash-m/yolo26n_obb_nashm_640x640_nv12.hbm"
 # Depth (Depth-Anything-V2) from rdk_model_zoo
 copy "${ZOO}/depth_anything_v2/model/s100/depth_any.hbm"
 # Stereo disparity (Lite Any Stereo V2, int16, 480x640) — converted offline.
-# Two calibration modes: *_int16 (resize-fit) and *_crop (center-crop-fit).
-# The stereo board test prefers the crop model on the repo's center-crop pair.
+# Two calibration modes: *_crop2 (center-crop-fit) and *_resize2 (resize-fit),
+# each in two sizes: M (67 FPS) and L (42 FPS, more accurate indoors).
+# The "2" builds are calibrated across the full 0..192 px disparity range; the
+# earlier *_crop / *_int16 builds clipped the output at 131 / 47.7 px.
+# The stereo board test prefers the M crop model on the repo's center-crop pair.
 LAS2_DIR="${BCDL_SRC_LAS2:-/path/to/converted/las2}"
-copy_or_hf "${LAS2_DIR}/las2_m_int16_nashm.hbm" ruisv/bcdl-las2-stereo
-copy_or_hf "${LAS2_DIR}/las2_m_crop_nashm.hbm" ruisv/bcdl-las2-stereo
+copy_or_hf "${LAS2_DIR}/las2_m_crop2_nashm.hbm" ruisv/bcdl-las2-stereo
+copy_or_hf "${LAS2_DIR}/las2_m_resize2_nashm.hbm" ruisv/bcdl-las2-stereo
+copy_or_hf "${LAS2_DIR}/las2_l_crop2_nashm.hbm" ruisv/bcdl-las2-stereo
+copy_or_hf "${LAS2_DIR}/las2_l_resize2_nashm.hbm" ruisv/bcdl-las2-stereo
 # RGB-D depth refinement (LingBot-Depth v0.5, 480x640) — converted offline.
 # Refines an existing noisy/holey depth map rather than estimating one; pairs
 # with either of the two models above as the depth source.

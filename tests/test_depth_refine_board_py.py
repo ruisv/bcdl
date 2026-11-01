@@ -64,7 +64,7 @@ def _sensor_like_depth(bgr):
     """
     depth = None
     stereo = os.environ.get("BCDL_STEREO_MODEL") or os.path.join(
-        _MODELS, "las2_m_crop_nashm.hbm")
+        _MODELS, "las2_m_crop2_nashm.hbm")
     right = os.path.join(_IMAGES, "stereo_right.png")
     if os.path.exists(stereo) and os.path.exists(right):
         try:

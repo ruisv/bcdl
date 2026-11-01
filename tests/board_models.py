@@ -104,10 +104,12 @@ DEPTH_MODEL = os.environ.get(
 # Stereo (LAS2) — two-image F32 NCHW RGB inputs -> disparity. Two calibration
 # modes shipped by fetch_models.sh: crop (matches the repo's center-crop pair)
 # preferred, else resize. The pair lives in data/images/ (committed losslessly).
+# fetch_models.sh also ships an L size of each (las2_l_*); the M build is the
+# default here because it is the one the benchmark table tracks.
 STEREO_CROP_MODEL = os.environ.get("BCDL_STEREO_CROP_MODEL",
-                                   os.path.join(MODELS, "las2_m_crop_nashm.hbm"))
+                                   os.path.join(MODELS, "las2_m_crop2_nashm.hbm"))
 STEREO_RESIZE_MODEL = os.environ.get("BCDL_STEREO_RESIZE_MODEL",
-                                     os.path.join(MODELS, "las2_m_int16_nashm.hbm"))
+                                     os.path.join(MODELS, "las2_m_resize2_nashm.hbm"))
 STEREO_LEFT = os.environ.get("BCDL_STEREO_LEFT", os.path.join(IMAGES, "stereo_left.png"))
 STEREO_RIGHT = os.environ.get("BCDL_STEREO_RIGHT", os.path.join(IMAGES, "stereo_right.png"))
 

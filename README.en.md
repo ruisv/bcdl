@@ -463,7 +463,7 @@ outputs for each row are in the [Gallery](#gallery).
 | semseg | deeplabv3plus        | 2048×1024   | 49.0  | 20   | 57.2  | 39.1 |
 | semseg_rt| PIDNet-S (1/8 output)| 2048×1024  | 4.52  | 221  | 4.70  | 19.0 |
 | depth  | depth-anything-v2    | 686×518     | 111   | 9    | 115   | 121.8|
-| stereo | las2-m (crop)        | 640×480     | 14.0  | 72   | 21.6  | 40.7 |
+| stereo | las2-m (crop)        | 640×480     | 13.9  | 72   | 17.5  | 40.2 |
 | ocr    | PP-OCRv5 server (det→cls→rec)| 960² / 48×320 | 20.0 | 50  | 135   | 35.3 |
 | embed  | SigLIP base/16       | 224²        | 19.3  | 52   | 20.2  | 129  |
 | drive  | YOLOP (det+drivable+lane)| 640²   | 2.80  | 358  | 5.44  | 12.0 |

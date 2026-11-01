@@ -42,7 +42,8 @@ here, see [Getting the models](#getting-the-models)).
 | semantic seg (real-time) | `pidnet_s_nashm_1024x2048_nv12_v3.hbm` | PIDNet-S | 2048×1024 | converted |
 | semantic seg (YOLO26 native res) | `yolo26n_sem_nashm_640x640_nv12.hbm` | YOLO26n-sem | 640×640 | converted |
 | monocular depth | `depth_any.hbm` | Depth-Anything-V2 | 686×518 | zoo |
-| stereo disparity | `las2_m_crop_nashm.hbm`, `las2_m_int16_nashm.hbm` | Lite Any Stereo V2 (M) | 640×480 | converted |
+| stereo disparity | `las2_m_crop2_nashm.hbm`, `las2_m_resize2_nashm.hbm` | Lite Any Stereo V2 (M) | 640×480 | converted |
+| stereo disparity (more accurate) | `las2_l_crop2_nashm.hbm`, `las2_l_resize2_nashm.hbm` | Lite Any Stereo V2 (L) | 640×480 | converted |
 | RGB-D depth refinement | `lingbot_depth_v05_int16_nashm.hbm` | LingBot-Depth v0.5 (MDM, DINOv2 ViT-L/14 RGBD) | 640×480 RGB + depth | converted |
 | open-vocab det | `yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm` | YOLOE-11s | 640×640 | converted |
 | open-vocab seg | `yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm` | YOLOE-11s | 640×640 | converted |
@@ -171,9 +172,30 @@ suffix is which build you have, not noise:
 | `_v3` | PIDNet-S | The earlier builds were calibrated on data that had **not** been pre-normalised. When the calibration data is float32, the compiler's `norm_type` does not apply to it, so the input thresholds come out wrong — again with a clean compile. |
 | `_qat` | OSNet-AIN | int8 PTQ does not work on this network at all: it compiles cleanly and returns well-formed unit vectors whose Market-1501 Rank-1 is 51% against the float model's 85%. The shipped build was recovered by QAT self-distillation to 84.6%. |
 | `_s100p` | DiffusionDrive | The first prebuilt published **per board** rather than per march — there is an `_s600` sibling. It is also an all-int16 build straight from upstream, so the usual "prefer int8" reading of a suffix does not apply here. Its companion anchor file is not optional: without `kmeans_navsim_traj_20.npy` the diffusion decoder has nothing to denoise. |
-| `_crop` / `_int16` | Lite Any Stereo V2 | Two calibration modes — centre-crop-fit and resize-fit. Match it to how you letterbox the pair; the repo's stereo test uses a centre-cropped pair and prefers `_crop`. |
+| `_crop2` / `_resize2` | Lite Any Stereo V2 | Two calibration modes — centre-crop-fit and resize-fit. Match it to how you letterbox the pair; the repo's stereo test uses a centre-cropped pair and prefers `_crop2`. The `2` is the calibration **range**. The output layer's int16 threshold is set by the largest disparity the calibration pairs contain, and the earlier `_crop` / `_int16` builds were calibrated on scenes with no near field, so they **clip the disparity at 131 px and 47.7 px** — anything closer than that reads as farther away, with no error. The `2` builds add copies of the same pairs with the right view shifted left, which raises every disparity by the shift without changing the content, so the thresholds cover the model's full 0–192 px. A second cause compounded the first: the compiler calibrates in batches of eight and, for this graph, takes the output range from only the first pair of each batch, so the `2` builds also repeat every calibration pair eight times. Measured against ground truth on held-out ETH3D and Middlebury 2021 scenes: crop (33 scenes), the worst scene went from 14.7 px to 0.30–0.43 px error against the float model, and scenes inside the old range pay about 0.07 px for the wider range; resize (51 scenes), EPE went from 2.17 px to 0.60 px, and the Middlebury bad-3px rate from 17.3% to 3.6%. |
 | `_int16` | LingBot-Depth | int8 PTQ does not survive this network. It compiles cleanly and returns a well-formed depth map whose dynamic range has collapsed — 2.9–13.8 m against the float model's 0.97–45.8 m, 233% mean absolute relative error, 0.53 cosine, mask IoU 0.56. The per-layer report says why: LayerNorm and softmax `Mul` nodes come back at 0.006 cosine, and 1056 of 1418 nodes sit below 0.90. A 24-layer ViT-L is the case the all-int16 rule exists for. |
 | the token count | LingBot-Depth | The upstream network has no fixed resolution: a token budget plus the aspect ratio sets the encoder grid. The shipped build uses 1200 tokens, i.e. a 30×40 grid, a 420×560 encoder input, and a decoder pyramid that lands exactly on 480×640 so the final resize is the identity. Larger budgets (up to 3600) buy accuracy at a quadratic cost in attention — the graph is already the slowest model in this catalogue. |
+
+### LAS2: M or L
+
+Same network family, same 2D-only cost aggregation, no iteration; L has twice
+the aggregation depth at each scale. Measured on the board, int16, against
+ground truth on ETH3D and Middlebury 2021 scenes that are not in the
+calibration set (33 for crop, 51 for resize; the two sets differ, so compare
+within a mode, not across):
+
+| build | EPE | bad 1 px | bad 2 px | latency | size |
+|---|---|---|---|---|---|
+| `las2_m_crop2_nashm.hbm` | 0.998 px | 14.2% | 6.0% | 15.0 ms / 67 FPS | 40 MB |
+| `las2_l_crop2_nashm.hbm` | 0.928 px | 11.0% | 5.0% | 24.0 ms / 42 FPS | 71 MB |
+| `las2_m_resize2_nashm.hbm` | 0.597 px | 8.5% | 3.4% | 15.0 ms / 67 FPS | 41 MB |
+| `las2_l_resize2_nashm.hbm` | 0.568 px | 6.7% | 2.9% | 24.0 ms / 42 FPS | 71 MB |
+
+Latency is one inference plus Python I/O, single thread. The gain is all
+indoors and close up: on the Middlebury scenes crop bad-1px drops from 19.2%
+to 14.5% (resize: 14.4% to 10.7%), while on ETH3D (small disparities) the two
+are level.
+Pick L when near-field detail matters and 42 FPS is enough; otherwise M.
 
 ### PointPillars comes in two chains, and one is 46× faster
 

@@ -12,6 +12,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **The shipped LAS2 stereo builds clipped disparity at 131 px and 47.7 px.**
+  An int16 output threshold is the largest value the calibration set produced,
+  and the crop and resize builds were calibrated on scenes with no near field —
+  so anything closer than that read as farther away, out of the model's
+  0–192 px, with no error. The repo's own stereo pair spans 44–129 px, just
+  under the crop cap, so no test noticed. The replacements,
+  `las2_m_crop2_nashm.hbm` and `las2_m_resize2_nashm.hbm`, are calibrated across
+  the full range (output thresholds 180–187 px). On held-out ETH3D and
+  Middlebury 2021 scenes with ground truth, the worst crop scene went from
+  14.7 px to 0.30–0.43 px against the float model, and resize EPE from 2.17 px
+  to 0.60 px. A new test shifts the repo pair to ~175 px and fails on the old
+  builds.
+
+### Added
+- **LAS2-L stereo builds** (`las2_l_crop2_nashm.hbm`,
+  `las2_l_resize2_nashm.hbm`): twice M's aggregation depth, bad-1px 14.2% →
+  11.0% on the crop set, at 44 FPS against M's 72. The gain is close-range;
+  see the "LAS2: M or L" section of `docs/MODELS.md`.
+
 ## [0.7.5] — 2026-08
 
 ### Fixed
