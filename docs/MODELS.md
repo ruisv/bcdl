@@ -311,7 +311,7 @@ they are listed here so you can also just download one by hand.
 |---|---|---|---|
 | [`ruisv/bcdl-ppocr-v6`](https://huggingface.co/ruisv/bcdl-ppocr-v6) | OCR det + rec + angle cls, **with the 18710-class dictionary** | 49 MB | Apache-2.0 |
 | [`ruisv/bcdl-ppocr-v5`](https://huggingface.co/ruisv/bcdl-ppocr-v5) | OCR v5 det + rec + cls, with its 18385 dictionary | 61 MB | Apache-2.0 |
-| [`ruisv/bcdl-las2-stereo`](https://huggingface.co/ruisv/bcdl-las2-stereo) | zero-shot stereo, both calibration modes | 78 MB | MIT |
+| [`ruisv/bcdl-las2-stereo`](https://huggingface.co/ruisv/bcdl-las2-stereo) | zero-shot stereo, M and L, both calibration modes | 213 MB | MIT |
 | [`ruisv/bcdl-lingbot-depth`](https://huggingface.co/ruisv/bcdl-lingbot-depth) | RGB-D depth refinement, int16 | 1015 MB | Apache-2.0 |
 | [`ruisv/bcdl-superres`](https://huggingface.co/ruisv/bcdl-superres) | ×4 upscaling, Compact **and** SPAN | 43 MB | BSD-3 / Apache-2.0 |
 | [`ruisv/bcdl-xfeat`](https://huggingface.co/ruisv/bcdl-xfeat) | sparse features | 3 MB | Apache-2.0 |
