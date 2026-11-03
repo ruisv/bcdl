@@ -1,4 +1,4 @@
-"""BCDL — BPU Computational Deep Learning (C++ core)"""
+"""BCDL — BPU Common Deep Learning (C++ core)"""
 
 from collections.abc import Sequence
 import enum

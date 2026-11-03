@@ -16,8 +16,13 @@ under [`include/bcdl/`](../include/bcdl/) are the source of truth); the names ma
   [Pose](#pose) · [Instance segmentation](#instance-segmentation) ·
   [Oriented boxes (OBB)](#oriented-boxes-obb) ·
   [Semantic segmentation](#semantic-segmentation) · [Depth](#depth) ·
-  [Stereo](#stereo) · [OCR](#ocr) ·
-  [Speech recognition](#speech-recognition-paraformer)
+  [Stereo](#stereo) · [OCR](#ocr)
+- Speech: [Voice pipeline (start here)](#voice-pipeline) ·
+  [Wake words](#keyword-spotting-wake-word) ·
+  [VAD](#voice-activity-detection-silero-vad) ·
+  [Recognition](#speech-recognition-paraformer) ·
+  [Commands](#voice-commands-closed-set) ·
+  [Synthesis](#speech-synthesis-matcha-tts--vocos)
 - Streaming & tracking: [Tracking (ByteTrack)](#tracking-bytetrack) ·
   [TrackingPipeline](#trackingpipeline) ·
   [AsyncDetectionPipeline](#asyncdetectionpipeline)
@@ -756,6 +761,116 @@ See [`examples/ocr_demo.cc`](../examples/ocr_demo.cc) for the full det→cls→r
 wiring (crop ordering and the dict gotchas are handled there).
 
 ---
+
+## Voice pipeline
+
+Five pieces make a voice-controlled robot, and all of their networks run on
+the BPU. BCDL takes and returns 16 kHz PCM; capturing from a microphone and
+playing to a speaker stay in your code.
+
+```
+ mic ──> KeywordSpotter ──wake──> VadSegmenter ──utterance──> ParaformerAsr ──text──> CommandMatcher
+         (always on)               (until silence)             (one pass)              (pinyin match)
+                                                                                            │
+ speaker <──────────────────────────── TextToSpeech <────────── reply text <────────────────┘
+```
+
+| piece | job | cost on the board |
+|---|---|---|
+| `KeywordSpotter` | listens for the wake word, all the time | 2.0 ms of BPU per 160 ms of audio |
+| `VadSegmenter` (`SileroVad`) | after the wake word, cuts out one whole utterance | 0.39 ms per 32 ms |
+| `ParaformerAsr` | utterance → Chinese text | ~35 ms per utterance |
+| `CommandMatcher` | text → one of your commands, or "not a command" | a few µs |
+| `TextToSpeech` | reply text → speech | ~15–25 ms per sentence |
+
+**Try it first.** [`examples/voice_assistant.py`](../examples/voice_assistant.py)
+(and its C++ twin [`voice_assistant.cc`](../examples/voice_assistant.cc)) runs
+the whole loop. With no argument it synthesises a short session in the robot's
+own voice — speech without the wake word, two commands, one request that is not
+a command — so it runs on a board with no microphone and no recordings:
+
+```bash
+scripts/fetch_models.sh                       # once
+python examples/voice_assistant.py            # or: ./build/voice_assistant
+python examples/voice_assistant.py my.wav     # your own 16 kHz mono recording
+```
+
+```
+    time  event
+    4.36 s  wake word '你好小车'
+    4.60 s  robot: 我在。  (14 ms to synthesise 0.7 s -> voice_out/reply_01.wav)
+    5.28 s  heard '向左转' (0.8 s, 34 ms to recognise) -> command: 向左转
+    6.30 s  robot: 好的，向左转。  (16 ms to synthesise 1.4 s -> voice_out/reply_02.wav)
+    ...
+   13.71 s  heard '给我唱首歌吧' (1.1 s, 33 ms to recognise) -> not a command
+```
+
+The loop is short; the parts that matter:
+
+```python
+awake = False
+for block in mic_blocks():                      # any length; float32 or int16, 16 kHz mono
+    if not awake:
+        if kws.feed(block):                     # the wake word
+            awake = True; vad.reset()
+        continue
+    for seg in vad.feed(block):                 # one whole utterance
+        m = matcher.match(asr.transcribe(seg.pcm).text)
+        play(tts.synthesize(f"好的，{m.command}。" if m else "没听懂，请再说一遍。").pcm)
+        awake = False; kws.reset()              # back to sleep on a fresh stream
+        break
+```
+
+**Audio in.** 16 kHz, mono, float in [-1, 1] or int16 (int16 is rescaled, not
+cast). Resample other rates before BCDL (`ffmpeg -i in.wav -ar 16000 -ac 1
+out.wav`, or your audio driver). Any block size works. `KeywordSpotter`,
+`SileroVad` and `VadSegmenter` keep state between calls, so give each stream its
+own objects and feed them in order. `reset()` starts a new stream, and
+`flush()` ends one: without it, a wake word or utterance in the last fraction
+of a second of a recording is never reported.
+
+**Your wake word.** A wake word is a line of the model's tokens — pinyin
+initials and toned finals — so changing it needs no training. Write the
+phrases one per line as `你好小车 @你好小车`, then let sherpa-onnx's tool turn
+them into tokens:
+
+```bash
+pip install sherpa-onnx
+sherpa-onnx-cli text2token --tokens models/kws_zipformer_zh_en_3m_tokens.txt \
+    --tokens-type ppinyin keywords_raw.txt keywords.txt
+# keywords.txt:  n ǐ h ǎo x iǎo ch ē @你好小车
+```
+
+Choose three or four syllables that do not occur in everyday speech or in your
+commands; a short or common phrase wakes the robot by mistake. English wake
+words need the CMU-style lexicon (`en.phone`) from the upstream model package
+and `--tokens-type phone+ppinyin`.
+
+**Tuning.**
+
+| if… | change |
+|---|---|
+| the wake word is missed | lower `KwsConfig.keywords_threshold` (0.25), or add `#0.15` to that line only |
+| it wakes on similar phrases | raise the threshold, or `:0.5` to lower that line's boost |
+| a command is cut in two at a pause | raise `VadConfig.min_silence_ms` (300) |
+| the robot answers too slowly | lower `min_silence_ms` — it is most of the delay: the end of speech is declared about that long after the speaker stops |
+| commands are rejected | add the phrasings people actually use as more entries; `CommandMatcher(..., max_distance=0.5)` |
+| other speech is taken as a command | lower `max_distance` |
+| replies are too fast or slow | `MatchaConfig.length_scale` (> 1 slower) |
+| pauses in replies sound long or clipped | `TextToSpeechConfig.silence_scale` (0.2; 1 keeps the model's) |
+
+**Things to know.**
+
+- **The robot hears itself.** Stop feeding the microphone to the VAD and the
+  spotter while a reply plays, or use echo cancellation in your audio stack.
+- **Chinese.** Recognition and synthesis are Chinese; synthesis drops Latin
+  words (write 无线网, not WiFi) and reads digits out (35% → 百分之三十五).
+- **Limits.** One utterance is at most 24 s (`VadConfig.max_speech_s` cuts at
+  20 s). One reply sentence is at most ~8 s; longer text is split into
+  sentences automatically.
+- **Accuracy figures** in the sections below come from synthetic and public
+  test sets. Before relying on them, record a hundred real commands on your
+  robot, with its motors running, and run them through the example.
 
 ## Speech recognition (Paraformer)
 

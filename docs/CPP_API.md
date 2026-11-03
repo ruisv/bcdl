@@ -660,6 +660,14 @@ wiring (crop ordering + dict conventions handled there).
 
 ---
 
+## Voice pipeline
+
+Wake word → VAD → recognition → command → spoken reply, every network on the
+BPU: [`examples/voice_assistant.cc`](../examples/voice_assistant.cc) is the
+whole loop in C++ (WAV in, WAV replies out; with no input it synthesises a
+demo session). Audio format, wake-word tokens and tuning are in the
+[voice pipeline overview](API.md#voice-pipeline); the classes are below.
+
 ## Speech recognition (Paraformer)
 
 `bcdl/preproc/fbank.h` — Kaldi-compatible front end; `bcdl/tasks/asr.h` — CIF,

@@ -1,4 +1,4 @@
-# BCDL — a vision framework for the RDK BPU
+# BCDL — a common AI framework for the RDK BPU: vision and speech
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
@@ -8,7 +8,7 @@
 
 **English** | [简体中文](README.md)
 
-> ### Build a BPU vision application in minutes.
+> ### Build a BPU vision or speech application in minutes.
 > One set of C++ and Python APIs across capture → hardware codec → preprocessing →
 > BPU inference → post-processing.
 > **Built on top of the official runtime — not a replacement for it.**
@@ -82,7 +82,8 @@ does it correctly.
 
 - **✅ One-line install** — prebuilt linux-aarch64 conda packages (Python
   3.9–3.14). No toolchain on the board; `import bcdl` right after install.
-- **✅ Unified API** — 22 vision tasks and speech recognition share one `Engine` + task-class model.
+- **✅ Unified API** — 22 vision tasks and a whole voice pipeline (wake word, VAD, recognition,
+  synthesis) share one `Engine` + task-class model.
   Switching task doesn't switch mental model, and C++ and Python are peers.
 - **✅ No hand-written memory or cache discipline** — `SysMem` lifetime, clean
   before infer and invalidate before read are the `Engine`'s job. **This is the
@@ -307,6 +308,12 @@ Everything under [`examples/`](examples/) is a standalone runnable program:
 | [`video_decode.cc`](examples/video_decode.cc) · [`video_roundtrip.cc`](examples/video_roundtrip.cc) | H.264/H.265 decode / codec round-trip |
 | [`jpeg_roundtrip.cc`](examples/jpeg_roundtrip.cc) | hardware JPEG encode/decode (JPU) |
 
+**Speech**
+
+| Example | What it does |
+|---|---|
+| [`voice_assistant.py`](examples/voice_assistant.py) · [`voice_assistant.cc`](examples/voice_assistant.cc) | **A voice-controlled robot**: wake word → VAD → recognition → command → spoken reply, every network on the BPU. With no argument it first synthesises a demo session, so it runs without a microphone |
+
 **Performance and probes**
 
 | example | what it does |
@@ -315,7 +322,8 @@ Everything under [`examples/`](examples/) is a standalone runnable program:
 | [`gdc_letterbox_bench.cc`](examples/gdc_letterbox_bench.cc) | GDC hardware letterbox vs CPU |
 | [`mempool_demo.cc`](examples/mempool_demo.cc) · [`vp_probe.cc`](examples/vp_probe.cc) | device memory pool / VP unit probes |
 
-The minimal Python usage for every task is in [`docs/API.md`](docs/API.md).
+The minimal Python usage for every task is in [`docs/API.md`](docs/API.md); for speech,
+start at the [voice pipeline overview](docs/API.md#voice-pipeline).
 
 ## Capabilities
 
@@ -385,6 +393,34 @@ takes float32 NumPy arrays — **no Engine, no board, no model needed**.
   - **Multi-object tracking** — ByteTrack (Kalman + two-stage association); ReID
     appearance embeddings with L2-normalize + cosine similarity (BoT-SORT
     association primitives), BoostTrack++ and camera-motion compensation.
+  - **Optical flow** — NeuFlow v2: a dense displacement field, Middlebury-wheel
+    colourisation and an EPE metric. **Shipped at int16 on purpose**: int8
+    degrades into a flat ~1.9 px noise floor, so fast pixels look fine and slow
+    ones are pure noise — while the compiler reports 0.9954 output cosine for it.
+    A head that regresses a physical quantity has to be scored in that
+    quantity's units. 19.3 ms on the BPU.
+  - **Industrial anomaly detection** — GLASS one-class detection: trained on one
+    product's **normal** images only, out comes a per-pixel anomaly map. The
+    image score is the **maximum, not the mean** — a part is as bad as its worst
+    patch. The backbone is a frozen ImageNet WideResNet-50 and only two small
+    heads are trained per product, so the shipped model is an **example** and the
+    threshold is a line-side decision. Image and pixel AUROC both 0.9905 on
+    MVTec-AD bottle, matching float.
+  - **End-to-end driving** — DiffusionDrive: a stitched three-camera strip, a
+    lidar BEV histogram and ego state in; a 4-second planned trajectory, 30 agents
+    and a 7-class BEV semantic map out. The first model here whose **inputs are
+    quantized too** (four int16 tensors with per-tensor scales — feed them float
+    bytes and it runs happily on noise). Trajectory cosine 0.9994 against FP32
+    over 120 real frames.
+  - **Lidar 3-D detection** — PointPillars: a sweep in, oriented 3-D boxes out.
+    The chain is deliberately separate pieces (voxelize → VFE → scatter →
+    backbone+head → decode + BEV NMS) because their costs differ wildly. The
+    anchor decode runs on the CPU: the published graph bakes it in with
+    `ScatterND`, which **compiles without an error into a model whose outputs are
+    never written**.
+  - Detection heads take both **PTQ (NV12 two-plane) and QAT-exported float-input**
+    models (`detect_float` / `letterbox_chw_float`).
+- **Speech** (every network on the BPU; the whole chain in [`voice_assistant.py`](examples/voice_assistant.py)):
   - **Wake words** — sherpa-onnx's open-vocabulary zipformer KWS (zh-en, 3M):
     the encoder on the BPU every 160 ms, decoding and keyword search on the
     CPU, step for step as sherpa-onnx; a new wake word is a line of text. Recall 97.5% / 89.1% (clean / noisy; float 96.5% / 87.1%),
@@ -415,33 +451,6 @@ takes float32 NumPy arrays — **no Engine, no board, no model needed**.
   - **Speech synthesis back end** — the Vocos vocoder (Matcha-TTS zh-en's): mel
     in, 16 kHz waveform out, int16 on the BPU with the inverse STFT on the CPU;
     7.9 ms per 3 s of audio, 0.54 dB from float over the audible spectrum.
-  - **Optical flow** — NeuFlow v2: a dense displacement field, Middlebury-wheel
-    colourisation and an EPE metric. **Shipped at int16 on purpose**: int8
-    degrades into a flat ~1.9 px noise floor, so fast pixels look fine and slow
-    ones are pure noise — while the compiler reports 0.9954 output cosine for it.
-    A head that regresses a physical quantity has to be scored in that
-    quantity's units. 19.3 ms on the BPU.
-  - **Industrial anomaly detection** — GLASS one-class detection: trained on one
-    product's **normal** images only, out comes a per-pixel anomaly map. The
-    image score is the **maximum, not the mean** — a part is as bad as its worst
-    patch. The backbone is a frozen ImageNet WideResNet-50 and only two small
-    heads are trained per product, so the shipped model is an **example** and the
-    threshold is a line-side decision. Image and pixel AUROC both 0.9905 on
-    MVTec-AD bottle, matching float.
-  - **End-to-end driving** — DiffusionDrive: a stitched three-camera strip, a
-    lidar BEV histogram and ego state in; a 4-second planned trajectory, 30 agents
-    and a 7-class BEV semantic map out. The first model here whose **inputs are
-    quantized too** (four int16 tensors with per-tensor scales — feed them float
-    bytes and it runs happily on noise). Trajectory cosine 0.9994 against FP32
-    over 120 real frames.
-  - **Lidar 3-D detection** — PointPillars: a sweep in, oriented 3-D boxes out.
-    The chain is deliberately separate pieces (voxelize → VFE → scatter →
-    backbone+head → decode + BEV NMS) because their costs differ wildly. The
-    anchor decode runs on the CPU: the published graph bakes it in with
-    `ScatterND`, which **compiles without an error into a model whose outputs are
-    never written**.
-  - Detection heads take both **PTQ (NV12 two-plane) and QAT-exported float-input**
-    models (`detect_float` / `letterbox_chw_float`).
 - **Hardware preprocessing** — fixed geometric transforms on the VPS GDC engine:
   hardware letterbox and arbitrary dense remap `GdcRemap` (cv2.remap semantics, for
   stereo rectification; 2448×2048 ≈ 6.3 ms, CPU mostly idle).

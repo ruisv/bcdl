@@ -15,8 +15,10 @@
   [超分 SuperRes](#超分-superres) · [稀疏特征点 XFeat](#稀疏特征点-xfeat) ·
   [实例分割 InstanceSeg](#实例分割-instanceseg) · [旋转框 OBB](#旋转框-obb) ·
   [语义分割 Segmentation](#语义分割-segmentation) · [深度 Depth](#深度-depth) ·
-  [双目 Stereo](#双目-stereo) · [OCR](#ocr) ·
-  [语音识别](#语音识别paraformer)
+  [双目 Stereo](#双目-stereo) · [OCR](#ocr)
+- 语音：[语音链总览（从这里开始）](#语音链总览) · [唤醒词](#唤醒词检测) ·
+  [端点检测](#语音端点检测silero-vad) · [识别](#语音识别paraformer) ·
+  [指令匹配](#语音指令固定指令集) · [合成](#语音合成matcha-tts--vocos)
 - 流式与跟踪：[跟踪 ByteTrack](#跟踪-bytetrack) · [TrackingPipeline](#trackingpipeline) ·
   [AsyncDetectionPipeline](#asyncdetectionpipeline) ·
   [AsyncVideoDetectionPipeline](#asyncvideodetectionpipeline)
@@ -703,6 +705,106 @@ text  = bcdl.decode_ctc(logits.astype(np.float32), chars)
 （裁剪顺序与字典的坑都在那里处理了）。
 
 ---
+
+## 语音链总览
+
+做一台能听懂指令、会回话的机器人，需要下面五个部件，网络全部跑在 BPU 上。BCDL 只接收和返回
+16 kHz PCM，麦克风采集和扬声器播放由你的代码负责。
+
+```
+ 麦克风 ──> KeywordSpotter ──唤醒──> VadSegmenter ──整句──> ParaformerAsr ──文字──> CommandMatcher
+            （一直在听）              （听到停顿为止）        （一次前向）            （按拼音匹配）
+                                                                                       │
+ 扬声器 <────────────────────────── TextToSpeech <────────── 回复文本 <─────────────────┘
+```
+
+| 部件 | 作用 | 板上开销 |
+|---|---|---|
+| `KeywordSpotter` | 一直监听唤醒词 | 每 160 ms 音频占 BPU 2.0 ms |
+| `VadSegmenter`（`SileroVad`） | 唤醒后切出完整的一句话 | 每 32 ms 音频 0.39 ms |
+| `ParaformerAsr` | 一句话 → 中文文本 | 每句约 35 ms |
+| `CommandMatcher` | 文本 → 你定义的某条指令，或"不是指令" | 几微秒 |
+| `TextToSpeech` | 回复文本 → 语音 | 每句约 15–25 ms |
+
+**先跑起来。** [`examples/voice_assistant.py`](../examples/voice_assistant.py)（C++ 版是
+[`voice_assistant.cc`](../examples/voice_assistant.cc)）跑通整个流程。不带参数时，它会先用
+机器人自己的声音合成一段演示录音：一句不带唤醒词的话、两条指令、一个不是指令的请求。所以板子上
+没有麦克风、没有录音也能直接跑：
+
+```bash
+scripts/fetch_models.sh                       # 只需一次
+python examples/voice_assistant.py            # 或 ./build/voice_assistant
+python examples/voice_assistant.py my.wav     # 你自己的 16 kHz 单声道录音
+```
+
+```
+    time  event
+    4.36 s  wake word '你好小车'
+    4.60 s  robot: 我在。  (14 ms to synthesise 0.7 s -> voice_out/reply_01.wav)
+    5.28 s  heard '向左转' (0.8 s, 34 ms to recognise) -> command: 向左转
+    6.30 s  robot: 好的，向左转。  (16 ms to synthesise 1.4 s -> voice_out/reply_02.wav)
+    ...
+   13.71 s  heard '给我唱首歌吧' (1.1 s, 33 ms to recognise) -> not a command
+```
+
+主循环很短，关键是这几行：
+
+```python
+awake = False
+for block in mic_blocks():                      # 长度任意；float32 或 int16，16 kHz 单声道
+    if not awake:
+        if kws.feed(block):                     # 听到唤醒词
+            awake = True; vad.reset()
+        continue
+    for seg in vad.feed(block):                 # 一整句话
+        m = matcher.match(asr.transcribe(seg.pcm).text)
+        play(tts.synthesize(f"好的，{m.command}。" if m else "没听懂，请再说一遍。").pcm)
+        awake = False; kws.reset()              # 回到待机，换一路新的流
+        break
+```
+
+**音频输入。** 16 kHz、单声道，浮点 [-1, 1] 或 int16（int16 会按比例换算，不是直接转型）。
+其他采样率要先重采样（`ffmpeg -i in.wav -ar 16000 -ac 1 out.wav`，或在声卡驱动层做）。每次送多长
+都可以。`KeywordSpotter`、`SileroVad`、`VadSegmenter` 在调用之间保存状态，所以每路音频要用
+各自的对象，并按顺序送入。`reset()` 开始一路新的流，`flush()` 结束一路流：不调用 `flush()`，
+录音最后一小段里的唤醒词或语句就不会被报告。
+
+**换成你的唤醒词。** 唤醒词是一行模型 token（声母和带声调的韵母），换词不需要训练。先按
+`你好小车 @你好小车` 的格式每行写一个短语，再用 sherpa-onnx 的工具转成 token：
+
+```bash
+pip install sherpa-onnx
+sherpa-onnx-cli text2token --tokens models/kws_zipformer_zh_en_3m_tokens.txt \
+    --tokens-type ppinyin keywords_raw.txt keywords.txt
+# keywords.txt：n ǐ h ǎo x iǎo ch ē @你好小车
+```
+
+唤醒词选三到四个音节、日常说话和指令里都不常出现的；太短或太常见的词容易误唤醒。英文唤醒词要用
+上游模型包里的 CMU 格式词典（`en.phone`），并改用 `--tokens-type phone+ppinyin`。
+
+**调参。**
+
+| 现象 | 调整 |
+|---|---|
+| 唤醒词叫了没反应 | 调低 `KwsConfig.keywords_threshold`（0.25），或只给这一行加 `#0.15` |
+| 说相近的词也会唤醒 | 调高阈值，或给这一行加 `:0.5` 降低加分 |
+| 一条指令在停顿处被切成两段 | 调大 `VadConfig.min_silence_ms`（300） |
+| 机器人回应太慢 | 调小 `min_silence_ms`：它占了延迟的大头，说话人停下后大约要过这么久才判定说完 |
+| 指令经常被拒绝 | 把大家实际会说的说法都加成单独的条目；`CommandMatcher(..., max_distance=0.5)` |
+| 别的话被当成指令 | 调小 `max_distance` |
+| 回复语速太快或太慢 | `MatchaConfig.length_scale`（> 1 变慢） |
+| 回复里的停顿太长或被截断 | `TextToSpeechConfig.silence_scale`（0.2；设为 1 保留模型原样） |
+
+**需要知道的几点。**
+
+- **机器人会听到自己的声音。** 播放回复时，暂停把麦克风音频送给 VAD 和唤醒词检测，或者在音频
+  栈里做回声消除。
+- **中文。** 识别和合成都是中文；合成会跳过英文单词（写"无线网"而不是 WiFi），数字会读出来
+  （35% → 百分之三十五）。
+- **长度上限。** 一句话最长 24 s（`VadConfig.max_speech_s` 在 20 s 处切开）。回复的单句最长约
+  8 s，更长的文本会自动按句子切开合成。
+- **下文各节的精度数字**来自合成数据和公开测试集。正式使用前，建议在你的机器人上、电机运转时
+  录一百条真实指令，用示例程序跑一遍。
 
 ## 语音识别（Paraformer）
 

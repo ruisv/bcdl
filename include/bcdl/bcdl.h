@@ -1,6 +1,6 @@
 #pragma once
 
-/// BCDL — BPU Computational Deep Learning. Umbrella header.
+/// BCDL — BPU Common Deep Learning. Umbrella header.
 ///
 /// Pulls in EVERY installed public header. Keep it exhaustive: docs/CPP_API.md
 /// tells users this one include is enough, so anything reachable from the

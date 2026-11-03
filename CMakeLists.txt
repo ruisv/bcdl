@@ -245,6 +245,12 @@ if(BCDL_BUILD_EXAMPLES)
   set_target_properties(depth_demo PROPERTIES
     BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
 
+  # Voice assistant: wake word -> VAD -> recognition -> command -> spoken reply.
+  add_executable(voice_assistant examples/voice_assistant.cc)
+  target_link_libraries(voice_assistant PRIVATE bcdl::bcdl)
+  set_target_properties(voice_assistant PROPERTIES
+    BUILD_RPATH "${BCDL_RPATH}" INSTALL_RPATH "${BCDL_RPATH}")
+
   add_executable(mempool_demo examples/mempool_demo.cc)
   target_link_libraries(mempool_demo PRIVATE bcdl::bcdl)
   set_target_properties(mempool_demo PROPERTIES

@@ -1,4 +1,4 @@
-# BCDL — RDK BPU 视觉开发框架
+# BCDL — RDK BPU 通用 AI 开发框架：视觉 + 语音
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
@@ -8,7 +8,7 @@
 
 [English](README.en.md) | **简体中文**
 
-> ### 几分钟做出一个 BPU 视觉应用。
+> ### 几分钟做出一个 BPU 视觉或语音应用。
 > 统一的 C++ / Python API，覆盖取流 → 硬件编解码 → 预处理 → BPU 推理 → 后处理整条链路。
 > **构建在官方运行时之上，不是取代它。**
 
@@ -77,7 +77,8 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 
 - **✅ 一行安装** —— 预编译的 linux-aarch64 conda 包（Python 3.9–3.14），
   板上不需要编译工具链，装完就能 `import bcdl`。
-- **✅ 统一的 API** —— 22 类视觉任务和语音识别共用同一套 `Engine` + 任务类心智模型；
+- **✅ 统一的 API** —— 22 类视觉任务和整条语音链（唤醒词、端点检测、识别、合成）共用同一套
+  `Engine` + 任务类心智模型；
   换任务不换写法，C++ 与 Python 接口对等。
 - **✅ 不再手写内存与缓存** —— `SysMem` 生命周期、推理前 clean / 读取前 invalidate
   由 `Engine` 负责。**这是 BPU 上最高频的正确性 bug**，表现为结果“看起来差不多但就是不对”。
@@ -280,6 +281,12 @@ build、许可证如何，见 [`docs/MODELS.md`](docs/MODELS.md)。
 | [`video_decode.cc`](examples/video_decode.cc) · [`video_roundtrip.cc`](examples/video_roundtrip.cc) | H.264/H.265 解码 / 编解码回环 |
 | [`jpeg_roundtrip.cc`](examples/jpeg_roundtrip.cc) | 硬件 JPEG 编解码（JPU） |
 
+**语音**
+
+| 示例 | 做什么 |
+|---|---|
+| [`voice_assistant.py`](examples/voice_assistant.py) · [`voice_assistant.cc`](examples/voice_assistant.cc) | **语音控制机器人**：唤醒词 → 端点检测 → 识别 → 指令匹配 → 语音回复，网络全在 BPU。不带参数时先用 TTS 合成一段演示录音，没有麦克风也能跑 |
+
 **性能与探针**
 
 | 示例 | 做什么 |
@@ -288,7 +295,8 @@ build、许可证如何，见 [`docs/MODELS.md`](docs/MODELS.md)。
 | [`gdc_letterbox_bench.cc`](examples/gdc_letterbox_bench.cc) | GDC 硬件 letterbox 对比 CPU |
 | [`mempool_demo.cc`](examples/mempool_demo.cc) · [`vp_probe.cc`](examples/vp_probe.cc) | 设备内存池 / VP 单元探针 |
 
-Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`](docs/API.zh.md)。
+Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`](docs/API.zh.md)；语音从
+[语音链总览](docs/API.zh.md#语音链总览)读起。
 
 ## 能力清单
 
@@ -339,6 +347,25 @@ Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`]
     真实退化上，模糊/压缩输入更强。按输入域选，不是谁替代谁。
   - **多目标跟踪** —— ByteTrack（Kalman + 两阶段关联）；ReID 外观嵌入的 L2
     归一化 + 余弦相似度（BoT-SORT 关联原语）、BoostTrack++ 与相机运动补偿。
+  - **光流** —— NeuFlow v2：稠密位移场 + Middlebury 色轮着色、EPE 度量。
+    **发的是 int16**：int8 会退化成一条约 1.9 px 的平噪声底，快像素看着没事、
+    慢像素全是噪声，而编译器给它报的输出余弦是 0.9954 —— 回归物理量的头要用
+    那个量的单位打分，不能用余弦。19.3 ms 纯 BPU。
+  - **工业异常检测** —— GLASS 单类检测：只用某产品的**正常**图训练，输出逐像素
+    异常图。图像分数取**最大值不取均值**（零件有多坏取决于最坏那块）。骨干是冻结
+    的 ImageNet WideResNet-50，每个产品只训两个小头，所以随库的模型是**示例**、
+    阈值是产线级决策。MVTec-AD bottle 上图像/像素 AUROC 均 0.9905，与浮点持平。
+  - **端到端驾驶** —— DiffusionDrive：三目拼接相机 + 点云 BEV 直方图 + 自车状态
+    进，4 秒规划轨迹 + 30 个目标 + 7 类 BEV 语义图出。本仓第一个**输入也是量化**
+    的模型（四个输入都是带 scale 的 int16，直接塞 float 字节会照跑但在跑噪声）。
+    120 帧真实数据上板端对 FP32 轨迹余弦 0.9994。
+  - **激光雷达 3-D 检测** —— PointPillars：点云进，带朝向的 3-D 框出。整条链
+    自己拆开（体素化 → VFE → scatter → 骨干+头 → 解码 + BEV NMS），因为各段
+    成本差得极远。anchor 解码放 CPU：官方图把它烘进 `ScatterND`，那东西**编译
+    不报错、产物却从不写输出**。
+  - 检测头同时支持 **PTQ（NV12 两平面）与 QAT 导出的浮点输入** 模型
+    （`detect_float` / `letterbox_chw_float`）。
+- **语音**（网络全在 BPU；整条链的示例见 [`voice_assistant.py`](examples/voice_assistant.py)）：
   - **唤醒词** —— sherpa-onnx 的开放词表 zipformer KWS（中英文，300 万参数）：编码器每 160 ms 在
     BPU 上跑一次，解码和关键词搜索在 CPU，逐步照搬 sherpa-onnx；换唤醒词只改一行文本。召回 97.5% / 89.1%（干净 / 噪声，浮点 96.5% / 87.1%），4.4 小时零误唤醒，每 160 ms 占 BPU 2.0 ms。
   - **语音端点检测** —— Silero VAD v6（int16，BPU）：每 32 ms 一次，0.39 ms；`VadSegmenter`
@@ -358,24 +385,6 @@ Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`]
     前端与 sherpa-onnx 逐 id 一致；定长导出改写了 GroupNorm 和注意力掩码，否则补零会改变结果。
   - **语音合成后端** —— Vocos 声码器（Matcha-TTS zh-en 配套）：mel 进、16 kHz 波形出，
     int16 跑在 BPU、逆 STFT 在 CPU，3 秒音频 7.9 ms，与浮点几乎无差（可听谱距离 0.54 dB）。
-  - **光流** —— NeuFlow v2：稠密位移场 + Middlebury 色轮着色、EPE 度量。
-    **发的是 int16**：int8 会退化成一条约 1.9 px 的平噪声底，快像素看着没事、
-    慢像素全是噪声，而编译器给它报的输出余弦是 0.9954 —— 回归物理量的头要用
-    那个量的单位打分，不能用余弦。19.3 ms 纯 BPU。
-  - **工业异常检测** —— GLASS 单类检测：只用某产品的**正常**图训练，输出逐像素
-    异常图。图像分数取**最大值不取均值**（零件有多坏取决于最坏那块）。骨干是冻结
-    的 ImageNet WideResNet-50，每个产品只训两个小头，所以随库的模型是**示例**、
-    阈值是产线级决策。MVTec-AD bottle 上图像/像素 AUROC 均 0.9905，与浮点持平。
-  - **端到端驾驶** —— DiffusionDrive：三目拼接相机 + 点云 BEV 直方图 + 自车状态
-    进，4 秒规划轨迹 + 30 个目标 + 7 类 BEV 语义图出。本仓第一个**输入也是量化**
-    的模型（四个输入都是带 scale 的 int16，直接塞 float 字节会照跑但在跑噪声）。
-    120 帧真实数据上板端对 FP32 轨迹余弦 0.9994。
-  - **激光雷达 3-D 检测** —— PointPillars：点云进，带朝向的 3-D 框出。整条链
-    自己拆开（体素化 → VFE → scatter → 骨干+头 → 解码 + BEV NMS），因为各段
-    成本差得极远。anchor 解码放 CPU：官方图把它烘进 `ScatterND`，那东西**编译
-    不报错、产物却从不写输出**。
-  - 检测头同时支持 **PTQ（NV12 两平面）与 QAT 导出的浮点输入** 模型
-    （`detect_float` / `letterbox_chw_float`）。
 - **硬件预处理** —— VPS GDC 引擎上的固定几何变换：硬件 letterbox 与任意密集
   重映射 `GdcRemap`（cv2.remap 语义，用于双目立体校正；2448×2048 约 6.3ms，
   CPU 基本空闲）。

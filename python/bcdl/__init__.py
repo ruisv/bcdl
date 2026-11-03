@@ -1,4 +1,4 @@
-"""BCDL — BPU Computational Deep Learning (Python wrapper).
+"""BCDL — BPU Common Deep Learning (Python wrapper).
 
 Thin numpy-friendly layer over the compiled ``bcdl_py`` extension. The C++ core
 exchanges raw bytes; this wrapper reshapes outputs into numpy arrays.

@@ -27,6 +27,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   builds.
 
 ### Added
+- **`examples/voice_assistant.py` and `voice_assistant.cc`**: a voice-controlled
+  robot end to end — wake word, VAD, recognition, command matching and a
+  spoken reply, fed in 100 ms blocks as from a microphone. With no recording
+  it synthesises a demo session first, so it runs on a board with no
+  microphone. The API reference gains a voice-pipeline overview: audio format,
+  how to make a wake word, a tuning table and the usual pitfalls.
 - **Speech recognition: `ParaformerAsr`** (Chinese, non-autoregressive). One
   16 kHz mono utterance in, text out: a C++ Kaldi-compatible front end
   (`Fbank`, `lfr_stack`, `Cmvn` — `torchaudio.compliance.kaldi.fbank` to ~2e-4,
@@ -96,6 +102,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `las2_l_resize2_nashm.hbm`): twice M's aggregation depth, bad-1px 14.2% →
   11.0% on the crop set, at 44 FPS against M's 72. The gain is close-range;
   see the "LAS2: M or L" section of `docs/MODELS.md`.
+
+### Changed
+- **BCDL now stands for BPU Common Deep Learning**, and the README presents it
+  as a framework for vision *and* speech; the speech pieces are grouped on
+  their own in the capability list.
 
 ## [0.7.5] — 2026-08
 

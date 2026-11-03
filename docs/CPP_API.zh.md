@@ -629,6 +629,13 @@ std::vector<bcdl::TextBox> boxes = det.postprocess(lb);
 
 ---
 
+## 语音链
+
+唤醒词 → 端点检测 → 识别 → 指令匹配 → 语音回复，网络全在 BPU：
+[`examples/voice_assistant.cc`](../examples/voice_assistant.cc) 是整个流程的 C++ 写法
+（读 WAV、回复写成 WAV；不给输入时先合成一段演示录音）。音频格式、唤醒词 token 和调参见
+[语音链总览](API.zh.md#语音链总览)；各个类的说明在下面。
+
 ## 语音识别（Paraformer）
 
 `bcdl/preproc/fbank.h` 是与 Kaldi 兼容的前端；`bcdl/tasks/asr.h` 提供 CIF、token 解码和三段式的

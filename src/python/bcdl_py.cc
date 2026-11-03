@@ -117,7 +117,7 @@ nb::ndarray<nb::numpy, T> toNumpy(std::vector<T> vec,
 }  // namespace
 
 NB_MODULE(bcdl_py, m) {
-  m.doc() = "BCDL — BPU Computational Deep Learning (C++ core)";
+  m.doc() = "BCDL — BPU Common Deep Learning (C++ core)";
   m.attr("__version__") = BCDL_VERSION_STRING;
 
   nb::class_<bcdl::Engine>(m, "Engine")
