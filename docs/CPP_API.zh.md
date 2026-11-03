@@ -14,7 +14,8 @@ C++ 库（命名空间 `bcdl`）的完整参考。[`include/bcdl/`](../include/b
   [姿态 Pose](#姿态-pose) · [全身姿态 WholeBody](#全身姿态-wholebody) ·
   [超分 SuperRes](#超分-superres) · [稀疏特征点 XFeat](#稀疏特征点-xfeat) ·
   [实例分割 InstanceSeg](#实例分割-instanceseg) · [旋转框 OBB](#旋转框-obb) ·
-  [语义分割 Segmentation](#语义分割-segmentation) · [深度 Depth](#深度-depth) · [OCR](#ocr)
+  [语义分割 Segmentation](#语义分割-segmentation) · [深度 Depth](#深度-depth) · [OCR](#ocr) ·
+  [语音识别](#语音识别paraformer)
 - 多媒体：[JPEG JPU](#jpeg-jpu) · [视频 VPU](#视频-vpu)
 - 跟踪与流水线：[ByteTracker](#bytetracker) · [DetectionPipeline](#detectionpipeline) ·
   [AsyncDetectionPipeline](#asyncdetectionpipeline) ·
@@ -148,6 +149,7 @@ std::size_t obytes = engine.outputBytes(0);
 | `Engine(hbm_path, model_name="")` | 加载模型（包里有多个时按名字挑）。 |
 | `modelName()` | 当前模型名。 |
 | `numInputs()` / `numOutputs()` | 张量个数。 |
+| `inputName(i)` / `outputName(i)` | 编译进模型的张量名（即 ONNX 里的名字）。 |
 | `inputShape(i)` / `outputShape(i)` | `std::vector<int>` 形状。 |
 | `inputType(i)` / `outputType(i)` | `hbDNN` 张量类型枚举。 |
 | `inputProperties(i)` / `outputProperties(i)` | 完整的 `hbDNNTensorProperties`（dtype、量化、stride）。 |
@@ -624,6 +626,161 @@ std::vector<bcdl::TextBox> boxes = det.postprocess(lb);
 
 完整的 det→cls→rec 串接见 [`examples/ocr_demo.cc`](../examples/ocr_demo.cc)
 （裁剪顺序与字典约定都在那里处理了）。
+
+---
+
+## 语音识别（Paraformer）
+
+`bcdl/preproc/fbank.h` 是与 Kaldi 兼容的前端；`bcdl/tasks/asr.h` 提供 CIF、token 解码和三段式的
+`ParaformerAsr`。输入一段 16 kHz 单声道语音，最长 `maxSeconds()`（随库模型为 24 秒），输出文字。
+
+```cpp
+bcdl::Engine enc("models/paraformer_encoder_int16.hbm");
+bcdl::Engine pred("models/paraformer_predictor_int16_v2.hbm");
+bcdl::Engine dec("models/paraformer_decoder_int16_v2.hbm");
+bcdl::ParaformerAsr asr(enc, pred, dec,
+                        bcdl::loadTokenList("models/paraformer_tokens_8404.json"),
+                        bcdl::loadKaldiCmvn("models/paraformer_am.mvn"));
+bcdl::AsrResult r = asr.transcribe(pcm, num_samples);   // float，范围 [-1, 1]
+// r.text, r.token_ids, r.feature_frames, r.truncated
+
+bcdl::Fbank fbank;                                         // FbankConfig{} = 16 kHz, 80 mel
+std::vector<float> feats;
+int frames = fbank.compute(pcm, num_samples, feats);       // [帧数, 80]
+// 纯函数: lfrStack(feats, frames, dim, lfr_m, lfr_n, out) · parseKaldiCmvn(text)
+// 纯函数: cifIntegrate(alphas, hidden, frames, dim, valid_frames, cfg, embeds)
+// 纯函数: argmaxTokens(logits, rows, vocab) · tokensToText(ids, vocab)
+```
+
+| 成员 | 说明 |
+|---|---|
+| `transcribe(pcm, samples, timeout_ms)` | 前端 + 三段 BPU + CIF。超过窗口长度的部分截掉，并置 `truncated` |
+| `transcribeFeatures(feats, frames, timeout_ms)` | 从 `[帧数, featureDim()]` 的 LFR+CMVN 特征开始 |
+| `features(pcm, samples, out)` | 只跑前端 |
+| `maxFrames()` · `maxSeconds()` · `featureDim()` · `maxTokens()` · `vocabSize()` | 从 Engine 读出的模型尺寸 |
+
+`ParaformerAsr` 按张量形状、而不是按下标去对应三段模型；token 表大小和 decoder 的类别数对不上时会直接拒绝。
+`cifIntegrate` 把 `CifConfig::tail_threshold` 放在第 `valid_frames` 帧，也就是语音真正结束的位置。
+定长的 predictor 图只能把它加在补零区的末尾，而补零区随后会被屏蔽掉，尾部权重也跟着没了，
+于是凡是最后一个 token 要靠尾部权重才能发放的句子，都会丢掉它。
+
+
+### 语音端点检测：`bcdl/tasks/vad.h`
+
+```cpp
+bcdl::Engine eng("models/silero_vad_16k_int16_nashm.hbm");
+bcdl::SileroVad vad(eng);                     // 有状态：一个对象对应一路音频流
+float p = vad.probability(chunk);             // 512 个采样点（32 ms）-> 语音概率
+bcdl::VadSegmenter seg(vad);                  // VadConfig{}：阈值 0.5，开 250 ms，关 300 ms
+for (auto& s : seg.feed(pcm, n))              // 任意长度；返回本次结束的语句
+  asr.transcribe(s.pcm.data(), s.pcm.size()); // s.start / s.end：自 reset() 起的采样点
+for (auto& s : seg.flush()) { /* 流结束 */ }
+```
+
+| 成员 | 说明 |
+|---|---|
+| `SileroVad::probability(chunk, timeout_ms)` · `reset()` | `kChunk` = 512；内部保存 LSTM 状态和上一块的最后 64 个采样点 |
+| `VadSegmenter::feed(pcm, n)` · `flush()` · `segments(pcm, n)` | 返回 `VadSegment{start, end, pcm}`；`segments` = reset + feed + flush |
+| `inSpeech()` · `lastProbability()` · `config()` | |
+| `VadConfig` | `threshold`、`neg_threshold`（< 0 时等于 threshold）、`min_speech_ms`、`min_silence_ms`、`speech_pad_ms`、`max_speech_s` |
+
+模型自带的 STFT（4 帧 256 点 Hann 窗，帧移 128）在 CPU 上算，BPU 只接收幅度谱：在 BPU 上做平方，
+功率值域约 5000，int16 会丢掉所有小幅值频点。概率连续 `min_speech_ms` 不低于 `threshold` 时开始一段，
+连续 `min_silence_ms` 低于 `neg_threshold` 时结束；一段达到 `max_speech_s` 就在此切开，接着开新的一段。
+
+
+### 唤醒词检测：`bcdl/tasks/kws.h`
+
+```cpp
+bcdl::Engine enc("models/kws_zipformer_zh_en_3m_c16_int16_nashm.hbm");
+bcdl::KeywordSpotter kws(enc, "models/kws_zipformer_zh_en_3m_decoder_joiner.npy",
+                         "models/kws_zipformer_zh_en_3m_tokens.txt");   // KwsConfig{}
+kws.setKeywords("n ǐ h ǎo x iǎo ch ē @你好小车\n"
+                "x iǎo ch ē x iǎo ch ē :1.5 #0.3 @小车小车\n");    // 或 loadKeywords(path)
+for (const bcdl::KwsDetection& d : kws.feed(pcm, n))     // 任意长度，浮点 [-1, 1]
+  printf("%s at %.2f s\n", d.keyword.c_str(), d.end);
+```
+
+| 成员 | 说明 |
+|---|---|
+| `setKeywords(text)` · `loadKeywords(path)` · `keywords()` | 每行一个唤醒词：模型 token、可选 `:boost` 和 `#threshold`、`@短语`；会重置音频流 |
+| `feed(pcm, n, timeout_ms)` | 返回 `KwsDetection{keyword, index, start, end, tokens}`，时间为自 `reset()` 起的秒数 |
+| `flush(timeout_ms)` | 流结束：用静音把最后不满一块的音频推过去，返回检测结果并重置 |
+| `reset()` · `encode(pcm, n, frames)` · `tokenId(tok)` · `vocabSize()` | `encode` 返回整段录音的编码器输出（测试用） |
+| `KwsConfig` | `keywords_score`（1.0）、`keywords_threshold`（0.25）、`num_trailing_blanks`（1）、`max_active_paths`（4），与 sherpa-onnx 默认值相同 |
+
+编码器在 BPU 上每次处理 160 ms，调用之间带着 38 个缓存张量；解码器、joiner 和关键词搜索
+（在唤醒词的 Aho-Corasick 图上做束搜索）在 CPU 上，逐步照搬 sherpa-onnx 的 KeywordSpotter：
+同一套搜索的浮点版在 87 段核对片段上与 sherpa-onnx 的检测结果完全一致。特征是 Kaldi fbank，Povey 窗、采样值取 [-1, 1]（`FbankConfig::window`、`input_scale`）。
+
+
+### 语音指令：`bcdl/tasks/command.h`
+
+```cpp
+bcdl::CommandMatcher m({"前进", "后退", "左转", "右转", "打开灯", "关灯"});  // max_distance 0.5
+bcdl::CommandMatch c = m.match(r.text);   // "大开灯" -> index 4，distance 0
+if (c.index >= 0) { /* c.command */ }
+// 纯函数: toPinyin(text) -> std::vector<std::string>，每个汉字一个无声调音节
+```
+
+| 成员 | 说明 |
+|---|---|
+| `match(text)` | 返回 `CommandMatch{index（-1 = 拒绝）, nearest, distance, command}` |
+| `distances(text)` | 到每条指令的归一化音节编辑距离 |
+| `commands()` · `size()` · `maxDistance()` | |
+
+距离 = 音节编辑距离 ÷ 指令音节数；距离相同时取长度更接近的，再取靠前的。英文单词只和英文单词比。
+在 40 条指令上，把 Paraformer 的整句正确率从 84.7% / 82.8%（干净 / 5 dB）提到匹配正确 96.9% / 95.6%，
+600 句新闻零误接受。拼音表（U+3400..U+9FFF）编译进库，由 `scripts/gen_pinyin_table.py` 生成。
+
+
+### 语音合成后端：`bcdl/preproc/istft.h`、`bcdl/tasks/vocoder.h`
+
+```cpp
+bcdl::Engine eng("models/vocos_16k_t256_int16_nashm.hbm");
+bcdl::VocosVocoder voc(eng);                       // VocosConfig{}：context 32，pad -16
+std::vector<float> pcm;
+int n = voc.synthesize(mel, frames, pcm);          // mel [80, frames] 行主序 -> 16 kHz PCM
+// 纯函数: Istft(IstftConfig{}).compute(real, imag, frames, out)        // 都是 [frames, 513]
+// 纯函数: Istft::computePolar(mag, cos, sin, frames, out)               // 都是 [513, frames]
+```
+
+| 成员 | 说明 |
+|---|---|
+| `synthesize(mel, frames, pcm, timeout_ms)` | 按 `chunkFrames()` 分块、每边重叠 `context`；返回 `(frames - 1) * hop` |
+| `numMels()` · `chunkFrames()` · `bodyFrames()` · `sampleRate()` | 从 Engine 读出的几何参数 |
+
+Engine 必须按顺序输出 `log_mag` 和 `phase`（`[1, 513, T]`）；`exp`、幅度截断、`cos`、`sin`
+和 iSTFT 都在 CPU 上做。`context >= 27` 时块之间的拼接精确；只有整句两端用 `pad_value`
+代替网络自身的零填充。
+
+
+### 语音合成：`bcdl/tasks/tts.h`
+
+```cpp
+bcdl::Engine enc("models/matcha_zh_en_enc_l128_int16_nashm.hbm");
+bcdl::Engine dec("models/matcha_zh_en_dec_t512_int16_nashm.hbm");
+bcdl::Engine voc_eng("models/vocos_16k_t256_int16_nashm.hbm");
+bcdl::MatchaAcoustic am(enc, dec, "models/matcha_zh_en_embedding.npy");  // MatchaConfig{}
+bcdl::VocosVocoder voc(voc_eng);
+bcdl::TextToSpeech tts(bcdl::MatchaFrontend("models/matcha_zh_en_tokens.txt",
+                                            "models/matcha_zh_en_lexicon.txt"),
+                       am, voc);
+bcdl::TtsResult r = tts.synthesize("好的，马上出发。");   // r.pcm，16 kHz
+```
+
+| 成员 | 说明 |
+|---|---|
+| `MatchaFrontend::encode(text)` | 每句一个 id 向量；与 sherpa-onnx 前端一致 |
+| `MatchaFrontend::readNumbers(text)` | 把数字读成汉字（静态函数） |
+| `MatchaAcoustic::synthesize(ids, n, timeout_ms)` | 返回 `MatchaResult{mel [80, frames], frames, durations, truncated}` |
+| `MatchaAcoustic::seed(s)` · `maxTokens()` · `maxFrames()` · `numMels()` · `vocabSize()` | |
+| `TextToSpeech::synthesize(text, timeout_ms)` | 返回 `TtsResult{pcm, sample_rate, sentences, truncated}`；停顿按 `TextToSpeechConfig::silence_scale`（0.2）压缩 |
+| `scaleSilence(pcm, sample_rate, scale, min_pause_s, level)` | 纯函数；不短于 `min_pause_s` 的停顿保留 `scale` 倍（sherpa-onnx 的规则） |
+
+编码器吃的是词嵌入而不是 id：查表在 CPU 上做，表是 `.npy`（`[vocab, D]`，已预先缩放）。时长为
+`ceil(exp(logw)) * length_scale`，在 CPU 上按 Matcha 的 `generate_path` 精确展开；解码器的噪声来自
+带种子的 `std::mt19937`。
 
 ---
 

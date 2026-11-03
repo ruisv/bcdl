@@ -27,6 +27,71 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   builds.
 
 ### Added
+- **Speech recognition: `ParaformerAsr`** (Chinese, non-autoregressive). One
+  16 kHz mono utterance in, text out: a C++ Kaldi-compatible front end
+  (`Fbank`, `lfr_stack`, `Cmvn` — `torchaudio.compliance.kaldi.fbank` to ~2e-4,
+  the float32 floor, and bit-exact with FunASR's LFR), the official three-stage int16 Paraformer-large
+  build on the BPU, and continuous integrate-and-fire (`cif_integrate`) on the
+  CPU between predictor and decoder. ~36 ms per utterance on the S100P,
+  front end included. `scripts/fetch_models.sh` downloads the build; four
+  AISHELL-1 clips in `data/audio/` drive the board test.
+- The CIF puts the predictor's tail weight at the **true end of speech**. The
+  fixed-shape build adds it at the end of its 24 s padding, where masking the
+  padding removes it, so any utterance whose last character needed the tail lost it:
+  on the 300 shortest AISHELL-1 test utterances that is 3.88% CER against
+  2.72% with the tail restored (float model: 1.76%).
+- **Wake words: `KeywordSpotter`**. sherpa-onnx's open-vocabulary zipformer2
+  KWS model (zh-en, 3M): the encoder on the BPU one 160 ms chunk per call, the
+  decoder, joiner and keyword search on the CPU, step for step as sherpa-onnx's
+  KeywordSpotter (in float, the same search gave sherpa-onnx's detections on
+  all 87 clips checked). A wake word is a line of tokens
+  (`n ǐ h ǎo x iǎo ch ē @你好小车`), not a model. Recall 97.5% / 89.1% (clean / noisy) against
+  96.5% / 87.1% for float, no false wake-ups in 4.4 h of speech and noise,
+  5.7% / 4.0% of confusable phrases fire (float 5.4% / 4.6%); 2.0 ms of BPU
+  per 160 ms, real-time factor 0.023 all in. The
+  published encoder needed four rewrites to compile (int64 mask input,
+  softplus, relative-position gathers, over-padded depthwise convs); see
+  MODELS.md. `FbankConfig.window` (`"povey"`) is new, for icefall models.
+- **Voice activity detection: `SileroVad`** and `VadSegmenter`. Silero VAD
+  v6.2.3 on the BPU, one call per 32 ms chunk, with a streaming segmenter that
+  hands whole utterances to the recogniser. On 100 noisy AISHELL-1 sessions (10 / 0 dB SNR) frame F1 is
+  0.924 / 0.863 against 0.929 / 0.870 for the float model, the end of speech
+  is declared a median 0.36 s after the speaker stops, and 24 minutes of noise
+  alone produce no speech; 0.39 ms per chunk. The model's STFT
+  runs on the CPU: compiled whole, the squared spectrum spans ~5000 on the BPU,
+  int16 loses the quiet bins and the probability sagged mid-sentence.
+  `Engine.input_name` / `output_name` (C++ `inputName` / `outputName`) are new.
+- **Voice commands: `CommandMatcher`** and `to_pinyin`. Matches recogniser
+  text against a fixed command list in toneless pinyin, so homophones
+  (打开灯 → 大开灯) and trailing particles (前进 → 前进了) still map to the right
+  command and non-commands are rejected. On 40 commands × 9 synthetic voices it
+  takes Paraformer from 84.7% / 82.8% exact (clean / 5 dB SNR) to 96.9% /
+  95.6% matched, 0.6% / 1.1% wrong command, no false accepts on 600 news
+  sentences; a few µs per call. The pinyin table is compiled in
+  (`scripts/gen_pinyin_table.py`, from pypinyin, MIT).
+- **Speech synthesis: `TextToSpeech`** — Chinese text in, 16 kHz speech out,
+  every network on the BPU: `MatchaFrontend` (sherpa-onnx's lexicon front end
+  for Matcha-TTS zh-en, reproduced id for id on 100 sentences, plus reading out
+  digits), `MatchaAcoustic` (two int16 graphs, length regulation on the CPU) and
+  `VocosVocoder`. Round-trip CER 1.73% on 60 sentences against 1.61% for the
+  float model on the CPU, at RTF 0.009 (26 ms per sentence). A fixed-length
+  export of stock Matcha is not the model: its GroupNorm and its additive 0/1
+  attention mask both depend on how much padding there is, so the decoder's
+  were rewritten to see exactly the unpadded frames (9e-5 from float). Token
+  ids are looked up on the CPU because the compiler quantised a float id input
+  to a range of 127. Pauses of 0.2 s or more are shortened to
+  `TextToSpeechConfig.silence_scale` (0.2, as sherpa-onnx; `scale_silence` on
+  its own): 225 s of audio for the 60 sentences becomes 172 s (sherpa-onnx:
+  176 s), round-trip CER unchanged.
+- **Speech synthesis back end: `VocosVocoder`** and `Istft`. Mel spectrogram in,
+  16 kHz waveform out: Vocos (the Matcha-TTS zh-en vocoder) converted to an
+  int16 BPU build with a fixed 256-frame window, the inverse STFT in C++ on the
+  CPU. Longer mels are chunked with exact seams. 7.9 ms per 3 s of audio (RTF
+  0.0026); 0.54 dB log-spectral distance from float over the audible cells, and
+  Paraformer transcribes the output exactly. The graph is cut before `exp` and
+  `cos`/`sin`: compiled as published, the quantised `cos`/`sin` take the phase
+  to cosine 0.58 at int8 and 0.97–0.99 at int16. int8 is rejected too — still
+  intelligible, but 5.4 dB from float, a noise floor.
 - **LAS2-L stereo builds** (`las2_l_crop2_nashm.hbm`,
   `las2_l_resize2_nashm.hbm`): twice M's aggregation depth, bad-1px 14.2% →
   11.0% on the crop set, at 44 FPS against M's 72. The gain is close-range;

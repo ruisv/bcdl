@@ -6,6 +6,7 @@ exchanges raw bytes; this wrapper reshapes outputs into numpy arrays.
 
 from __future__ import annotations
 
+import os
 import warnings
 
 import numpy as np
@@ -42,6 +43,12 @@ class Engine:
     @property
     def num_outputs(self) -> int:
         return self._e.num_outputs
+
+    def input_name(self, i: int) -> str:
+        return self._e.input_name(i)
+
+    def output_name(self, i: int) -> str:
+        return self._e.output_name(i)
 
     def input_shape(self, i: int) -> list[int]:
         return self._e.input_shape(i)
@@ -1541,6 +1548,336 @@ class AsyncVideoDetectionPipeline:
         """Per-stage timing incl. decode_ms (VPU decode + NV12->BGR)."""
         return self._p.profile()
 
+# --- speech: Kaldi fbank front end + Paraformer ASR --------------------------
+# The front end is the C++ one, bound, rather than a numpy re-implementation:
+# a model trained on kaldi.fbank features transcribes worse — silently — on
+# features that are merely similar, so there is exactly one definition of them.
+FbankConfig = bcdl_py.FbankConfig
+Fbank = bcdl_py.Fbank
+lfr_stack = bcdl_py.lfr_stack
+Cmvn = bcdl_py.Cmvn
+parse_kaldi_cmvn = bcdl_py.parse_kaldi_cmvn
+load_kaldi_cmvn = bcdl_py.load_kaldi_cmvn
+CifConfig = bcdl_py.CifConfig
+cif_integrate = bcdl_py.cif_integrate
+load_token_list = bcdl_py.load_token_list
+argmax_tokens = bcdl_py.argmax_tokens
+tokens_to_text = bcdl_py.tokens_to_text
+AsrResult = bcdl_py.AsrResult
+ParaformerConfig = bcdl_py.ParaformerConfig
+to_pinyin = bcdl_py.to_pinyin
+CommandMatch = bcdl_py.CommandMatch
+CommandMatcher = bcdl_py.CommandMatcher
+VadConfig = bcdl_py.VadConfig
+KwsConfig = bcdl_py.KwsConfig
+KwsDetection = bcdl_py.KwsDetection
+VadSegment = bcdl_py.VadSegment
+IstftConfig = bcdl_py.IstftConfig
+Istft = bcdl_py.Istft
+VocosConfig = bcdl_py.VocosConfig
+MatchaFrontendConfig = bcdl_py.MatchaFrontendConfig
+MatchaFrontend = bcdl_py.MatchaFrontend
+MatchaConfig = bcdl_py.MatchaConfig
+MatchaResult = bcdl_py.MatchaResult
+TtsResult = bcdl_py.TtsResult
+TextToSpeechConfig = bcdl_py.TextToSpeechConfig
+
+
+def scale_silence(pcm, sample_rate: int, scale: float, min_pause_s: float = 0.2,
+                  level: float = 0.01) -> np.ndarray:
+    """Shorten every pause (``|x| <= level`` for at least ``min_pause_s``) to
+    ``scale`` of its length — sherpa-onnx's silence_scale. float32 PCM in and out."""
+    return bcdl_py.scale_silence(np.ascontiguousarray(pcm, dtype=np.float32).reshape(-1),
+                                 sample_rate, scale, min_pause_s, level)
+
+
+class ParaformerAsr:
+    """Non-autoregressive speech recognition: one 16 kHz utterance in, text out.
+
+    Three compiled stages (encoder, predictor, decoder) with continuous
+    integrate-and-fire on the CPU between the last two. Feed ONE utterance of at
+    most :attr:`max_seconds` — longer audio is truncated and flagged on the
+    result, so segment it with a VAD first. There is no resampler: the PCM must
+    already be 16 kHz mono float in [-1, 1]."""
+
+    def __init__(self, encoder: "Engine", predictor: "Engine", decoder: "Engine",
+                 vocab, cmvn: "Cmvn", config: "ParaformerConfig | None" = None):
+        self.encoder, self.predictor, self.decoder = encoder, predictor, decoder
+        self.config = config if config is not None else ParaformerConfig()
+        self._a = bcdl_py.ParaformerAsr(encoder._e, predictor._e, decoder._e, list(vocab),
+                                        cmvn, self.config)
+
+    @classmethod
+    def from_files(cls, encoder: str, predictor: str, decoder: str, tokens: str,
+                   cmvn: str, config: "ParaformerConfig | None" = None) -> "ParaformerAsr":
+        """Build from the three ``.hbm`` paths, a token list and an ``am.mvn``."""
+        return cls(Engine(encoder), Engine(predictor), Engine(decoder),
+                   load_token_list(tokens), load_kaldi_cmvn(cmvn), config)
+
+    def transcribe(self, pcm: np.ndarray, timeout_ms: int = 0) -> "AsrResult":
+        """Mono 16 kHz PCM (float in [-1, 1], or int16) -> AsrResult."""
+        return self._a.transcribe(_as_float_pcm(pcm), timeout_ms)
+
+    def transcribe_features(self, feats: np.ndarray, timeout_ms: int = 0) -> "AsrResult":
+        """(frames, feature_dim) LFR + CMVN features -> AsrResult."""
+        return self._a.transcribe_features(np.ascontiguousarray(feats, dtype=np.float32),
+                                           timeout_ms)
+
+    def features(self, pcm: np.ndarray) -> np.ndarray:
+        """Front end only: PCM (float in [-1, 1], or int16) -> (frames, feature_dim)
+        normalised features."""
+        return self._a.features(_as_float_pcm(pcm))
+
+    @property
+    def max_seconds(self) -> float:
+        return self._a.max_seconds
+
+    @property
+    def max_frames(self) -> int:
+        return self._a.max_frames
+
+    @property
+    def feature_dim(self) -> int:
+        return self._a.feature_dim
+
+    @property
+    def max_tokens(self) -> int:
+        return self._a.max_tokens
+
+    @property
+    def vocab_size(self) -> int:
+        return self._a.vocab_size
+
+
+def _as_float_pcm(pcm) -> np.ndarray:
+    """float in [-1, 1] as is; int16 rescaled to it (not just cast)."""
+    pcm = np.asarray(pcm)
+    if pcm.dtype == np.int16:
+        pcm = pcm.astype(np.float32) / 32768.0
+    return np.ascontiguousarray(pcm, dtype=np.float32).reshape(-1)
+
+
+class SileroVad:
+    """Silero VAD v6 on the BPU: speech probability per 512-sample (32 ms)
+    chunk of 16 kHz audio. Streaming: the network's state and the previous
+    chunk's tail carry over between calls, so feed one stream in order and
+    :meth:`reset` between streams."""
+
+    chunk = bcdl_py.SileroVad.chunk
+    sample_rate = bcdl_py.SileroVad.sample_rate
+
+    def __init__(self, engine: "Engine | str"):
+        self.engine = Engine(engine) if isinstance(engine, str) else engine
+        self._v = bcdl_py.SileroVad(self.engine._e)
+
+    def probability(self, chunk, timeout_ms: int = 0) -> float:
+        """512 samples (float in [-1, 1], or int16) -> speech probability."""
+        return self._v.probability(_as_float_pcm(chunk), timeout_ms)
+
+    def probabilities(self, pcm, timeout_ms: int = 0) -> np.ndarray:
+        """A whole recording from a reset -> one probability per full chunk."""
+        pcm = _as_float_pcm(pcm)
+        self.reset()
+        n = len(pcm) // self.chunk
+        return np.array([self._v.probability(pcm[i * self.chunk:(i + 1) * self.chunk], timeout_ms)
+                         for i in range(n)], dtype=np.float32)
+
+    def reset(self) -> None:
+        self._v.reset()
+
+
+class VadSegmenter:
+    """Cuts a 16 kHz stream into utterances with a :class:`SileroVad`.
+
+    ``feed(pcm)`` takes audio of any length and returns the :class:`VadSegment`
+    s that closed during it (``start``/``end`` in samples since the last reset,
+    ``pcm`` ready for :meth:`ParaformerAsr.transcribe`); ``flush()`` ends the
+    stream. ``segments(pcm)`` does a whole recording at once."""
+
+    def __init__(self, vad: "SileroVad | Engine | str", config: "VadConfig | None" = None):
+        self.vad = vad if isinstance(vad, SileroVad) else SileroVad(vad)
+        self.config = config if config is not None else VadConfig()
+        self._s = bcdl_py.VadSegmenter(self.vad._v, self.config)
+
+    def feed(self, pcm, timeout_ms: int = 0) -> "list[VadSegment]":
+        return self._s.feed(_as_float_pcm(pcm), timeout_ms)
+
+    def flush(self) -> "list[VadSegment]":
+        return self._s.flush()
+
+    def segments(self, pcm, timeout_ms: int = 0) -> "list[VadSegment]":
+        return self._s.segments(_as_float_pcm(pcm), timeout_ms)
+
+    def reset(self) -> None:
+        self._s.reset()
+
+    @property
+    def in_speech(self) -> bool:
+        return self._s.in_speech
+
+    @property
+    def last_probability(self) -> float:
+        return self._s.last_probability
+
+
+class KeywordSpotter:
+    """Wake words on the BPU: a streaming zipformer transducer (sherpa-onnx's
+    KWS model) whose encoder runs one 160 ms chunk per call, with the decoder,
+    joiner and keyword search on the CPU. Keywords are token lines in
+    sherpa-onnx's format (``"n ǐ h ǎo x iǎo ch ē @你好小车"``), so a new wake
+    word needs no new model. Streaming: feed one stream in order."""
+
+    def __init__(self, encoder: "Engine | str", decoder_joiner: str, tokens: str,
+                 keywords: "str | None" = None, config: "KwsConfig | None" = None):
+        self.engine = Engine(encoder) if isinstance(encoder, str) else encoder
+        self.config = config if config is not None else KwsConfig()
+        self._k = bcdl_py.KeywordSpotter(self.engine._e, decoder_joiner, tokens, self.config)
+        if keywords is not None:
+            if "\n" not in keywords and os.path.isfile(keywords):
+                self._k.load_keywords(keywords)
+            else:
+                self._k.set_keywords(keywords)
+
+    def set_keywords(self, text: str) -> None:
+        """Keyword lines (``tokens [:boost] [#threshold] @phrase``); resets the stream."""
+        self._k.set_keywords(text)
+
+    def load_keywords(self, path: str) -> None:
+        self._k.load_keywords(path)
+
+    @property
+    def keywords(self) -> "list[str]":
+        return self._k.keywords
+
+    def feed(self, pcm, timeout_ms: int = 0) -> "list[KwsDetection]":
+        """16 kHz PCM (float in [-1, 1], or int16), any length -> what fired."""
+        return self._k.feed(_as_float_pcm(pcm), timeout_ms)
+
+    def flush(self, timeout_ms: int = 0) -> "list[KwsDetection]":
+        """End of stream: pushes the last partial chunk through with silence,
+        returns what fires, then resets. Call it when a recording ends."""
+        return self._k.flush(timeout_ms)
+
+    def encode(self, pcm, timeout_ms: int = 0) -> np.ndarray:
+        """Encoder output ``(frames, D)`` for a whole recording, from a reset."""
+        return self._k.encode(_as_float_pcm(pcm), timeout_ms)
+
+    def reset(self) -> None:
+        self._k.reset()
+
+    def token_id(self, token: str) -> int:
+        return self._k.token_id(token)
+
+    @property
+    def vocab_size(self) -> int:
+        return self._k.vocab_size
+
+
+class VocosVocoder:
+    """Mel spectrogram -> waveform: Vocos on the BPU, inverse STFT on the CPU.
+
+    The compiled model takes a fixed number of mel frames (:attr:`chunk_frames`);
+    longer input is cut into overlapping chunks whose seams are exact. Feed the
+    ``(num_mels, frames)`` log-mel an acoustic model such as Matcha-TTS emits;
+    the result is float PCM at :attr:`sample_rate`, ``(frames - 1) * hop``
+    samples long."""
+
+    def __init__(self, engine: "Engine | str", config: "VocosConfig | None" = None):
+        self.engine = Engine(engine) if isinstance(engine, str) else engine
+        self.config = config if config is not None else VocosConfig()
+        self._v = bcdl_py.VocosVocoder(self.engine._e, self.config)
+
+    def synthesize(self, mel: np.ndarray, timeout_ms: int = 0) -> np.ndarray:
+        """``(num_mels, frames)`` log-mel (a leading batch of 1 is accepted) -> float32 PCM."""
+        mel = np.asarray(mel, dtype=np.float32)
+        if mel.ndim == 3 and mel.shape[0] == 1:
+            mel = mel[0]
+        return self._v.synthesize(np.ascontiguousarray(mel), timeout_ms)
+
+    @property
+    def num_mels(self) -> int:
+        return self._v.num_mels
+
+    @property
+    def chunk_frames(self) -> int:
+        return self._v.chunk_frames
+
+    @property
+    def body_frames(self) -> int:
+        return self._v.body_frames
+
+    @property
+    def sample_rate(self) -> int:
+        return self._v.sample_rate
+
+
+class MatchaAcoustic:
+    """Matcha-TTS acoustic model: one sentence's token ids -> log-mel.
+
+    Two compiled graphs (encoder with the duration predictor; decoder with three
+    flow-matching steps), length regulation on the CPU between them."""
+
+    def __init__(self, encoder: "Engine | str", decoder: "Engine | str", embedding: str,
+                 config: "MatchaConfig | None" = None):
+        self.encoder = Engine(encoder) if isinstance(encoder, str) else encoder
+        self.decoder = Engine(decoder) if isinstance(decoder, str) else decoder
+        self.config = config if config is not None else MatchaConfig()
+        self._a = bcdl_py.MatchaAcoustic(self.encoder._e, self.decoder._e, embedding,
+                                         self.config)
+
+    def synthesize(self, ids, timeout_ms: int = 0) -> "MatchaResult":
+        return self._a.synthesize([int(i) for i in ids], timeout_ms)
+
+    def seed(self, seed: int) -> None:
+        self._a.seed(seed)
+
+    @property
+    def max_tokens(self) -> int:
+        return self._a.max_tokens
+
+    @property
+    def max_frames(self) -> int:
+        return self._a.max_frames
+
+    @property
+    def num_mels(self) -> int:
+        return self._a.num_mels
+
+    @property
+    def vocab_size(self) -> int:
+        return self._a.vocab_size
+
+
+class TextToSpeech:
+    """Chinese text in, 16 kHz float PCM out — Matcha-TTS + Vocos, all on the board.
+
+    ``TextToSpeech.from_files(encoder, decoder, embedding, vocoder, tokens, lexicon)``; then
+    ``.synthesize(text).pcm``. Each sentence is synthesised on its own, the
+    audio concatenated, and pauses longer than 0.2 s shortened to
+    ``tts_config.silence_scale`` (0.2, as sherpa-onnx; 1 keeps them)."""
+
+    def __init__(self, frontend: "MatchaFrontend", acoustic: "MatchaAcoustic",
+                 vocoder: "VocosVocoder", tts_config: "TextToSpeechConfig | None" = None):
+        self.frontend, self.acoustic, self.vocoder = frontend, acoustic, vocoder
+        self.tts_config = tts_config if tts_config is not None else TextToSpeechConfig()
+        self._t = bcdl_py.TextToSpeech(frontend, acoustic._a, vocoder._v, self.tts_config)
+
+    @classmethod
+    def from_files(cls, encoder: str, decoder: str, embedding: str, vocoder: str, tokens: str,
+                   lexicon: str, config: "MatchaConfig | None" = None,
+                   tts_config: "TextToSpeechConfig | None" = None) -> "TextToSpeech":
+        return cls(MatchaFrontend(tokens, lexicon),
+                   MatchaAcoustic(encoder, decoder, embedding, config), VocosVocoder(vocoder),
+                   tts_config)
+
+    def synthesize(self, text: str, timeout_ms: int = 0) -> "TtsResult":
+        return self._t.synthesize(text, timeout_ms)
+
+    @property
+    def sample_rate(self) -> int:
+        return self.vocoder.sample_rate
+
+
 # --- OCR: DBNet detect / orientation cls / CTC recognize -------------------
 # decode_ctc/decode_dbnet/load_char_dict are pure (no model). The Engine-bound
 # TextRecognizer/TextAngleClassifier/DbTextDetector take engine._e and need an
@@ -1748,6 +2085,48 @@ __all__ = [
     "anomaly_mask",
     "anomaly_preprocess",
     "AnomalyDetector",
+    # speech recognition (fbank front end + Paraformer)
+    "FbankConfig",
+    "Fbank",
+    "lfr_stack",
+    "Cmvn",
+    "parse_kaldi_cmvn",
+    "load_kaldi_cmvn",
+    "CifConfig",
+    "cif_integrate",
+    "load_token_list",
+    "argmax_tokens",
+    "tokens_to_text",
+    "AsrResult",
+    "ParaformerConfig",
+    "ParaformerAsr",
+    "to_pinyin",
+    "CommandMatch",
+    "CommandMatcher",
+    # voice activity detection (Silero VAD + streaming segmenter)
+    "SileroVad",
+    "VadConfig",
+    "VadSegment",
+    "VadSegmenter",
+    # keyword spotting (wake word)
+    "KwsConfig",
+    "KwsDetection",
+    "KeywordSpotter",
+    # speech synthesis back end (iSTFT + Vocos)
+    "IstftConfig",
+    "Istft",
+    "VocosConfig",
+    "VocosVocoder",
+    # speech synthesis (Matcha-TTS front end + acoustic model, whole chain)
+    "MatchaFrontendConfig",
+    "MatchaFrontend",
+    "MatchaConfig",
+    "MatchaResult",
+    "MatchaAcoustic",
+    "TtsResult",
+    "TextToSpeech",
+    "TextToSpeechConfig",
+    "scale_silence",
     # dense optical flow
     "FlowConfig",
     "FlowField",

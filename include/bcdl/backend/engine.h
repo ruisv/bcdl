@@ -39,6 +39,10 @@ class Engine {
   int numInputs() const noexcept { return static_cast<int>(inputs_.size()); }
   int numOutputs() const noexcept { return static_cast<int>(outputs_.size()); }
 
+  /// Tensor names as compiled into the model (the ONNX input/output names).
+  std::string inputName(int i) const;
+  std::string outputName(int i) const;
+
   // Every index below is range-checked (throws bcdl::Error). These accessors are
   // re-exported straight to Python, where an out-of-range index used to build a
   // bytes object over a garbage pointer and take the interpreter down with it.

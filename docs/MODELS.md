@@ -64,6 +64,17 @@ here, see [Getting the models](#getting-the-models)).
 | super-resolution ×4 | `realesr_general_x4v3_nashm_128.hbm` | Real-ESRGAN Compact | 128×128 tile | converted |
 | super-resolution ×4 | `spanx4_ch48_nashm_128.hbm` | SPAN ch48 | 128×128 tile | converted |
 | image embeddings | `bpu-siglip-base-patch16-224.hbm` | SigLIP base/16 | 224×224 | zoo (downloaded) |
+| speech recognition — encoder | `paraformer_encoder_int16.hbm` | Paraformer-large, zh (contextual) | 400 LFR frames (24 s) × 560 | zoo (downloaded) |
+| speech recognition — predictor | `paraformer_predictor_int16_v2.hbm` | Paraformer-large CIF predictor | 400 × 512 | zoo (downloaded) |
+| speech recognition — decoder | `paraformer_decoder_int16_v2.hbm` | Paraformer-large decoder, 8404 tokens | ≤ 100 tokens | zoo (downloaded) |
+| speech recognition — assets | `paraformer_tokens_8404.json`, `paraformer_am.mvn` | token list (from the build) + CMVN (from the upstream model) | — | downloaded |
+| keyword spotting — encoder | `kws_zipformer_zh_en_3m_c16_int16_nashm.hbm` | sherpa-onnx zipformer2 KWS zh-en 3M (2025-12-20), streaming encoder with 38 cache tensors; graph rewritten for the BPU (see below) | 29 fbank frames per call (160 ms step) | converted |
+| keyword spotting — assets | `kws_zipformer_zh_en_3m_decoder_joiner.npy`, `kws_zipformer_zh_en_3m_tokens.txt` | decoder + joiner weights as one table (run on the CPU), token table | — | converted / upstream |
+| voice activity detection | `silero_vad_16k_int16_nashm.hbm` | Silero VAD v6.2.3, 16 kHz; one streaming step from the magnitude spectrum (STFT on the CPU), LSTM state in and out | 512 samples (32 ms) per call | converted |
+| speech synthesis — encoder | `matcha_zh_en_enc_l128_int16_nashm.hbm` | Matcha-TTS zh-en text encoder + duration predictor; takes embeddings | 128 tokens | converted |
+| speech synthesis — decoder | `matcha_zh_en_dec_t512_int16_nashm.hbm` | Matcha-TTS zh-en U-Net decoder, 3 flow-matching steps compiled in | 512 frames (8.2 s) | converted |
+| speech synthesis — assets | `matcha_zh_en_embedding.npy`, `matcha_zh_en_tokens.txt`, `matcha_zh_en_lexicon.txt` | token embedding table (CPU lookup) + front-end token table and lexicon | — | converted / upstream |
+| speech synthesis — vocoder | `vocos_16k_t256_int16_nashm.hbm` | Vocos 16 kHz (n_fft 1024, hop 256), the Matcha-TTS zh-en vocoder; graph ends at log-magnitude + phase | 80 mels × 256 frames (4.1 s; longer input is chunked) | converted |
 
 The code references every one of these **only** by the repo-relative path
 `models/<name>.hbm`, overridable per task through the environment
@@ -156,6 +167,129 @@ tail rather than for the mean. (For scale, open-loop L2 against the realized
 future on those frames is 0.28 m at 1 s and 1.85 m at 3 s — but that is a
 NAVSIM-trained model evaluated on nuScenes, a different sensor rig, so it
 measures cross-domain transfer, not the model's accuracy.)
+
+**The speech model drops the last character of many utterances unless CIF is
+done right — and the fix is on the CPU, not in the build.** Paraformer's
+predictor adds a small "tail" weight just past the end of speech so the final
+token can fire. A fixed-shape predictor graph only knows its padded length, so it
+adds the tail at the end of the padding; masking the padding then removes it.
+`ParaformerAsr` re-applies the tail at the true end of speech. On 600 random
+AISHELL-1 test utterances, and on the 300 shortest ones, both runtimes fed the
+same int16 build:
+
+| | float (FunASR) | int16, tail lost | int16, `ParaformerAsr` |
+|---|---|---|---|
+| AISHELL-1, 600 random | 3.41% | 4.57% | 3.78% |
+| AISHELL-1, 300 shortest | 1.76% | 3.88% | 2.72% |
+| same 600 + MUSAN noise, 5 dB | 5.08% | 6.20% | 5.58% |
+
+(CER, characters; numbers written out in Chinese on both sides before scoring.)
+Neither the zero padding up to the 24 s window nor the zeroed contextual-bias
+input was the cause — both were ablated in float and change nothing measurable.
+The front end in `ParaformerAsr` uses no dither, so a transcription is
+deterministic; that cost nothing on these sets.
+
+**The TTS acoustic model needed two graph rewrites before a fixed-length build
+was the same model.** Matcha runs each sentence at its own length (rounded up
+to a multiple of 4). Padded to a fixed 512 frames, two things change the
+result: the decoder's GroupNorm normalises over the whole time axis, padding
+included, and its attention mask is a 0/1 float that `scaled_dot_product_attention`
+*adds* to the scores — valid frames get +1, padded ones +0, so padding is
+down-weighted rather than excluded. Neither cares what the padding contains,
+only how much of it there is, so a "is the output sensitive to the padded
+values?" check passes while the output is off by up to 10 in log-mel. The
+shipped decoder normalises over, and attends to, exactly the frames the
+unpadded model sees, and matches it to 9e-5 in float. Separately, the token ids
+cannot be a graph input: the compiler quantises a float id input like any
+activation (it chose a range of 127 for a 2190-entry vocabulary), which put the
+encoder's duration output at cosine 0.83. The embedding lookup runs on the CPU
+instead, and the encoder outputs come out at 0.99999. Durations are
+`ceil(exp(logw))`, so where `exp(logw)` sits on an integer the int16 build can
+land one frame either side of float — 1 token of 8 and 1 of 17 on the two
+test sentences. Scored on the
+same 60 sentences:
+
+| | round-trip CER (FireRedASR2) | UTMOS | real-time factor on the board |
+|---|---|---|---|
+| float Matcha + Vocos, CPU (sherpa-onnx, 4 threads) | 1.61% | 3.29 | 0.085 |
+| int16 Matcha + Vocos, BPU, pauses as the model makes them | 1.73% | 3.33 | 0.0070 |
+| int16 Matcha + Vocos, BPU (`TextToSpeech`, pauses ≥ 0.2 s shortened to 0.2× as sherpa-onnx does) | 1.73% | 3.29 | 0.0092 |
+
+The BPU chain takes 26 ms per sentence on average (58 ms for the slowest, a
+two-sentence text), of which the decoder graph is 8.2 ms and the encoder 1.2 ms.
+The model's pauses at punctuation run long — 225 s of audio for the 60
+sentences against sherpa-onnx's 176 s, because sherpa-onnx shortens every pause
+of 0.2 s or more to 0.2× of its length. `TextToSpeech` does the same by
+default (172 s); the real-time factor rises only because there is less audio.
+
+**The vocoder is int16, and its phase is not computed on the BPU.** Vocos
+ends in `exp` for the magnitude and `cos`/`sin` of a raw phase that spans about
+±42 rad. Compiled as published, the compiler lowers `cos`/`sin` to a quantised
+range reduction, and the phase comes out at cosine 0.58 against float at int8
+and 0.97–0.99 at int16 — enough to hear. The shipped graph is cut at the head's
+linear output, so the BPU returns log-magnitude and phase and the CPU does the
+rest. Per 192-frame chunk (3.1 s of audio) on the board: 1.3 ms BPU, 2.5 ms
+exp/cos/sin, 4.1 ms iSTFT — 7.9 ms in all. Scored on 60 sentences against the float
+model, over the time-frequency cells within 40 dB of each utterance's peak:
+
+| | log-spectral distance | cells off by > 3 dB | round-trip CER (FireRedASR2) | BPU per 256-frame chunk |
+|---|---|---|---|---|
+| float, whole sentence | — | — | 1.98% | — |
+| float, chunked as on the board | 0.01 dB | 0.0% | 1.98% | — |
+| int8 | 5.38 dB | 49.8% | 2.10% | 0.76 ms |
+| **int16 (shipped)** | **0.54 dB** | **0.3%** | 2.48% | 1.29 ms |
+
+The int8 build is still intelligible — the recogniser barely notices — but
+half of what you hear is off by more than 3 dB, which is a noise floor; the
+int16 difference is one more homophone (它 → 他) in 60 sentences. Chunking itself
+is exact: the network sees at most 27 frames either side, the chunks overlap by
+32, and the seams are bit-identical to a whole-sentence pass. The real-time
+factor, iSTFT included, is 0.0026.
+
+**The wake-word encoder needed four graph rewrites before the compiler would
+build it, and one before int16 meant anything.** The published streaming
+encoder takes an int64 `processed_lens` and turns it into a boolean attention
+mask; that became a float `pad_mask` input computed on the CPU, with every
+`Where` on it rewritten as `x·(1−m) + c·m`. Swoosh's softplus `log(1 + exp(s))`
+puts `exp(s)` over many orders of magnitude, which quantised to cosine 0 and
+took the whole encoder to −0.21; written as `relu(s) + log(1 + exp(−|s|))`
+its `exp` stays in (0, 1]. The relative-position shift is six
+`GatherElements` with constant indices — each row a contiguous run whose
+offset depends on the query position — and became per-query slices. Ten
+depthwise convolutions have a kernel of 15 padded by 7 on inputs of 1–4
+frames, which the code generator cannot lower ("invalid storage"); on L
+frames only the centre 2L−1 taps ever meet data, so the kernels were cropped
+to those. Each rewrite was checked against the published graph in float
+(encoder output within 1.5e-4, and the same detections on 87 clips). One of
+the optimizer's passes crashes onnxruntime on this graph; it was disabled for
+the build. Built at int16 with calibration on real streaming states (wake-word clips,
+confusables, noisy speech, noise), the encoder output is at per-frame cosine
+0.995 against float; the whole-array cosine is 0.915 because some frames come
+out smaller rather than turned, which the joiner's tanh and the softmax do not
+notice. On the full test sets:
+
+| | wake words found, clean / noisy | false wake-ups | confusable phrases that fire, clean / noisy |
+|---|---|---|---|
+| float (sherpa-onnx) | 96.5% / 87.1% | 0 in 4.1 h | 5.4% / 4.6% |
+| **int16, BPU** | **97.5% / 89.1%** | **0 in 4.4 h** | **5.7% / 4.0%** |
+
+**The VAD's spectrum is computed on the CPU.** Silero VAD opens with an STFT
+written as a strided convolution followed by `sqrt(re² + im²)`. Compiled whole,
+the squared terms span ~5000, int16 resolves them in steps of 0.15, every
+quiet bin rounds away, and the LSTM state drifted to cosine 0.989 per step —
+enough for the speech probability to sag to 0.2–0.5 in the middle of a
+sentence. The shipped graph starts at the magnitude spectrum (4 frames × 129
+bins, computed by an FFT on the CPU); its state outputs are at cosine 0.9998.
+On 100 noisy AISHELL-1 sessions and 24 minutes of MUSAN noise, with the
+default segmenter (0.5 threshold, 250 ms to open, 300 ms to close):
+
+| | frame F1, 10 / 0 dB | utterances missed, 10 / 0 dB | end of speech declared after (median, 10 dB) | false speech on noise |
+|---|---|---|---|---|
+| float (ONNX) | 0.929 / 0.870 | 2.3% / 11.5% | 0.36 s | 0 |
+| **int16, BPU (shipped)** | **0.924 / 0.863** | **3.4% / 13.2%** | **0.36 s** | **0** |
+
+The calibration set is real streaming states — the LSTM state each chunk
+actually arrives with — rather than zero states.
 
 ## Which build to take
 
@@ -491,4 +625,9 @@ answers, not ones nobody looked at.
 | Real-ESRGAN (realesr-general-x4v3) | BSD-3-Clause — the weights are release assets of the same repo, published by the copyright holder |
 | YOLOP | MIT **code**, and unusually the weights are committed in the repo, so MIT covers them. But it is trained on **BDD100K**, whose agreement limits commercial use to member organizations — non-commercial is clear, commercial needs a look |
 | DiffusionDrive | MIT **code** (navsim itself Apache-2.0), but both the compiled model and the trajectory anchors derive from **NAVSIM / OpenScene**, which build on nuPlan — non-commercial terms. Treat the weights and the anchor file as **non-commercial** |
+| Paraformer-large contextual (FunASR) | The model card declares **Apache-2.0**; FunASR's model licence (v1.1) adds that redistributions keep the attribution and the model name. Both allow redistribution. Trained on undisclosed in-house audio. The compiled stages come from D-Robotics `rdk_model_zoo` — check its terms too |
+| sherpa-onnx KWS zipformer zh-en 3M (2025-12-20) | Published by the k2-fsa project (sherpa-onnx is Apache-2.0) as a release archive with no model-specific licence, and the release page does not say what the zh-en model was trained on; its Chinese-only sibling is trained on WenetSpeech. Check the data terms before redistributing the weights |
+| Silero VAD v6.2.3 | **MIT** for the code and the published weights (the ONNX release this build is converted from). Training data undisclosed |
+| Matcha-TTS zh-en (ModelScope `dengcunqin/matcha_tts_zh_en_20251010`) | The model card declares **Apache-2.0**; Matcha-TTS code is MIT. Training data undisclosed: the card says "mixed Chinese-English data", fine-tuned from the same author's earlier zh-en model, which was trained with icefall's `baker_zh` recipe — whether that recipe's Baker corpus (BZNSYP, **non-commercial**) is in the data is not stated. Check before a commercial build. The lexicon and token table come with the sherpa-onnx packaging of the same model |
+| Vocos 16 kHz (`vocos-16khz-univ`, published with Matcha-TTS zh-en) | The model card declares **Apache-2.0**; the Vocos architecture and code are MIT. Training data undisclosed. The acoustic model it is paired with (Matcha-TTS zh-en, same author, Apache-2.0 card) also does not disclose its data — fine-tuned from a model trained on mixed Chinese-English speech |
 | PIDNet | MIT **code**, trained on **Cityscapes**, which explicitly permits distributing models trained on it *and* explicitly bars commercial use of any derivative work. So: redistributable, **non-commercial** |

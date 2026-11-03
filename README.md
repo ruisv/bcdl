@@ -77,7 +77,7 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 
 - **✅ 一行安装** —— 预编译的 linux-aarch64 conda 包（Python 3.9–3.14），
   板上不需要编译工具链，装完就能 `import bcdl`。
-- **✅ 统一的 API** —— 22 类视觉任务共用同一套 `Engine` + 任务类心智模型；
+- **✅ 统一的 API** —— 22 类视觉任务和语音识别共用同一套 `Engine` + 任务类心智模型；
   换任务不换写法，C++ 与 Python 接口对等。
 - **✅ 不再手写内存与缓存** —— `SysMem` 生命周期、推理前 clean / 读取前 invalidate
   由 `Engine` 负责。**这是 BPU 上最高频的正确性 bug**，表现为结果“看起来差不多但就是不对”。
@@ -101,7 +101,7 @@ hobot 运行时（`hbDNN` / `hbUCP` / 多媒体编解码）。区别只在**抽�
 | 形态 | 底层运行时 + 示例程序 | 可复用的框架（库） |
 | 接口 | 以 C API 为主 | C++17 RAII 类 + Python 绑定 |
 | 设备内存 | 自己 malloc / free `hbUCPSysMem`，自己 clean / invalidate 缓存 | `Engine` 自动处理 |
-| 后处理 | 自己写（NMS / DFL / 旋转 IoU / CTC…） | 22 类任务开箱即用 |
+| 后处理 | 自己写（NMS / DFL / 旋转 IoU / CTC…） | 23 类任务开箱即用 |
 | 多媒体拼接 | 各单元各自的 API，自己搬 buffer | 统一 `SysMem`，流水线零拷贝 |
 | 语言 | C / C++ | C++ 与 Python 对等，NumPy 进出 |
 | 上手 | 从示例复制，逐个模型改 | `conda install` + 十行代码 |
@@ -339,6 +339,25 @@ Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`]
     真实退化上，模糊/压缩输入更强。按输入域选，不是谁替代谁。
   - **多目标跟踪** —— ByteTrack（Kalman + 两阶段关联）；ReID 外观嵌入的 L2
     归一化 + 余弦相似度（BoT-SORT 关联原语）、BoostTrack++ 与相机运动补偿。
+  - **唤醒词** —— sherpa-onnx 的开放词表 zipformer KWS（中英文，300 万参数）：编码器每 160 ms 在
+    BPU 上跑一次，解码和关键词搜索在 CPU，逐步照搬 sherpa-onnx；换唤醒词只改一行文本。召回 97.5% / 89.1%（干净 / 噪声，浮点 96.5% / 87.1%），4.4 小时零误唤醒，每 160 ms 占 BPU 2.0 ms。
+  - **语音端点检测** —— Silero VAD v6（int16，BPU）：每 32 ms 一次，0.39 ms；`VadSegmenter`
+    把音频流切成整句交给识别。带噪会话上帧级 F1 0.924 / 0.863（10 / 0 dB，浮点 0.929 / 0.870），
+    说完话中位 0.36 s 判停，24 分钟纯噪声零误报。模型自带的 STFT 放在 CPU：在 BPU 上做平方会让
+    int16 丢掉小幅值频点。
+  - **语音识别** —— Paraformer-large（中文，非自回归）：16 kHz 单声道一句话进，文字出，
+    一次前向没有逐字解码循环，三段 BPU 加 CPU 上的 CIF，板上一句约 36 ms。前端是与
+    Kaldi fbank 逐项对齐的 C++ 实现（LFR、CMVN 一并内置）。**官方定长构建在 CIF
+    处会吞掉不少句子的最后一个字**：尾部权重被加在补零区末尾，再被补零屏蔽清掉；
+    `ParaformerAsr` 把它挪回真实的语音结尾，AISHELL-1 最短 300 句字错率从 3.9% 降到 2.7%。
+    配套 `CommandMatcher` 按拼音把识别结果对到固定指令表，吸收同音字和多出的语气词：
+    40 条指令上整句正确率 84.7% → 指令匹配正确 96.9%，新闻句零误接受。
+  - **语音合成** —— Matcha-TTS zh-en + Vocos，中文文本进、16 kHz 语音出，网络全在 BPU：
+    平均每句 26 ms（实时率 0.009），合成语音回识别字错率 1.73%，与 CPU 浮点（1.61%）相当；
+    长停顿按 sherpa-onnx 的规则压到 0.2 倍。
+    前端与 sherpa-onnx 逐 id 一致；定长导出改写了 GroupNorm 和注意力掩码，否则补零会改变结果。
+  - **语音合成后端** —— Vocos 声码器（Matcha-TTS zh-en 配套）：mel 进、16 kHz 波形出，
+    int16 跑在 BPU、逆 STFT 在 CPU，3 秒音频 7.9 ms，与浮点几乎无差（可听谱距离 0.54 dB）。
   - **光流** —— NeuFlow v2：稠密位移场 + Middlebury 色轮着色、EPE 度量。
     **发的是 int16**：int8 会退化成一条约 1.9 px 的平噪声底，快像素看着没事、
     慢像素全是噪声，而编译器给它报的输出余弦是 0.9954 —— 回归物理量的头要用

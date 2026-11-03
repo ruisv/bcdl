@@ -67,6 +67,20 @@ Engine::~Engine() {
   }
 }
 
+std::string Engine::inputName(int i) const {
+  checkInput(i);
+  const char* n = nullptr;
+  BCDL_CHECK(hbDNNGetInputName(&n, dnn_, i));
+  return n ? n : "";
+}
+
+std::string Engine::outputName(int i) const {
+  checkOutput(i);
+  const char* n = nullptr;
+  BCDL_CHECK(hbDNNGetOutputName(&n, dnn_, i));
+  return n ? n : "";
+}
+
 void Engine::allocTensors() {
   int in_count = 0, out_count = 0;
   BCDL_CHECK(hbDNNGetInputCount(&in_count, dnn_));

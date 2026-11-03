@@ -16,7 +16,8 @@ under [`include/bcdl/`](../include/bcdl/) are the source of truth); the names ma
   [Pose](#pose) · [Instance segmentation](#instance-segmentation) ·
   [Oriented boxes (OBB)](#oriented-boxes-obb) ·
   [Semantic segmentation](#semantic-segmentation) · [Depth](#depth) ·
-  [Stereo](#stereo) · [OCR](#ocr)
+  [Stereo](#stereo) · [OCR](#ocr) ·
+  [Speech recognition](#speech-recognition-paraformer)
 - Streaming & tracking: [Tracking (ByteTrack)](#tracking-bytetrack) ·
   [TrackingPipeline](#trackingpipeline) ·
   [AsyncDetectionPipeline](#asyncdetectionpipeline)
@@ -98,6 +99,7 @@ outs = engine.infer([x])                     # outs[i] reshaped to output_shape(
 | `Engine(hbm_path, model_name="")` | Load a model. `model_name` selects one packaged model if the `.hbm` holds several. |
 | `model_name -> str` | The active model's name. |
 | `num_inputs / num_outputs -> int` | Tensor counts. |
+| `input_name(i) / output_name(i) -> str` | Tensor name as compiled (the ONNX name). |
 | `input_shape(i) / output_shape(i) -> list[int]` | Tensor shape. |
 | `input_bytes(i) -> int` | Allocated device-buffer size for input `i` (after BPU stride alignment). |
 | `input_packed_bytes(i) -> int` | Size of input `i` as a contiguous row-major array. Smaller than `input_bytes(i)` when the model pads a dimension. |
@@ -752,6 +754,300 @@ text  = bcdl.decode_ctc(logits.astype(np.float32), chars)
 
 See [`examples/ocr_demo.cc`](../examples/ocr_demo.cc) for the full det→cls→rec
 wiring (crop ordering and the dict gotchas are handled there).
+
+---
+
+## Speech recognition (Paraformer)
+
+One 16 kHz mono utterance in, text out, in a single forward pass — Paraformer is
+non-autoregressive, so there is no decoding loop. The build is three compiled
+stages with continuous integrate-and-fire (CIF) on the CPU between the last two:
+fbank → LFR → CMVN → **encoder** → **predictor** → CIF → **decoder** → argmax.
+
+```python
+asr = bcdl.ParaformerAsr.from_files(
+    "models/paraformer_encoder_int16.hbm",
+    "models/paraformer_predictor_int16_v2.hbm",
+    "models/paraformer_decoder_int16_v2.hbm",
+    "models/paraformer_tokens_8404.json",
+    "models/paraformer_am.mvn")
+r = asr.transcribe(pcm)          # float32 in [-1, 1] (or int16), 16 kHz mono
+print(r.text, r.truncated)
+
+# the front end and CIF on their own (no model needed):
+feats = bcdl.Fbank().compute(pcm)                  # (frames, 80) Kaldi log-mel
+lfr = bcdl.lfr_stack(feats, 7, 6)                  # (ceil(frames/6), 560)
+emb, n = bcdl.cif_integrate(alphas, hidden, valid_frames)
+```
+
+**One utterance at a time, at most `asr.max_seconds` (24 s).** Longer input is
+truncated and `r.truncated` is set — split long audio with a VAD first. There is
+no resampler: resample to 16 kHz before calling.
+
+The front end reproduces `torchaudio.compliance.kaldi.fbank` (dither 0) — to
+~1e-5 of a float64 reference, ~2e-4 of torchaudio's own float32 — and FunASR's
+LFR bit for bit, because a model trained on those features transcribes worse,
+silently, on features that are merely similar.
+
+- **`FbankConfig`** — `sample_rate`, `num_mel_bins`, `frame_length_ms`,
+  `frame_shift_ms`, `preemphasis`, `remove_dc_offset`, `low_freq`, `high_freq`,
+  `input_scale` (float PCM is multiplied by this, 32768 by default, because
+  Kaldi works on int16-scale samples; icefall / k2 models want 1), `window`
+  (`"hamming"`, torchaudio's and FunASR's, or `"povey"`, Kaldi's default).
+- **`Fbank(config=FbankConfig())`** — `.compute(pcm) -> (frames, num_mel_bins)`,
+  `.num_frames(samples)`, `.frame_length`, `.frame_shift`, `.fft_size`.
+- **`lfr_stack(feats, lfr_m=7, lfr_n=6) -> np.ndarray`** — low-frame-rate
+  stacking, bit-exact with FunASR.
+- **`Cmvn`** — `dim`, `shift`, `scale`, `.apply(feats)`;
+  **`load_kaldi_cmvn(path)`** / **`parse_kaldi_cmvn(text)`** read an `am.mvn`.
+- **`CifConfig`** — `threshold` (1.0), `tail_threshold` (0.45), `max_tokens`.
+- **`cif_integrate(alphas, hidden, valid_frames, config=CifConfig())`** →
+  `((max_tokens, D) embeddings, token count)`. The tail weight is placed at frame
+  `valid_frames`, the true end of speech. A fixed-shape predictor graph can only
+  put it at the end of its padding, where masking the padding deletes it — and
+  then any utterance whose last character needed the tail loses it.
+- **`load_token_list(path) -> list[str]`** — a JSON array (`tokens.json`) or one
+  token per line; **`argmax_tokens(logits)`**; **`tokens_to_text(ids, vocab)`**
+  (drops `<specials>`, glues `@@` pieces, spaces Latin words).
+- **`AsrResult`** — `text`, `token_ids`, `feature_frames`, `truncated`.
+- **`ParaformerConfig`** — `fbank`, `lfr_m`, `lfr_n`, `cif`.
+- **`ParaformerAsr(encoder, predictor, decoder, vocab, cmvn, config=None)`** —
+  three `Engine`s; also `ParaformerAsr.from_files(encoder, predictor, decoder,
+  tokens, cmvn, config=None)`. `.transcribe(pcm, timeout_ms=0)`,
+  `.transcribe_features(feats)`, `.features(pcm)`, `.max_seconds`,
+  `.max_frames`, `.feature_dim`, `.max_tokens`, `.vocab_size`. The stages are
+  matched by tensor shape, and a token list whose size disagrees with the
+  decoder is refused.
+
+### Voice activity detection (Silero VAD)
+
+Finds where speech starts and stops in a 16 kHz stream and hands each utterance
+to the recogniser whole. Silero VAD v6 runs on the BPU, one call per 32 ms
+chunk; `VadSegmenter` turns its probabilities into utterances.
+
+```python
+vad = bcdl.SileroVad("models/silero_vad_16k_int16_nashm.hbm")
+seg = bcdl.VadSegmenter(vad)                 # VadConfig(): 0.5, 250 ms on, 300 ms off
+for block in mic_blocks():                   # float32 or int16, any length
+    for s in seg.feed(block):                # utterances that closed in this block
+        print(s.start / 16000, asr.transcribe(s.pcm).text)
+for s in seg.flush(): ...                    # end of stream
+
+segs = seg.segments(recording)               # a whole recording at once
+p = vad.probabilities(recording)             # one probability per 512 samples
+```
+
+Measured on 100 noisy sessions (30 s each: AISHELL-1 utterances 0.3–3 s apart,
+MUSAN noise at 10 and 0 dB SNR) and 24 minutes of noise alone, with the
+default `VadConfig`:
+
+| | frame F1, 10 / 0 dB | utterances missed | end of speech declared after (median / p90, 10 dB) | false speech on noise |
+|---|---|---|---|---|
+| float Silero (ONNX) | 0.929 / 0.870 | 2.3% / 11.5% | 0.36 / 0.44 s | 0 |
+| **int16, BPU** | **0.924 / 0.863** | **3.4% / 13.2%** | **0.36 / 0.43 s** | **0** |
+
+The two agree on speech vs. non-speech for 99.0% of 253k chunks (mean
+probability difference 0.012). Each chunk costs 0.39 ms on the board, STFT and
+Python included — 1.2% of real time. `threshold = 0.4` brings the BPU build's
+F1 level with float's (0.929 / 0.872) but declares the end of speech later
+(p90 0.61 s at 0 dB against 0.52 s).
+
+- **`SileroVad(engine_or_path)`** — `.probability(chunk)` (512 samples →
+  float), `.probabilities(pcm)` (whole recording from a reset), `.reset()`,
+  `.chunk` (512), `.sample_rate` (16000). Stateful: the LSTM state and the
+  previous chunk's last 64 samples carry over, so one object reads one stream,
+  in order.
+- **`VadConfig`** — `threshold` (0.5), `neg_threshold` (−1 = same as
+  threshold; lower it for hysteresis), `min_speech_ms` (250), `min_silence_ms`
+  (300), `speech_pad_ms` (30), `max_speech_s` (20 — the recogniser's window is
+  24 s).
+- **`VadSegmenter(vad, config=None)`** — `.feed(pcm)`, `.flush()`,
+  `.segments(pcm)`, `.reset()`, `.in_speech`, `.last_probability`. A segment
+  opens after `min_speech_ms` at or above `threshold` and closes after
+  `min_silence_ms` below `neg_threshold`; the end of speech is therefore
+  declared about `min_silence_ms` after the speaker stops.
+- **`VadSegment`** — `start`, `end` (samples since the last reset, padding
+  included), `pcm`.
+
+The model's STFT runs on the CPU and the BPU takes the magnitude spectrum.
+Compiled whole, the graph squares the real and imaginary parts on the BPU,
+where the power spans ~5000: int16 then loses every quiet frequency bin and the
+probability sagged to 0.2–0.5 in the middle of a sentence.
+
+### Keyword spotting (wake word)
+
+Listens continuously for a wake word, then the VAD and recogniser take over.
+The model is sherpa-onnx's open-vocabulary zipformer transducer (zh-en, 3M
+parameters): a wake word is a line of tokens, not a trained model. The encoder
+runs on the BPU, one 160 ms chunk per call; the decoder, joiner and keyword
+search run on the CPU and follow sherpa-onnx's KeywordSpotter step for step.
+
+```python
+kws = bcdl.KeywordSpotter("models/kws_zipformer_zh_en_3m_c16_int16_nashm.hbm",
+                          "models/kws_zipformer_zh_en_3m_decoder_joiner.npy",
+                          "models/kws_zipformer_zh_en_3m_tokens.txt",
+                          "n ǐ h ǎo x iǎo ch ē @你好小车\n"
+                          "x iǎo ch ē x iǎo ch ē @小车小车\n")
+for block in mic_blocks():                   # float32 or int16, any length
+    for d in kws.feed(block):
+        print(d.keyword, d.start, d.end)     # seconds since reset()
+```
+
+A keyword line is the model's tokens — pinyin initials and toned finals for
+Chinese, ARPAbet phones for English — then optional `:boost` and
+`#threshold` for that line, then `@phrase`. sherpa-onnx's `text2token` tool
+(`pip install sherpa-onnx`) writes these lines from plain text.
+
+Measured with 你好小车 and 小车小车 (202 clips each clean and with MUSAN noise,
+9 synthetic voices), against AISHELL-1 speech, spoken commands and 2.3 h of
+noisy sessions, and 350 confusable phrases (你好小菜, 校车校车, ...), at the
+default threshold:
+
+| | wake words found, clean / noisy | false wake-ups | confusable phrases that fire, clean / noisy |
+|---|---|---|---|
+| float (sherpa-onnx) | 96.5% / 87.1% | 0 in 4.1 h | 5.4% / 4.6% |
+| **int16, BPU** | **97.5% / 89.1%** | **0 in 4.4 h** | **5.7% / 4.0%** |
+
+The encoder takes 2.0 ms of BPU time per 160 ms chunk; with the CPU decoding
+the whole spotter runs at a real-time factor of 0.023.
+
+- **`KeywordSpotter(encoder, decoder_joiner, tokens, keywords=None,
+  config=None)`** — `keywords` is the text of the lines or a path to a file.
+  `.feed(pcm)`, `.flush()` (end of stream: a wake word in the last ~0.3 s
+  is only seen after it), `.set_keywords(text)`, `.load_keywords(path)`, `.keywords`,
+  `.reset()`, `.encode(pcm)` (encoder output of a whole recording, for tests),
+  `.token_id(token)`. Streaming: one object reads one stream, in order.
+- **`KwsConfig`** — `keywords_score` (1.0, the boost per matched token),
+  `keywords_threshold` (0.25, the mean per-token probability a detection
+  needs), `num_trailing_blanks` (1), `max_active_paths` (4): sherpa-onnx's
+  defaults. Raise the threshold for fewer false wake-ups, lower it for more
+  recall.
+- **`KwsDetection`** — `keyword`, `index` (its line), `start`, `end`,
+  `tokens`.
+
+### Voice commands (closed set)
+
+A robot taking spoken commands needs to know *which* command was said, not a
+perfect transcript. `CommandMatcher` compares recogniser text with a fixed list
+in toneless pinyin, which absorbs homophones (打开灯 → 大开灯, 出发 → 处罚) and
+a stray trailing particle (前进 → 前进了), and rejects speech that is not a
+command. Pure CPU, a few µs per call.
+
+```python
+m = bcdl.CommandMatcher(["前进", "后退", "左转", "右转", "打开灯", "关灯"])
+r = m.match(asr.transcribe(pcm).text)    # e.g. "大开灯"
+if r:                                    # r.index >= 0
+    print(r.index, r.command, r.distance)   # 4 打开灯 0.0
+```
+
+On 40 commands × 9 synthetic voices, Paraformer's exact-sentence accuracy was
+84.7% clean / 82.8% at 5 dB SNR; matched this way it is 96.9% / 95.6%, with
+0.6% / 1.1% mapped to the wrong command and none of 600 news sentences accepted.
+
+- **`to_pinyin(text) -> list[str]`** — one toneless syllable per CJK character
+  (most common reading, ü as `v`); an ASCII letter run is one lower-cased token;
+  a digit run is read as a Chinese number (`"90"` → `jiu shi`); full-width
+  letters/digits fold to ASCII; everything else is dropped.
+- **`CommandMatcher(commands, max_distance=0.5)`** — distance is the
+  syllable-level edit distance divided by the command's syllable count; ties go
+  to the closer length, then the earlier command. Latin words are only ever
+  compared with Latin words ("you" is not 右). `.match(text) -> CommandMatch`,
+  `.distances(text) -> list[float]`, `.commands`, `.max_distance`, `len()`.
+- **`CommandMatch`** — `index` (-1 = rejected), `nearest` (closest command even
+  when rejected; -1 for text with no pinyin), `distance`, `command`; truthy when
+  accepted. Several phrasings of one intent are several entries.
+
+
+### Speech synthesis back end (Vocos)
+
+Mel spectrogram in, waveform out: Vocos on the BPU, the inverse STFT on the CPU.
+It is the second half of a non-autoregressive TTS — pair it with an acoustic
+model that emits 80-bin log-mels at 16 kHz / hop 256, such as Matcha-TTS zh-en.
+
+```python
+voc = bcdl.VocosVocoder("models/vocos_16k_t256_int16_nashm.hbm")
+pcm = voc.synthesize(mel)        # (80, frames) float32 log-mel -> float32 PCM, 16 kHz
+
+# the inverse STFT on its own (no model needed):
+ist = bcdl.Istft()               # n_fft 1024, hop 256, centred, periodic Hann
+wav = ist.compute(real, imag)    # (frames, 513) each
+wav = ist.compute_polar(mag, cos, sin)   # (513, frames) each — Vocos's layout
+```
+
+The build takes 256 frames (4.1 s); longer mels are cut into chunks that
+overlap by 32 frames and the seams are exact. Per 3 s of audio: 1.3 ms BPU and
+6.6 ms CPU. Against the float model it is 0.54 dB in log-spectral distance over
+the audible cells, and Paraformer transcribes its output exactly.
+
+- **`IstftConfig`** — `n_fft` (power of two), `hop_length`, `center`.
+- **`Istft(config=IstftConfig())`** — `.compute(real, imag)`,
+  `.compute_polar(mag, cos, sin)`, `.num_samples(frames)` (`(frames - 1) * hop`
+  centred), `.bins`. Matches `torch.istft` with a periodic Hann window; DC and
+  Nyquist imaginary parts are ignored.
+- **`VocosConfig`** — `stft`, `context` (overlap per side, ≥ 27 for exact
+  seams), `pad_value` (log-mel for frames past either end, −16),
+  `max_magnitude` (100), `sample_rate`.
+- **`VocosVocoder(engine_or_path, config=None)`** — `.synthesize(mel,
+  timeout_ms=0)` takes `(num_mels, frames)` or `(1, num_mels, frames)`;
+  `.num_mels`, `.chunk_frames`, `.body_frames`, `.sample_rate`. The model must
+  output `log_mag` and `phase`, in that order: `exp`/`cos`/`sin` are done on the
+  CPU because the compiler's quantised `cos`/`sin` ruin the phase.
+
+
+### Speech synthesis (Matcha-TTS + Vocos)
+
+Chinese text in, 16 kHz speech out, every network on the BPU. Non-autoregressive:
+each sentence is one encoder pass, one decoder pass (three flow-matching steps
+compiled into it) and one or two vocoder chunks.
+
+```python
+tts = bcdl.TextToSpeech.from_files(
+    "models/matcha_zh_en_enc_l128_int16_nashm.hbm",
+    "models/matcha_zh_en_dec_t512_int16_nashm.hbm",
+    "models/matcha_zh_en_embedding.npy",
+    "models/vocos_16k_t256_int16_nashm.hbm",
+    "models/matcha_zh_en_tokens.txt",
+    "models/matcha_zh_en_lexicon.txt")
+r = tts.synthesize("好的，马上出发。")      # r.pcm float32, r.sample_rate 16000
+
+# or stage by stage:
+fe = bcdl.MatchaFrontend("models/matcha_zh_en_tokens.txt", "models/matcha_zh_en_lexicon.txt")
+for ids in fe.encode(text):                  # one id list per sentence
+    m = acoustic.synthesize(ids)             # MatchaAcoustic -> m.mel (80, frames)
+    pcm = vocoder.synthesize(m.mel)
+```
+
+On 60 robot-reply sentences the BPU chain is heard back by FireRedASR2 at 1.73%
+CER, against 1.61% for the float model on the CPU (sherpa-onnx), at a
+real-time factor of 0.009 — 26 ms per sentence on average.
+
+- **`MatchaFrontend(tokens, lexicon, config=MatchaFrontendConfig())`** —
+  `.encode(text) -> list[list[int]]`, `.sentences(text)`,
+  `MatchaFrontend.read_numbers(text)`, `.vocab_size`, `.lexicon_size`.
+  Reproduces sherpa-onnx's lexicon front end for this model id for id
+  (punctuation folding, sentence split/merge, longest-match lexicon lookup, the
+  closing punctuation token). Digits are read out first (`90` → 九十, `12.6` →
+  十二点六, `35%` → 百分之三十五, `2026年` → 二零二六年). Latin words are dropped —
+  the lexicon has no English.
+- **`MatchaFrontendConfig`** — `min_words` (5), `max_words` (20).
+- **`MatchaConfig`** — `noise_scale` (1.0; 0 makes the output deterministic),
+  `length_scale` (> 1 is slower), `seed`.
+- **`MatchaAcoustic(encoder, decoder, embedding, config=None)`** —
+  `.synthesize(ids) -> MatchaResult` (`mel` `(80, frames)`, `frames`,
+  `durations`, `truncated`), `.seed(n)`, `.max_tokens` (128), `.max_frames`
+  (512 = 8.2 s), `.num_mels`, `.vocab_size`. Longer input is truncated and
+  flagged. The token embedding is looked up on the CPU from the `.npy`.
+- **`TextToSpeech(frontend, acoustic, vocoder, tts_config=None)`** /
+  **`.from_files(..., config=None, tts_config=None)`** — `.synthesize(text) ->
+  TtsResult` (`pcm`, `sample_rate`, `sentences`, `truncated`). Sentences are
+  synthesised separately and concatenated, then every pause of 0.2 s or more
+  keeps `TextToSpeechConfig.silence_scale` of its length (0.2, sherpa-onnx's
+  default; 1 keeps the model's pauses, which run long at punctuation). On the
+  60 test sentences that takes the audio from 225 s to 172 s (sherpa-onnx:
+  176 s) with the round-trip CER unchanged.
+- **`scale_silence(pcm, sample_rate, scale, min_pause_s=0.2, level=0.01)`** —
+  that pause shortening on its own (`|x| <= level` counts as silence); matches
+  sherpa-onnx sample for sample.
 
 ---
 

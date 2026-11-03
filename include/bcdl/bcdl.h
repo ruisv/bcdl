@@ -18,8 +18,10 @@
 #include "bcdl/backend/input_writer.h"
 #include "bcdl/backend/output_reader.h"
 
-// Preprocessing: images, geometry, letterbox, GDC, voxelization
+// Preprocessing: images, geometry, letterbox, GDC, voxelization, speech features
 #include "bcdl/preproc/drive_inputs.h"
+#include "bcdl/preproc/fbank.h"
+#include "bcdl/preproc/istft.h"
 #include "bcdl/preproc/gdc_letterbox.h"
 #include "bcdl/preproc/gdc_remap.h"
 #include "bcdl/preproc/geometry.h"
@@ -34,6 +36,12 @@
 
 // Tasks: model-specific pre/post-processing
 #include "bcdl/tasks/anomaly.h"
+#include "bcdl/tasks/asr.h"
+#include "bcdl/tasks/command.h"
+#include "bcdl/tasks/vocoder.h"
+#include "bcdl/tasks/tts.h"
+#include "bcdl/tasks/vad.h"
+#include "bcdl/tasks/kws.h"
 #include "bcdl/tasks/classification.h"
 #include "bcdl/tasks/depth.h"
 #include "bcdl/tasks/depth_refine.h"

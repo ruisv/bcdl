@@ -76,6 +76,8 @@ add_library(bcdl SHARED
   src/preproc/letterbox_cpu.cc
   src/preproc/drive_inputs.cc
   src/preproc/lidar_voxelize.cc
+  src/preproc/fbank.cc
+  src/preproc/istft.cc
   src/media/jpeg_codec.cc
   src/media/video_codec.cc
   src/tasks/detection.cc
@@ -99,6 +101,12 @@ add_library(bcdl SHARED
   src/tasks/wholebody.cc
   src/tasks/features.cc
   src/tasks/superres.cc
+  src/tasks/asr.cc
+  src/tasks/command.cc
+  src/tasks/vocoder.cc
+  src/tasks/tts.cc
+  src/tasks/vad.cc
+  src/tasks/kws.cc
   src/pipeline/detection_pipeline.cc
   src/pipeline/tracking_pipeline.cc
   src/pipeline/async_detection_pipeline.cc

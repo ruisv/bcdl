@@ -82,7 +82,7 @@ does it correctly.
 
 - **✅ One-line install** — prebuilt linux-aarch64 conda packages (Python
   3.9–3.14). No toolchain on the board; `import bcdl` right after install.
-- **✅ Unified API** — 22 vision tasks share one `Engine` + task-class model.
+- **✅ Unified API** — 22 vision tasks and speech recognition share one `Engine` + task-class model.
   Switching task doesn't switch mental model, and C++ and Python are peers.
 - **✅ No hand-written memory or cache discipline** — `SysMem` lifetime, clean
   before infer and invalidate before read are the `Engine`'s job. **This is the
@@ -385,6 +385,36 @@ takes float32 NumPy arrays — **no Engine, no board, no model needed**.
   - **Multi-object tracking** — ByteTrack (Kalman + two-stage association); ReID
     appearance embeddings with L2-normalize + cosine similarity (BoT-SORT
     association primitives), BoostTrack++ and camera-motion compensation.
+  - **Wake words** — sherpa-onnx's open-vocabulary zipformer KWS (zh-en, 3M):
+    the encoder on the BPU every 160 ms, decoding and keyword search on the
+    CPU, step for step as sherpa-onnx; a new wake word is a line of text. Recall 97.5% / 89.1% (clean / noisy; float 96.5% / 87.1%),
+    no false wake-ups in 4.4 h, 2.0 ms of BPU per 160 ms.
+  - **Voice activity detection** — Silero VAD v6 (int16, BPU): one call per
+    32 ms chunk, 0.39 ms; `VadSegmenter` cuts the stream into whole utterances
+    for the recogniser. Frame F1 0.924 / 0.863 on noisy sessions (10 / 0 dB;
+    float 0.929 / 0.870), end of speech declared a median 0.36 s after the
+    speaker stops, no false speech in 24 minutes of noise. The model's STFT
+    runs on the CPU: squared on the BPU, int16 loses the quiet bins.
+  - **Speech recognition** — Paraformer-large (Chinese, non-autoregressive): one
+    16 kHz mono utterance in, text out, in a single forward pass — three BPU
+    stages with CIF on the CPU, ~36 ms per utterance on the board. The front end
+    is a C++ reproduction of Kaldi fbank (LFR and CMVN included). **The official
+    fixed-shape build drops the last character of many utterances at CIF**: its
+    tail weight lands at the end of the padding, which masking then clears.
+    `ParaformerAsr` puts it back at the true end of speech — CER on the 300
+    shortest AISHELL-1 test utterances goes from 3.9% to 2.7%.
+    `CommandMatcher` maps the text onto a fixed command list in pinyin,
+    absorbing homophones and stray particles: on 40 commands, 84.7% exact
+    becomes 96.9% matched, with no false accepts on news sentences.
+  - **Speech synthesis** — Matcha-TTS zh-en + Vocos: Chinese text in, 16 kHz
+    speech out, every network on the BPU, 26 ms per sentence (RTF 0.009) and
+    1.73% round-trip CER against 1.61% for the float model on the CPU. The front
+    end matches sherpa-onnx id for id; the fixed-length export rewrites the
+    decoder's GroupNorm and attention mask, without which padding changes the
+    output.
+  - **Speech synthesis back end** — the Vocos vocoder (Matcha-TTS zh-en's): mel
+    in, 16 kHz waveform out, int16 on the BPU with the inverse STFT on the CPU;
+    7.9 ms per 3 s of audio, 0.54 dB from float over the audible spectrum.
   - **Optical flow** — NeuFlow v2: a dense displacement field, Middlebury-wheel
     colourisation and an EPE metric. **Shipped at int16 on purpose**: int8
     degrades into a flat ~1.9 px noise floor, so fast pixels look fine and slow

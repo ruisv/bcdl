@@ -15,7 +15,8 @@
   [超分 SuperRes](#超分-superres) · [稀疏特征点 XFeat](#稀疏特征点-xfeat) ·
   [实例分割 InstanceSeg](#实例分割-instanceseg) · [旋转框 OBB](#旋转框-obb) ·
   [语义分割 Segmentation](#语义分割-segmentation) · [深度 Depth](#深度-depth) ·
-  [双目 Stereo](#双目-stereo) · [OCR](#ocr)
+  [双目 Stereo](#双目-stereo) · [OCR](#ocr) ·
+  [语音识别](#语音识别paraformer)
 - 流式与跟踪：[跟踪 ByteTrack](#跟踪-bytetrack) · [TrackingPipeline](#trackingpipeline) ·
   [AsyncDetectionPipeline](#asyncdetectionpipeline) ·
   [AsyncVideoDetectionPipeline](#asyncvideodetectionpipeline)
@@ -92,6 +93,7 @@ outs = engine.infer([x])                     # outs[i] 已 reshape 成 output_sh
 | `Engine(hbm_path, model_name="")` | 加载模型。`.hbm` 里打包了多个模型时，用 `model_name` 选其中一个。 |
 | `model_name -> str` | 当前模型名。 |
 | `num_inputs / num_outputs -> int` | 张量个数。 |
+| `input_name(i) / output_name(i) -> str` | 编译进模型的张量名（即 ONNX 里的名字）。 |
 | `input_shape(i) / output_shape(i) -> list[int]` | 张量形状。 |
 | `input_bytes(i) -> int` | 输入 `i` 分配到的设备缓冲大小（已按 BPU stride 对齐）。 |
 | `input_packed_bytes(i) -> int` | 输入 `i` 作为连续行主序数组的大小。模型对某一维做了补齐时会小于 `input_bytes(i)`。 |
@@ -699,6 +701,252 @@ text  = bcdl.decode_ctc(logits.astype(np.float32), chars)
 
 完整的 det→cls→rec 串接见 [`examples/ocr_demo.cc`](../examples/ocr_demo.cc)
 （裁剪顺序与字典的坑都在那里处理了）。
+
+---
+
+## 语音识别（Paraformer）
+
+输入一段 16 kHz 单声道语音，一次前向就出文字。Paraformer 是非自回归模型，没有逐字解码的循环。
+模型编成三段，后两段之间在 CPU 上做 CIF（连续积分发放）：
+fbank → LFR → CMVN → **encoder** → **predictor** → CIF → **decoder** → argmax。
+
+```python
+asr = bcdl.ParaformerAsr.from_files(
+    "models/paraformer_encoder_int16.hbm",
+    "models/paraformer_predictor_int16_v2.hbm",
+    "models/paraformer_decoder_int16_v2.hbm",
+    "models/paraformer_tokens_8404.json",
+    "models/paraformer_am.mvn")
+r = asr.transcribe(pcm)          # float32，范围 [-1, 1]（int16 也行），16 kHz 单声道
+print(r.text, r.truncated)
+
+# 前端和 CIF 也能单独用（不需要模型）：
+feats = bcdl.Fbank().compute(pcm)                  # (帧数, 80) Kaldi log-mel
+lfr = bcdl.lfr_stack(feats, 7, 6)                  # (ceil(帧数/6), 560)
+emb, n = bcdl.cif_integrate(alphas, hidden, valid_frames)
+```
+
+**每次只喂一句话，最长 `asr.max_seconds`（24 秒）。**超长的部分会被截掉，并把 `r.truncated`
+置为真，所以长音频要先用 VAD 切句。库里没有重采样，调用前请先转成 16 kHz。
+
+前端复现 `torchaudio.compliance.kaldi.fbank`（dither 0）：和 float64 参考实现的误差约 1e-5，和 torchaudio 自身的 float32 结果相差约 2e-4；LFR 与 FunASR 逐位一致。
+这么较真是因为：模型是在这套特征上训练的，换成"差不多"的特征不会报错，只会悄悄地识别变差。
+
+- **`FbankConfig`**：`sample_rate`、`num_mel_bins`、`frame_length_ms`、`frame_shift_ms`、
+  `preemphasis`、`remove_dc_offset`、`low_freq`、`high_freq`、`input_scale`、`window`。
+  `input_scale` 默认 32768，float PCM 会先乘上它，因为 Kaldi 处理的是 int16 量级的采样；icefall / k2
+  的模型要设成 1。`window` 为 `"hamming"`（torchaudio 和 FunASR 用的）或 `"povey"`（Kaldi 默认）。
+- **`Fbank(config=FbankConfig())`**：`.compute(pcm) -> (帧数, num_mel_bins)`、
+  `.num_frames(samples)`、`.frame_length`、`.frame_shift`、`.fft_size`。
+- **`lfr_stack(feats, lfr_m=7, lfr_n=6) -> np.ndarray`**：低帧率拼帧，与 FunASR 逐位一致。
+- **`Cmvn`**：`dim`、`shift`、`scale`、`.apply(feats)`。`am.mvn` 用
+  **`load_kaldi_cmvn(path)`** 或 **`parse_kaldi_cmvn(text)`** 读入。
+- **`CifConfig`**：`threshold`（默认 1.0）、`tail_threshold`（默认 0.45）、`max_tokens`。
+- **`cif_integrate(alphas, hidden, valid_frames, config=CifConfig())`** →
+  `((max_tokens, D) 嵌入, token 数)`。尾部权重放在第 `valid_frames` 帧，也就是语音真正结束的位置。
+  定长的 predictor 图只能把它放在补零区的末尾，而补零区随后会被屏蔽掉，尾部权重也就跟着没了，
+  结果是凡是最后一个字要靠尾部权重才能发放的句子，都会丢掉这个字。
+- **`load_token_list(path) -> list[str]`**：读 JSON 数组（`tokens.json`）或每行一个 token 的文本。
+  另有 **`argmax_tokens(logits)`** 和 **`tokens_to_text(ids, vocab)`**（去掉 `<特殊符号>`、
+  拼接 `@@` 子词、英文单词之间加空格）。
+- **`AsrResult`**：`text`、`token_ids`、`feature_frames`、`truncated`。
+- **`ParaformerConfig`**：`fbank`、`lfr_m`、`lfr_n`、`cif`。
+- **`ParaformerAsr(encoder, predictor, decoder, vocab, cmvn, config=None)`**：
+  传入三个 `Engine`，也可以用 `ParaformerAsr.from_files(encoder, predictor, decoder, tokens, cmvn,
+  config=None)` 从文件构建。方法和属性有 `.transcribe(pcm, timeout_ms=0)`、
+  `.transcribe_features(feats)`、`.features(pcm)`、`.max_seconds`、`.max_frames`、
+  `.feature_dim`、`.max_tokens`、`.vocab_size`。三段模型按张量形状自动对应；
+  token 表的大小和 decoder 对不上时会直接报错。
+
+
+### 语音端点检测（Silero VAD）
+
+在 16 kHz 音频流里找出语音的起止，把每句话完整地交给识别。Silero VAD v6 跑在 BPU 上，每 32 ms
+调用一次；`VadSegmenter` 把概率切成一句一句。
+
+```python
+vad = bcdl.SileroVad("models/silero_vad_16k_int16_nashm.hbm")
+seg = bcdl.VadSegmenter(vad)                 # VadConfig()：阈值 0.5，开 250 ms，关 300 ms
+for block in mic_blocks():                   # float32 或 int16，长度任意
+    for s in seg.feed(block):                # 本块里结束的语句
+        print(s.start / 16000, asr.transcribe(s.pcm).text)
+for s in seg.flush(): ...                    # 流结束
+
+segs = seg.segments(recording)               # 整段录音一次处理
+p = vad.probabilities(recording)             # 每 512 个采样点一个概率
+```
+
+在 100 段带噪会话（每段 30 s：AISHELL-1 语句间隔 0.3–3 s，叠加 10 dB 和 0 dB 的 MUSAN 噪声）和
+24 分钟纯噪声上，用默认 `VadConfig` 测得：
+
+| | 帧级 F1，10 / 0 dB | 漏句率 | 判停延迟（中位 / p90，10 dB） | 纯噪声误报 |
+|---|---|---|---|---|
+| 浮点 Silero（ONNX） | 0.929 / 0.870 | 2.3% / 11.5% | 0.36 / 0.44 s | 0 |
+| **int16，BPU** | **0.924 / 0.863** | **3.4% / 13.2%** | **0.36 / 0.43 s** | **0** |
+
+25.3 万个块上两者的语音 / 非语音判定 99.0% 一致（概率平均差 0.012）。板上每块 0.39 ms，
+含 STFT 和 Python 开销，占实时的 1.2%。把 `threshold` 调到 0.4，BPU 版的 F1 能追平浮点
+（0.929 / 0.872），但判停更晚（0 dB 下 p90 从 0.52 s 变成 0.61 s）。
+
+- **`SileroVad(engine_or_path)`** —— `.probability(chunk)`（512 个采样点 → 概率）、
+  `.probabilities(pcm)`（整段录音，从 reset 开始）、`.reset()`、`.chunk`（512）、
+  `.sample_rate`（16000）。有状态：LSTM 状态和上一块最后 64 个采样点会带到下一次，
+  所以一个对象只读一路音频流，且要按顺序。
+- **`VadConfig`** —— `threshold`（0.5）、`neg_threshold`（−1 表示等于 threshold；调低即滞回）、
+  `min_speech_ms`（250）、`min_silence_ms`（300）、`speech_pad_ms`（30）、
+  `max_speech_s`（20；识别窗口是 24 s）。
+- **`VadSegmenter(vad, config=None)`** —— `.feed(pcm)`、`.flush()`、`.segments(pcm)`、
+  `.reset()`、`.in_speech`、`.last_probability`。概率连续 `min_speech_ms` 不低于 `threshold`
+  时开始一段，连续 `min_silence_ms` 低于 `neg_threshold` 时结束，所以判停大约在说话人停下后
+  `min_silence_ms`。
+- **`VadSegment`** —— `start`、`end`（自上次 reset 起的采样点，含补边）、`pcm`。
+
+模型自带的 STFT 在 CPU 上算，BPU 只接收幅度谱。整图编译时，实部虚部的平方在 BPU 上做，
+功率值域约 5000，int16 会丢掉所有小幅值频点，句子中段的概率掉到 0.2–0.5。
+
+### 唤醒词检测
+
+持续监听唤醒词，听到后再交给 VAD 和识别。模型是 sherpa-onnx 的开放词表 zipformer transducer
+（中英文，300 万参数）：唤醒词是一行 token，不需要重新训练模型。编码器在 BPU 上每次处理 160 ms，
+解码器、joiner 和关键词搜索在 CPU 上，逐步照搬 sherpa-onnx 的 KeywordSpotter。
+
+```python
+kws = bcdl.KeywordSpotter("models/kws_zipformer_zh_en_3m_c16_int16_nashm.hbm",
+                          "models/kws_zipformer_zh_en_3m_decoder_joiner.npy",
+                          "models/kws_zipformer_zh_en_3m_tokens.txt",
+                          "n ǐ h ǎo x iǎo ch ē @你好小车\n"
+                          "x iǎo ch ē x iǎo ch ē @小车小车\n")
+for block in mic_blocks():                   # float32 或 int16，长度任意
+    for d in kws.feed(block):
+        print(d.keyword, d.start, d.end)     # 自 reset() 起的秒数
+```
+
+每行唤醒词依次是：模型的 token（中文是声母和带声调的韵母，英文是 ARPAbet 音素），可选的
+`:boost` 和 `#threshold`（只作用于这一行），最后是 `@短语`。sherpa-onnx 的 `text2token` 工具
+（`pip install sherpa-onnx`）可以把普通文本转成这种格式。
+
+用"你好小车""小车小车"测试（各 202 段，干净和叠加 MUSAN 噪声各一套，9 种合成音色），负样本是
+AISHELL-1 语音、语音指令和 2.3 小时带噪会话，另有 350 段易混淆短语（你好小菜、校车校车……），
+默认阈值下：
+
+| | 唤醒词召回（干净 / 噪声） | 误唤醒 | 易混淆短语误触发（干净 / 噪声） |
+|---|---|---|---|
+| 浮点（sherpa-onnx） | 96.5% / 87.1% | 4.1 小时 0 次 | 5.4% / 4.6% |
+| **int16，BPU** | **97.5% / 89.1%** | **4.4 小时 0 次** | **5.7% / 4.0%** |
+
+编码器每 160 ms 音频占用 BPU 2.0 ms；加上 CPU 解码，整体实时率 0.023。
+
+- **`KeywordSpotter(encoder, decoder_joiner, tokens, keywords=None, config=None)`** ——
+  `keywords` 可以是唤醒词文本，也可以是文件路径。`.feed(pcm)`、`.flush()`（流结束时调用：最后约
+  0.3 s 里的唤醒词要靠它才检测得到）、`.set_keywords(text)`、
+  `.load_keywords(path)`、`.keywords`、`.reset()`、`.encode(pcm)`（整段录音的编码器输出，测试用）、
+  `.token_id(token)`。有状态：一个对象只读一路音频流，且要按顺序。
+- **`KwsConfig`** —— `keywords_score`（1.0，每个匹配 token 的加分）、`keywords_threshold`（0.25，
+  检测所需的平均 token 概率）、`num_trailing_blanks`（1）、`max_active_paths`（4），与 sherpa-onnx
+  默认值相同。想减少误唤醒就调高阈值，想提高召回就调低。
+- **`KwsDetection`** —— `keyword`、`index`（第几行）、`start`、`end`、`tokens`。
+
+### 语音指令（固定指令集）
+
+机器人听口令，要的是知道说的是**哪一条**指令，不需要一字不差的转写。`CommandMatcher`
+把识别结果和固定指令表放到无声调拼音里比较，同音字（打开灯 → 大开灯、出发 → 处罚）和
+句尾多出的语气词（前进 → 前进了）都能吸收，不是指令的话会被拒绝。纯 CPU，每次几微秒。
+
+```python
+m = bcdl.CommandMatcher(["前进", "后退", "左转", "右转", "打开灯", "关灯"])
+r = m.match(asr.transcribe(pcm).text)    # 比如 "大开灯"
+if r:                                    # 即 r.index >= 0
+    print(r.index, r.command, r.distance)   # 4 打开灯 0.0
+```
+
+在 40 条指令 × 9 个合成音色上，Paraformer 整句完全正确率是干净 84.7% / 5 dB 噪声 82.8%；
+这样匹配后是 96.9% / 95.6%，错配到别的指令 0.6% / 1.1%，600 句新闻没有一句被当成指令。
+
+- **`to_pinyin(text) -> list[str]`**：每个汉字一个无声调音节（取最常用读音，ü 写作 `v`）；
+  连续的 ASCII 字母算一个小写 token；连续数字按中文读法展开（`"90"` → `jiu shi`）；
+  全角字母数字折成半角；其余字符丢弃。
+- **`CommandMatcher(commands, max_distance=0.5)`**：距离 = 音节级编辑距离 ÷ 该指令的音节数；
+  距离相同时取长度更接近的，再取靠前的。英文单词只和英文单词比（"you" 不等于“右”）。
+  方法有 `.match(text) -> CommandMatch`、`.distances(text) -> list[float]`、`.commands`、
+  `.max_distance`、`len()`。
+- **`CommandMatch`**：`index`（-1 表示拒绝）、`nearest`（被拒绝时也给出最近的指令；文本没有
+  任何拼音时为 -1）、`distance`、`command`；接受时布尔值为真。同一意图的多种说法就写成多条。
+
+
+### 语音合成后端（Vocos 声码器）
+
+mel 谱进、波形出：Vocos 跑在 BPU，逆 STFT 在 CPU。它是非自回归 TTS 的后半段，
+前面接一个输出 80 维对数 mel（16 kHz、hop 256）的声学模型，比如 Matcha-TTS zh-en。
+
+```python
+voc = bcdl.VocosVocoder("models/vocos_16k_t256_int16_nashm.hbm")
+pcm = voc.synthesize(mel)        # (80, frames) float32 对数 mel -> float32 PCM，16 kHz
+
+# 单独用逆 STFT（不需要模型）：
+ist = bcdl.Istft()               # n_fft 1024、hop 256、center、周期 Hann 窗
+wav = ist.compute(real, imag)    # 都是 (frames, 513)
+wav = ist.compute_polar(mag, cos, sin)   # 都是 (513, frames)，即 Vocos 的输出布局
+```
+
+编译好的模型一次吃 256 帧（4.1 s）；更长的 mel 切成两边各重叠 32 帧的块，拼接处精确无误差。
+每 3 s 音频：BPU 1.3 ms、CPU 6.6 ms。和浮点模型相比，可听部分的对数谱距离 0.54 dB，
+Paraformer 识别它的输出一字不差。
+
+- **`IstftConfig`**：`n_fft`（2 的幂）、`hop_length`、`center`。
+- **`Istft(config=IstftConfig())`**：`.compute(real, imag)`、`.compute_polar(mag, cos, sin)`、
+  `.num_samples(frames)`（center 时为 `(frames - 1) * hop`）、`.bins`。与周期 Hann 窗的
+  `torch.istft` 一致；DC 和 Nyquist 的虚部被忽略。
+- **`VocosConfig`**：`stft`、`context`（每边重叠帧数，≥ 27 拼接才精确）、`pad_value`
+  （两端之外补的对数 mel 值，−16）、`max_magnitude`（100）、`sample_rate`。
+- **`VocosVocoder(engine_or_path, config=None)`**：`.synthesize(mel, timeout_ms=0)` 接受
+  `(num_mels, frames)` 或 `(1, num_mels, frames)`；属性有 `.num_mels`、`.chunk_frames`、
+  `.body_frames`、`.sample_rate`。模型必须按顺序输出 `log_mag` 和 `phase`：`exp`/`cos`/`sin`
+  放在 CPU 上算，因为编译器量化后的 `cos`/`sin` 会把相位算坏。
+
+
+### 语音合成（Matcha-TTS + Vocos）
+
+中文文本进、16 kHz 语音出，所有网络都跑在 BPU 上。非自回归：每句话只跑一次编码器、一次解码器
+（三步 flow matching 编译在图里）和一到两块声码器。
+
+```python
+tts = bcdl.TextToSpeech.from_files(
+    "models/matcha_zh_en_enc_l128_int16_nashm.hbm",
+    "models/matcha_zh_en_dec_t512_int16_nashm.hbm",
+    "models/matcha_zh_en_embedding.npy",
+    "models/vocos_16k_t256_int16_nashm.hbm",
+    "models/matcha_zh_en_tokens.txt",
+    "models/matcha_zh_en_lexicon.txt")
+r = tts.synthesize("好的，马上出发。")      # r.pcm 为 float32，r.sample_rate 为 16000
+
+# 也可以逐段调用：
+fe = bcdl.MatchaFrontend("models/matcha_zh_en_tokens.txt", "models/matcha_zh_en_lexicon.txt")
+for ids in fe.encode(text):                  # 每句一个 id 列表
+    m = acoustic.synthesize(ids)             # MatchaAcoustic -> m.mel (80, frames)
+    pcm = vocoder.synthesize(m.mel)
+```
+
+在 60 句小车回复上，BPU 整条链路的合成语音用 FireRedASR2 回识别，字错率 1.73%；浮点模型在 CPU
+上（sherpa-onnx）是 1.61%。实时率 0.009，平均每句 26 ms。
+
+- **`MatchaFrontend(tokens, lexicon, config=MatchaFrontendConfig())`**：`.encode(text) ->
+  list[list[int]]`、`.sentences(text)`、`MatchaFrontend.read_numbers(text)`、`.vocab_size`、
+  `.lexicon_size`。与 sherpa-onnx 针对该模型的词典前端逐个 id 一致（标点折叠、切句与合并、
+  词典最长匹配、句尾标点 token）。数字先读成汉字（`90` → 九十、`12.6` → 十二点六、
+  `35%` → 百分之三十五、`2026年` → 二零二六年）。英文单词会被丢弃——词典里没有英文。
+- **`MatchaFrontendConfig`**：`min_words`（5）、`max_words`（20）。
+- **`MatchaConfig`**：`noise_scale`（1.0；设为 0 时输出确定）、`length_scale`（> 1 更慢）、`seed`。
+- **`MatchaAcoustic(encoder, decoder, embedding, config=None)`**：`.synthesize(ids) ->
+  MatchaResult`（`mel` 为 `(80, frames)`、`frames`、`durations`、`truncated`）、`.seed(n)`、
+  `.max_tokens`（128）、`.max_frames`（512 = 8.2 s）、`.num_mels`、`.vocab_size`。超长输入会被
+  截断并打上标记。token 的词嵌入在 CPU 上从 `.npy` 查表。
+- **`TextToSpeech(frontend, acoustic, vocoder, tts_config=None)`** /
+  **`.from_files(..., config=None, tts_config=None)`**：`.synthesize(text) -> TtsResult`（`pcm`、
+  `sample_rate`、`sentences`、`truncated`）。每句单独合成后拼接，再把每段不短于 0.2 s 的停顿压到
+  `TextToSpeechConfig.silence_scale` 倍（默认 0.2，与 sherpa-onnx 相同；设为 1 保留模型原样的停顿，
+  标点处偏长）。60 句测试文本的总时长从 225 s 降到 172 s（sherpa-onnx 是 176 s），回识别字错率不变。
+- **`scale_silence(pcm, sample_rate, scale, min_pause_s=0.2, level=0.01)`**：单独做停顿压缩
+  （`|x| <= level` 算静音），与 sherpa-onnx 逐样本一致。
 
 ---
 

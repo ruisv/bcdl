@@ -49,6 +49,14 @@
 #include "bcdl/tasks/mono3d.h"
 #include "bcdl/tasks/obb.h"
 #include "bcdl/tasks/optical_flow.h"
+#include "bcdl/tasks/asr.h"
+#include "bcdl/tasks/command.h"
+#include "bcdl/tasks/vocoder.h"
+#include "bcdl/tasks/tts.h"
+#include "bcdl/tasks/vad.h"
+#include "bcdl/tasks/kws.h"
+#include "bcdl/preproc/istft.h"
+#include "bcdl/preproc/fbank.h"
 #include "bcdl/tasks/panoptic_drive.h"
 #include "bcdl/tasks/ocr.h"
 #include "bcdl/tasks/open_vocab.h"
@@ -122,6 +130,8 @@ NB_MODULE(bcdl_py, m) {
                   "feature submodels). Pass one to Engine(path, model_name).")
       .def_prop_ro("num_inputs", &bcdl::Engine::numInputs)
       .def_prop_ro("num_outputs", &bcdl::Engine::numOutputs)
+      .def("input_name", &bcdl::Engine::inputName, "index"_a)
+      .def("output_name", &bcdl::Engine::outputName, "index"_a)
       .def("input_shape", &bcdl::Engine::inputShape, "index"_a)
       .def("output_shape", &bcdl::Engine::outputShape, "index"_a)
       .def("input_bytes",
@@ -2710,6 +2720,488 @@ NB_MODULE(bcdl_py, m) {
       .def_prop_ro("input_width", &bcdl::OpticalFlowEstimator::inputWidth)
       .def_prop_ro("input_height", &bcdl::OpticalFlowEstimator::inputHeight)
       .def_prop_ro("config", &bcdl::OpticalFlowEstimator::config);
+
+  // ===========================================================================
+  // Speech: Kaldi fbank front end + Paraformer ASR
+  // ===========================================================================
+  nb::class_<bcdl::FbankConfig>(m, "FbankConfig")
+      .def(nb::init<>())
+      .def_rw("sample_rate", &bcdl::FbankConfig::sample_rate)
+      .def_rw("num_mel_bins", &bcdl::FbankConfig::num_mel_bins)
+      .def_rw("frame_length_ms", &bcdl::FbankConfig::frame_length_ms)
+      .def_rw("frame_shift_ms", &bcdl::FbankConfig::frame_shift_ms)
+      .def_rw("preemphasis", &bcdl::FbankConfig::preemphasis)
+      .def_rw("remove_dc_offset", &bcdl::FbankConfig::remove_dc_offset)
+      .def_rw("low_freq", &bcdl::FbankConfig::low_freq)
+      .def_rw("high_freq", &bcdl::FbankConfig::high_freq)
+      .def_rw("input_scale", &bcdl::FbankConfig::input_scale)
+      .def_rw("window", &bcdl::FbankConfig::window);
+
+  nb::class_<bcdl::Fbank>(m, "Fbank")
+      .def(nb::init<const bcdl::FbankConfig&>(), "config"_a = bcdl::FbankConfig{})
+      .def(
+          "compute",
+          [](bcdl::Fbank& self, nb::ndarray<const float, nb::ndim<1>, nb::c_contig> pcm) {
+            std::vector<float> out;
+            int frames;
+            {
+              nb::gil_scoped_release rel;
+              frames = self.compute(pcm.data(), pcm.shape(0), out);
+            }
+            return toNumpy(std::move(out), {static_cast<size_t>(frames),
+                                            static_cast<size_t>(self.config().num_mel_bins)});
+          },
+          "pcm"_a, "Mono float PCM -> (frames, num_mel_bins) log-mel features.")
+      .def("num_frames", &bcdl::Fbank::numFrames, "samples"_a)
+      .def_prop_ro("frame_length", &bcdl::Fbank::frameLength)
+      .def_prop_ro("frame_shift", &bcdl::Fbank::frameShift)
+      .def_prop_ro("fft_size", &bcdl::Fbank::fftSize)
+      .def_prop_ro("config", &bcdl::Fbank::config);
+
+  m.def(
+      "lfr_stack",
+      [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig> feats, int lfr_m, int lfr_n) {
+        std::vector<float> out;
+        const int dim = static_cast<int>(feats.shape(1));
+        const int n = bcdl::lfrStack(feats.data(), static_cast<int>(feats.shape(0)), dim,
+                                     lfr_m, lfr_n, out);
+        return toNumpy(std::move(out),
+                       {static_cast<size_t>(n), static_cast<size_t>(lfr_m) * dim});
+      },
+      "feats"_a, "lfr_m"_a = 7, "lfr_n"_a = 6,
+      "Low-frame-rate stacking: (T, D) -> (ceil(T / lfr_n), lfr_m * D), as FunASR.");
+
+  nb::class_<bcdl::Cmvn>(m, "Cmvn")
+      .def(nb::init<>())
+      .def_prop_ro("dim", &bcdl::Cmvn::dim)
+      .def_prop_ro(
+          "shift", [](const bcdl::Cmvn& c) { return toNumpy(std::vector<float>(c.shift), {c.shift.size()}); },
+          nb::rv_policy::reference)
+      .def_prop_ro(
+          "scale", [](const bcdl::Cmvn& c) { return toNumpy(std::vector<float>(c.scale), {c.scale.size()}); },
+          nb::rv_policy::reference)
+      .def(
+          "apply",
+          [](const bcdl::Cmvn& c, nb::ndarray<const float, nb::ndim<2>, nb::c_contig> feats) {
+            if (static_cast<int>(feats.shape(1)) != c.dim())
+              throw std::invalid_argument("Cmvn.apply: feature dim does not match the CMVN");
+            std::vector<float> out(feats.data(), feats.data() + feats.size());
+            c.apply(out.data(), static_cast<int>(feats.shape(0)));
+            return toNumpy(std::move(out), {feats.shape(0), feats.shape(1)});
+          },
+          "feats"_a, "(x + shift) * scale, per dimension; returns a new array.");
+  m.def("parse_kaldi_cmvn", &bcdl::parseKaldiCmvn, "text"_a,
+        "Parse an am.mvn (<AddShift> / <Rescale>) into a Cmvn.");
+  m.def("load_kaldi_cmvn", &bcdl::loadKaldiCmvn, "path"_a);
+
+  nb::class_<bcdl::CifConfig>(m, "CifConfig")
+      .def(nb::init<>())
+      .def_rw("threshold", &bcdl::CifConfig::threshold)
+      .def_rw("tail_threshold", &bcdl::CifConfig::tail_threshold)
+      .def_rw("max_tokens", &bcdl::CifConfig::max_tokens);
+
+  m.def(
+      "cif_integrate",
+      [](nb::ndarray<const float, nb::ndim<1>, nb::c_contig> alphas,
+         nb::ndarray<const float, nb::ndim<2>, nb::c_contig> hidden, int valid_frames,
+         const bcdl::CifConfig& cfg) {
+        if (hidden.shape(0) != alphas.shape(0))
+          throw std::invalid_argument("cif_integrate: alphas and hidden differ in frame count");
+        std::vector<float> emb;
+        const int dim = static_cast<int>(hidden.shape(1));
+        const int n = bcdl::cifIntegrate(alphas.data(), hidden.data(),
+                                         static_cast<int>(alphas.shape(0)), dim, valid_frames,
+                                         cfg, emb);
+        return nb::make_tuple(
+            toNumpy(std::move(emb), {static_cast<size_t>(cfg.max_tokens), static_cast<size_t>(dim)}),
+            n);
+      },
+      "alphas"_a, "hidden"_a, "valid_frames"_a, "config"_a = bcdl::CifConfig{},
+      "Continuous integrate-and-fire -> ((max_tokens, D) embeddings, token count).");
+
+  m.def("load_token_list", &bcdl::loadTokenList, "path"_a,
+        "Token list from a JSON array (tokens.json) or one token per line.");
+  m.def(
+      "argmax_tokens",
+      [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig> logits) {
+        return bcdl::argmaxTokens(logits.data(), static_cast<int>(logits.shape(0)),
+                                  static_cast<int>(logits.shape(1)));
+      },
+      "logits"_a, "Row-wise argmax of (rows, vocab) logits.");
+  m.def("tokens_to_text", &bcdl::tokensToText, "ids"_a, "vocab"_a,
+        "Join token pieces: drop <specials>, glue '@@' pieces, space Latin words.");
+
+  nb::class_<bcdl::AsrResult>(m, "AsrResult")
+      .def(nb::init<>())
+      .def_ro("text", &bcdl::AsrResult::text)
+      .def_ro("token_ids", &bcdl::AsrResult::token_ids)
+      .def_ro("feature_frames", &bcdl::AsrResult::feature_frames)
+      .def_ro("truncated", &bcdl::AsrResult::truncated)
+      .def("__repr__", [](const bcdl::AsrResult& r) {
+        return "AsrResult(text='" + r.text + "', tokens=" + std::to_string(r.token_ids.size()) +
+               (r.truncated ? ", truncated" : "") + ")";
+      });
+
+  nb::class_<bcdl::ParaformerConfig>(m, "ParaformerConfig")
+      .def(nb::init<>())
+      .def_rw("fbank", &bcdl::ParaformerConfig::fbank)
+      .def_rw("lfr_m", &bcdl::ParaformerConfig::lfr_m)
+      .def_rw("lfr_n", &bcdl::ParaformerConfig::lfr_n)
+      .def_rw("cif", &bcdl::ParaformerConfig::cif);
+
+  nb::class_<bcdl::ParaformerAsr>(m, "ParaformerAsr")
+      .def(nb::init<bcdl::Engine&, bcdl::Engine&, bcdl::Engine&, std::vector<std::string>,
+                    bcdl::Cmvn, bcdl::ParaformerConfig>(),
+           "encoder"_a, "predictor"_a, "decoder"_a, "vocab"_a, "cmvn"_a,
+           "config"_a = bcdl::ParaformerConfig{}, nb::keep_alive<1, 2>(),
+           nb::keep_alive<1, 3>(), nb::keep_alive<1, 4>())
+      .def(
+          "transcribe",
+          [](bcdl::ParaformerAsr& self, nb::ndarray<const float, nb::ndim<1>, nb::c_contig> pcm,
+             int timeout_ms) {
+            nb::gil_scoped_release rel;  // front end + three BPU stages + CIF
+            return self.transcribe(pcm.data(), pcm.shape(0), timeout_ms);
+          },
+          "pcm"_a, "timeout_ms"_a = 0, "One mono 16 kHz float utterance -> AsrResult.")
+      .def(
+          "transcribe_features",
+          [](bcdl::ParaformerAsr& self, nb::ndarray<const float, nb::ndim<2>, nb::c_contig> f,
+             int timeout_ms) {
+            if (static_cast<int>(f.shape(1)) != self.featureDim())
+              throw std::invalid_argument("transcribe_features: feature dim does not match the encoder");
+            nb::gil_scoped_release rel;
+            return self.transcribeFeatures(f.data(), static_cast<int>(f.shape(0)), timeout_ms);
+          },
+          "feats"_a, "timeout_ms"_a = 0,
+          "(frames, feature_dim) LFR+CMVN features -> AsrResult.")
+      .def(
+          "features",
+          [](bcdl::ParaformerAsr& self, nb::ndarray<const float, nb::ndim<1>, nb::c_contig> pcm) {
+            std::vector<float> out;
+            int n;
+            {
+              nb::gil_scoped_release rel;
+              n = self.features(pcm.data(), pcm.shape(0), out);
+            }
+            return toNumpy(std::move(out),
+                           {static_cast<size_t>(n), static_cast<size_t>(self.featureDim())});
+          },
+          "pcm"_a, "Front end only: PCM -> (frames, feature_dim) normalised features.")
+      .def_prop_ro("max_frames", &bcdl::ParaformerAsr::maxFrames)
+      .def_prop_ro("max_seconds", &bcdl::ParaformerAsr::maxSeconds)
+      .def_prop_ro("feature_dim", &bcdl::ParaformerAsr::featureDim)
+      .def_prop_ro("max_tokens", &bcdl::ParaformerAsr::maxTokens)
+      .def_prop_ro("vocab_size", &bcdl::ParaformerAsr::vocabSize)
+      .def_prop_ro("config", &bcdl::ParaformerAsr::config);
+
+  m.def("to_pinyin", &bcdl::toPinyin, "text"_a,
+        "Toneless pinyin of a UTF-8 string, one token per syllable.");
+  nb::class_<bcdl::CommandMatch>(m, "CommandMatch")
+      .def(nb::init<>())
+      .def_ro("index", &bcdl::CommandMatch::index)
+      .def_ro("nearest", &bcdl::CommandMatch::nearest)
+      .def_ro("distance", &bcdl::CommandMatch::distance)
+      .def_ro("command", &bcdl::CommandMatch::command)
+      .def("__bool__", [](const bcdl::CommandMatch& r) { return r.index >= 0; })
+      .def("__repr__", [](const bcdl::CommandMatch& r) {
+        return "CommandMatch(index=" + std::to_string(r.index) + ", command='" + r.command +
+               "', nearest=" + std::to_string(r.nearest) +
+               ", distance=" + std::to_string(r.distance) + ")";
+      });
+  nb::class_<bcdl::CommandMatcher>(m, "CommandMatcher")
+      .def(nb::init<std::vector<std::string>, float>(), "commands"_a, "max_distance"_a = 0.5f)
+      .def("match", &bcdl::CommandMatcher::match, "text"_a,
+           "Recogniser text -> CommandMatch (index -1 = not a command).")
+      .def("distances", &bcdl::CommandMatcher::distances, "text"_a,
+           "Normalised pinyin edit distance to every command, in list order.")
+      .def_prop_ro("commands", &bcdl::CommandMatcher::commands)
+      .def_prop_ro("max_distance", &bcdl::CommandMatcher::maxDistance)
+      .def("__len__", &bcdl::CommandMatcher::size);
+
+  // Speech synthesis back end: iSTFT + Vocos
+  nb::class_<bcdl::IstftConfig>(m, "IstftConfig")
+      .def(nb::init<>())
+      .def_rw("n_fft", &bcdl::IstftConfig::n_fft)
+      .def_rw("hop_length", &bcdl::IstftConfig::hop_length)
+      .def_rw("center", &bcdl::IstftConfig::center);
+  nb::class_<bcdl::Istft>(m, "Istft")
+      .def(nb::init<const bcdl::IstftConfig&>(), "config"_a = bcdl::IstftConfig{})
+      .def(
+          "compute",
+          [](bcdl::Istft& self, nb::ndarray<const float, nb::ndim<2>, nb::c_contig> real,
+             nb::ndarray<const float, nb::ndim<2>, nb::c_contig> imag) {
+            if (real.shape(0) != imag.shape(0) || real.shape(1) != imag.shape(1) ||
+                static_cast<int>(real.shape(1)) != self.bins())
+              throw std::invalid_argument("Istft.compute: real and imag must both be (frames, " +
+                                          std::to_string(self.bins()) + ")");
+            std::vector<float> out;
+            {
+              nb::gil_scoped_release rel;
+              self.compute(real.data(), imag.data(), static_cast<int>(real.shape(0)), out);
+            }
+            const size_t n = out.size();
+            return toNumpy(std::move(out), {n});
+          },
+          "real"_a, "imag"_a, "(frames, n_fft/2+1) real and imaginary parts -> waveform.")
+      .def(
+          "compute_polar",
+          [](bcdl::Istft& self, nb::ndarray<const float, nb::ndim<2>, nb::c_contig> mag,
+             nb::ndarray<const float, nb::ndim<2>, nb::c_contig> cos,
+             nb::ndarray<const float, nb::ndim<2>, nb::c_contig> sin) {
+            const auto ok = [&](const auto& a) {
+              return a.shape(0) == mag.shape(0) && a.shape(1) == mag.shape(1);
+            };
+            if (static_cast<int>(mag.shape(0)) != self.bins() || !ok(cos) || !ok(sin))
+              throw std::invalid_argument("Istft.compute_polar: mag, cos, sin must all be (" +
+                                          std::to_string(self.bins()) + ", frames)");
+            std::vector<float> out;
+            {
+              nb::gil_scoped_release rel;
+              self.computePolar(mag.data(), cos.data(), sin.data(),
+                                static_cast<int>(mag.shape(1)), out);
+            }
+            const size_t n = out.size();
+            return toNumpy(std::move(out), {n});
+          },
+          "mag"_a, "cos"_a, "sin"_a,
+          "(n_fft/2+1, frames) magnitude and phase cos/sin (Vocos layout) -> waveform.")
+      .def("num_samples", &bcdl::Istft::numSamples, "frames"_a)
+      .def_prop_ro("bins", &bcdl::Istft::bins)
+      .def_prop_ro("config", &bcdl::Istft::config);
+  nb::class_<bcdl::VocosConfig>(m, "VocosConfig")
+      .def(nb::init<>())
+      .def_rw("stft", &bcdl::VocosConfig::stft)
+      .def_rw("context", &bcdl::VocosConfig::context)
+      .def_rw("pad_value", &bcdl::VocosConfig::pad_value)
+      .def_rw("max_magnitude", &bcdl::VocosConfig::max_magnitude)
+      .def_rw("sample_rate", &bcdl::VocosConfig::sample_rate);
+  nb::class_<bcdl::VocosVocoder>(m, "VocosVocoder")
+      .def(nb::init<bcdl::Engine&, bcdl::VocosConfig>(), "engine"_a,
+           "config"_a = bcdl::VocosConfig{}, nb::keep_alive<1, 2>())
+      .def(
+          "synthesize",
+          [](bcdl::VocosVocoder& self, nb::ndarray<const float, nb::ndim<2>, nb::c_contig> mel,
+             int timeout_ms) {
+            if (static_cast<int>(mel.shape(0)) != self.numMels())
+              throw std::invalid_argument("VocosVocoder.synthesize: mel must be (" +
+                                          std::to_string(self.numMels()) + ", frames)");
+            std::vector<float> out;
+            {
+              nb::gil_scoped_release rel;
+              self.synthesize(mel.data(), static_cast<int>(mel.shape(1)), out, timeout_ms);
+            }
+            const size_t n = out.size();
+            return toNumpy(std::move(out), {n});
+          },
+          "mel"_a, "timeout_ms"_a = 0, "(num_mels, frames) log-mel -> float waveform.")
+      .def_prop_ro("num_mels", &bcdl::VocosVocoder::numMels)
+      .def_prop_ro("chunk_frames", &bcdl::VocosVocoder::chunkFrames)
+      .def_prop_ro("body_frames", &bcdl::VocosVocoder::bodyFrames)
+      .def_prop_ro("sample_rate", &bcdl::VocosVocoder::sampleRate)
+      .def_prop_ro("config", &bcdl::VocosVocoder::config);
+
+  // Voice activity detection: Silero VAD + streaming segmenter
+  nb::class_<bcdl::SileroVad>(m, "SileroVad")
+      .def(nb::init<bcdl::Engine&>(), "engine"_a, nb::keep_alive<1, 2>())
+      .def(
+          "probability",
+          [](bcdl::SileroVad& self, nb::ndarray<const float, nb::ndim<1>, nb::c_contig> chunk,
+             int timeout_ms) {
+            if (chunk.shape(0) != static_cast<size_t>(bcdl::SileroVad::kChunk))
+              throw std::invalid_argument("SileroVad.probability: chunk must be " +
+                                          std::to_string(bcdl::SileroVad::kChunk) +
+                                          " samples");
+            nb::gil_scoped_release rel;
+            return self.probability(chunk.data(), timeout_ms);
+          },
+          "chunk"_a, "timeout_ms"_a = 0,
+          "Speech probability of the next 512 samples (16 kHz float PCM); stateful.")
+      .def("reset", &bcdl::SileroVad::reset)
+      .def_prop_ro_static("chunk", [](nb::handle) { return bcdl::SileroVad::kChunk; })
+      .def_prop_ro_static("sample_rate", [](nb::handle) { return bcdl::SileroVad::kSampleRate; });
+  nb::class_<bcdl::VadConfig>(m, "VadConfig")
+      .def(nb::init<>())
+      .def_rw("threshold", &bcdl::VadConfig::threshold)
+      .def_rw("neg_threshold", &bcdl::VadConfig::neg_threshold)
+      .def_rw("min_speech_ms", &bcdl::VadConfig::min_speech_ms)
+      .def_rw("min_silence_ms", &bcdl::VadConfig::min_silence_ms)
+      .def_rw("speech_pad_ms", &bcdl::VadConfig::speech_pad_ms)
+      .def_rw("max_speech_s", &bcdl::VadConfig::max_speech_s);
+  nb::class_<bcdl::VadSegment>(m, "VadSegment")
+      .def_ro("start", &bcdl::VadSegment::start)
+      .def_ro("end", &bcdl::VadSegment::end)
+      .def_prop_ro("pcm",
+                   [](const bcdl::VadSegment& s) {
+                     return toNumpy(std::vector<float>(s.pcm), {s.pcm.size()});
+                   },
+                   nb::rv_policy::reference);
+  nb::class_<bcdl::VadSegmenter>(m, "VadSegmenter")
+      .def(nb::init<bcdl::SileroVad&, bcdl::VadConfig>(), "vad"_a,
+           "config"_a = bcdl::VadConfig{}, nb::keep_alive<1, 2>())
+      .def(
+          "feed",
+          [](bcdl::VadSegmenter& self, nb::ndarray<const float, nb::ndim<1>, nb::c_contig> pcm,
+             int timeout_ms) {
+            nb::gil_scoped_release rel;
+            return self.feed(pcm.data(), pcm.shape(0), timeout_ms);
+          },
+          "pcm"_a, "timeout_ms"_a = 0, "Float PCM of any length -> utterances that closed.")
+      .def("flush", &bcdl::VadSegmenter::flush)
+      .def(
+          "segments",
+          [](bcdl::VadSegmenter& self, nb::ndarray<const float, nb::ndim<1>, nb::c_contig> pcm,
+             int timeout_ms) {
+            nb::gil_scoped_release rel;
+            return self.segments(pcm.data(), pcm.shape(0), timeout_ms);
+          },
+          "pcm"_a, "timeout_ms"_a = 0, "Whole recording -> its utterances (from a reset).")
+      .def("reset", &bcdl::VadSegmenter::reset)
+      .def_prop_ro("in_speech", &bcdl::VadSegmenter::inSpeech)
+      .def_prop_ro("last_probability", &bcdl::VadSegmenter::lastProbability)
+      .def_prop_ro("config", &bcdl::VadSegmenter::config);
+
+  // Keyword spotting: streaming zipformer transducer
+  nb::class_<bcdl::KwsConfig>(m, "KwsConfig")
+      .def(nb::init<>())
+      .def_rw("keywords_score", &bcdl::KwsConfig::keywords_score)
+      .def_rw("keywords_threshold", &bcdl::KwsConfig::keywords_threshold)
+      .def_rw("num_trailing_blanks", &bcdl::KwsConfig::num_trailing_blanks)
+      .def_rw("max_active_paths", &bcdl::KwsConfig::max_active_paths);
+  nb::class_<bcdl::KwsDetection>(m, "KwsDetection")
+      .def_ro("keyword", &bcdl::KwsDetection::keyword)
+      .def_ro("index", &bcdl::KwsDetection::index)
+      .def_ro("start", &bcdl::KwsDetection::start)
+      .def_ro("end", &bcdl::KwsDetection::end)
+      .def_ro("tokens", &bcdl::KwsDetection::tokens)
+      .def("__repr__", [](const bcdl::KwsDetection& d) {
+        return "KwsDetection('" + d.keyword + "', " + std::to_string(d.start) + "-" +
+               std::to_string(d.end) + " s)";
+      });
+  nb::class_<bcdl::KeywordSpotter>(m, "KeywordSpotter")
+      .def(nb::init<bcdl::Engine&, const std::string&, const std::string&, bcdl::KwsConfig>(),
+           "encoder"_a, "decoder_joiner"_a, "tokens"_a, "config"_a = bcdl::KwsConfig{},
+           nb::keep_alive<1, 2>())
+      .def("set_keywords", &bcdl::KeywordSpotter::setKeywords, "text"_a)
+      .def("load_keywords", &bcdl::KeywordSpotter::loadKeywords, "path"_a)
+      .def_prop_ro("keywords", &bcdl::KeywordSpotter::keywords)
+      .def(
+          "feed",
+          [](bcdl::KeywordSpotter& self, nb::ndarray<const float, nb::ndim<1>, nb::c_contig> pcm,
+             int timeout_ms) {
+            nb::gil_scoped_release rel;
+            return self.feed(pcm.data(), pcm.shape(0), timeout_ms);
+          },
+          "pcm"_a, "timeout_ms"_a = 0, "16 kHz float PCM of any length -> detections.")
+      .def(
+          "encode",
+          [](bcdl::KeywordSpotter& self, nb::ndarray<const float, nb::ndim<1>, nb::c_contig> pcm,
+             int timeout_ms) {
+            int frames = 0;
+            std::vector<float> e;
+            {
+              nb::gil_scoped_release rel;
+              e = self.encode(pcm.data(), pcm.shape(0), frames, timeout_ms);
+            }
+            const size_t d = frames ? e.size() / frames : 0;
+            return toNumpy(std::move(e), {static_cast<size_t>(frames), d});
+          },
+          "pcm"_a, "timeout_ms"_a = 0, "Encoder output (frames, D) of a whole recording, from a reset.")
+      .def(
+          "flush",
+          [](bcdl::KeywordSpotter& self, int timeout_ms) {
+            nb::gil_scoped_release rel;
+            return self.flush(timeout_ms);
+          },
+          "timeout_ms"_a = 0, "End of stream: what still fires, then reset.")
+      .def("reset", &bcdl::KeywordSpotter::reset)
+      .def("token_id", &bcdl::KeywordSpotter::tokenId, "token"_a)
+      .def_prop_ro("vocab_size", &bcdl::KeywordSpotter::vocabSize)
+      .def_prop_ro("config", &bcdl::KeywordSpotter::config);
+
+  // Speech synthesis: Matcha-TTS front end + acoustic model, and the whole chain
+  nb::class_<bcdl::MatchaFrontendConfig>(m, "MatchaFrontendConfig")
+      .def(nb::init<>())
+      .def_rw("min_words", &bcdl::MatchaFrontendConfig::min_words)
+      .def_rw("max_words", &bcdl::MatchaFrontendConfig::max_words);
+  nb::class_<bcdl::MatchaFrontend>(m, "MatchaFrontend")
+      .def(nb::init<const std::string&, const std::string&, bcdl::MatchaFrontendConfig>(),
+           "tokens"_a, "lexicon"_a, "config"_a = bcdl::MatchaFrontendConfig{})
+      .def("encode", &bcdl::MatchaFrontend::encode, "text"_a,
+           "Text -> one token-id list per sentence.")
+      .def("sentences", &bcdl::MatchaFrontend::sentences, "text"_a)
+      .def_static("read_numbers", &bcdl::MatchaFrontend::readNumbers, "text"_a)
+      .def_prop_ro("vocab_size", &bcdl::MatchaFrontend::vocabSize)
+      .def_prop_ro("lexicon_size", &bcdl::MatchaFrontend::lexiconSize);
+  nb::class_<bcdl::MatchaConfig>(m, "MatchaConfig")
+      .def(nb::init<>())
+      .def_rw("noise_scale", &bcdl::MatchaConfig::noise_scale)
+      .def_rw("length_scale", &bcdl::MatchaConfig::length_scale)
+      .def_rw("seed", &bcdl::MatchaConfig::seed);
+  nb::class_<bcdl::MatchaResult>(m, "MatchaResult")
+      .def_prop_ro("mel",
+                   [](const bcdl::MatchaResult& r) {
+                     const size_t mels = r.frames ? r.mel.size() / r.frames : 0;
+                     return toNumpy(std::vector<float>(r.mel),
+                                    {mels, static_cast<size_t>(r.frames)});
+                   },
+                   nb::rv_policy::reference)
+      .def_ro("frames", &bcdl::MatchaResult::frames)
+      .def_ro("durations", &bcdl::MatchaResult::durations)
+      .def_ro("truncated", &bcdl::MatchaResult::truncated);
+  nb::class_<bcdl::MatchaAcoustic>(m, "MatchaAcoustic")
+      .def(nb::init<bcdl::Engine&, bcdl::Engine&, const std::string&, bcdl::MatchaConfig>(),
+           "encoder"_a, "decoder"_a, "embedding"_a, "config"_a = bcdl::MatchaConfig{},
+           nb::keep_alive<1, 2>(), nb::keep_alive<1, 3>())
+      .def(
+          "synthesize",
+          [](bcdl::MatchaAcoustic& self, const std::vector<int>& ids, int timeout_ms) {
+            nb::gil_scoped_release rel;
+            return self.synthesize(ids.data(), static_cast<int>(ids.size()), timeout_ms);
+          },
+          "ids"_a, "timeout_ms"_a = 0, "One sentence's token ids -> MatchaResult.")
+      .def("seed", &bcdl::MatchaAcoustic::seed, "seed"_a)
+      .def_prop_ro("max_tokens", &bcdl::MatchaAcoustic::maxTokens)
+      .def_prop_ro("max_frames", &bcdl::MatchaAcoustic::maxFrames)
+      .def_prop_ro("num_mels", &bcdl::MatchaAcoustic::numMels)
+      .def_prop_ro("vocab_size", &bcdl::MatchaAcoustic::vocabSize)
+      .def_prop_ro("config", &bcdl::MatchaAcoustic::config);
+  nb::class_<bcdl::TtsResult>(m, "TtsResult")
+      .def_prop_ro("pcm",
+                   [](const bcdl::TtsResult& r) {
+                     return toNumpy(std::vector<float>(r.pcm), {r.pcm.size()});
+                   },
+                   nb::rv_policy::reference)
+      .def_ro("sample_rate", &bcdl::TtsResult::sample_rate)
+      .def_ro("sentences", &bcdl::TtsResult::sentences)
+      .def_ro("truncated", &bcdl::TtsResult::truncated);
+  m.def(
+      "scale_silence",
+      [](nb::ndarray<const float, nb::ndim<1>, nb::c_contig> pcm, int sample_rate, float scale,
+         float min_pause_s, float level) {
+        std::vector<float> in(pcm.data(), pcm.data() + pcm.shape(0));
+        std::vector<float> out = bcdl::scaleSilence(in, sample_rate, scale, min_pause_s, level);
+        const size_t n = out.size();
+        return toNumpy(std::move(out), {n});
+      },
+      "pcm"_a, "sample_rate"_a, "scale"_a, "min_pause_s"_a = 0.2f, "level"_a = 0.01f,
+      "Shorten every pause (|x| <= level for >= min_pause_s) to scale of its length.");
+  nb::class_<bcdl::TextToSpeechConfig>(m, "TextToSpeechConfig")
+      .def(nb::init<>())
+      .def_rw("silence_scale", &bcdl::TextToSpeechConfig::silence_scale);
+  nb::class_<bcdl::TextToSpeech>(m, "TextToSpeech")
+      .def(nb::init<bcdl::MatchaFrontend, bcdl::MatchaAcoustic&, bcdl::VocosVocoder&,
+                    bcdl::TextToSpeechConfig>(),
+           "frontend"_a, "acoustic"_a, "vocoder"_a, "config"_a = bcdl::TextToSpeechConfig{},
+           nb::keep_alive<1, 3>(), nb::keep_alive<1, 4>())
+      .def(
+          "synthesize",
+          [](bcdl::TextToSpeech& self, const std::string& text, int timeout_ms) {
+            nb::gil_scoped_release rel;
+            return self.synthesize(text, timeout_ms);
+          },
+          "text"_a, "timeout_ms"_a = 0, "Text -> TtsResult (16 kHz float PCM).")
+      .def_prop_ro("frontend", &bcdl::TextToSpeech::frontend)
+      .def_prop_ro("config", &bcdl::TextToSpeech::config);
 
   // ===========================================================================
   // End-to-end driving: camera + lidar -> planned trajectory

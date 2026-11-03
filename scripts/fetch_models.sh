@@ -331,4 +331,53 @@ download "${DRIVE_HBM}" \
   "https://archive.d-robotics.cc/downloads/rdk_model_zoo/rdk_s100/${DRIVE_HBM}"
 download "kmeans_navsim_traj_20.npy" \
   "https://github.com/hustvl/DiffusionDrive/releases/download/DiffusionDrive_88p1_PDMS_Eval_file/kmeans_navsim_traj_20.npy"
+# Speech recognition (Paraformer-large, Chinese). An official PREBUILT split
+# into three stages with CIF on the CPU between the last two. The published file
+# names are generic (encoder_int16.hbm, ...), so each is saved under its internal
+# model name — prefixed where that name does not say what it belongs to — so the
+# _v2 the compiler stamped on two of them stays visible. The token list comes
+# with the build; the CMVN statistics come from the upstream model, which is
+# where the build's own front end takes them from.
+PARA="https://archive.d-robotics.cc/downloads/rdk_model_zoo/rdk_s100/paraformer/nash-e"
+download paraformer_encoder_int16.hbm      "${PARA}/encoder_int16.hbm"
+download paraformer_predictor_int16_v2.hbm "${PARA}/predictor_int16.hbm"
+download paraformer_decoder_int16_v2.hbm   "${PARA}/decoder_int16.hbm"
+download paraformer_tokens_8404.json       "${PARA}/tokens.json"
+download paraformer_am.mvn \
+  "https://modelscope.cn/models/iic/speech_paraformer-large-contextual_asr_nat-zh-cn-16k-common-vocab8404/resolve/master/am.mvn"
+# Voice activity detection: Silero VAD v6.2.3 (16 kHz), converted offline at
+# int16 as one fixed-shape step of the streaming model: a 512-sample chunk with
+# its 64 samples of context in, the LSTM state in and out. The context and the
+# reflection pad are done on the CPU.
+VAD_DIR="${BCDL_SRC_VAD:-/path/to/converted/silero_vad}"
+copy_or_hf "${VAD_DIR}/silero_vad_16k_int16_nashm.hbm" ruisv/bcdl-silero-vad
+# Keyword spotting (wake word): sherpa-onnx's zipformer2 KWS model (zh-en, 3M,
+# chunk 16 / left 64). The encoder is converted offline at int16 after a graph
+# rewrite (the int64 processed_lens becomes a float pad_mask, the softplus is
+# made fixed-point safe, the relative-position gathers become slices); the
+# decoder and joiner run on the CPU from one weight table.
+KWS_DIR="${BCDL_SRC_KWS:-/path/to/converted/kws}"
+copy_or_hf "${KWS_DIR}/kws_zipformer_zh_en_3m_c16_int16_nashm.hbm" ruisv/bcdl-kws-zipformer
+copy_or_hf "${KWS_DIR}/kws_zipformer_zh_en_3m_decoder_joiner.npy" ruisv/bcdl-kws-zipformer
+copy_or_hf "${KWS_DIR}/kws_zipformer_zh_en_3m_tokens.txt" ruisv/bcdl-kws-zipformer
+# Speech synthesis back end: Vocos (16 kHz, n_fft 1024 / hop 256) for the
+# Matcha-TTS zh-en acoustic model, converted offline at int16 with a fixed
+# 256-frame window; VocosVocoder chunks longer mels with exact seams. The graph
+# stops at the head's log-magnitude and phase - exp/cos/sin and the iSTFT run
+# on the CPU, because the compiler's quantised cos/sin ruin the phase.
+VOCOS_DIR="${BCDL_SRC_VOCOS:-/path/to/converted/vocos}"
+copy_or_hf "${VOCOS_DIR}/vocos_16k_t256_int16_nashm.hbm" ruisv/bcdl-vocos
+# Speech synthesis acoustic model: Matcha-TTS zh-en, two int16 graphs (encoder
+# with the duration predictor, 128 tokens; decoder with three flow-matching
+# steps, 512 frames = 8.2 s), plus the front end's token table and lexicon.
+# The decoder's GroupNorm and attention mask are rewritten so that padding to
+# 512 frames reproduces the unpadded model; a stock fixed-shape export does not.
+# The token embedding lookup runs on the CPU (the table is the .npy), because a
+# float token-id input gets quantised like any activation.
+MATCHA_DIR="${BCDL_SRC_MATCHA:-/path/to/converted/matcha}"
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_enc_l128_int16_nashm.hbm" ruisv/bcdl-matcha-tts
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_dec_t512_int16_nashm.hbm" ruisv/bcdl-matcha-tts
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_embedding.npy" ruisv/bcdl-matcha-tts
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_tokens.txt" ruisv/bcdl-matcha-tts
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_lexicon.txt" ruisv/bcdl-matcha-tts
 echo ">> done. ($(ls -1 "${DEST}"/*.hbm 2>/dev/null | wc -l) models)"
