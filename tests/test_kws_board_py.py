@@ -77,7 +77,8 @@ def test_encoder_matches_float(kws):
     cos = [_cos(ref[i], got[i]) for i in range(n)]
     print(f"\n  {n} frames in {dt * 1000:.0f} ms; per-frame cosine min {min(cos):.4f} "
           f"mean {np.mean(cos):.4f}; whole {_cos(ref[:n], got[:n]):.4f}")
-    # Measured: per frame mean 0.995, min 0.973. The whole-array cosine is
+    # Measured on this clip: per frame mean 0.995, min 0.973 (over 87 clips the
+    # mean is 0.993 and single frames go down to 0.5-0.65). The whole-array cosine is
     # lower (0.915) because some frames come out smaller overall, not turned:
     # the joiner's tanh and the log-softmax barely notice, and recall on the
     # full test sets matches float.

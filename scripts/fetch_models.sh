@@ -92,12 +92,17 @@ copy_staged() {
   copy "${DEPLOY}/${name}"
 }
 
-# copy_or_hf <local-path> <hf-repo> — prefer a locally staged build (a maintainer
-# rebuilding a model wants their new one), else fetch the published copy.
+# copy_or_hf <local-path> <hf-repo> [how-to-build] — prefer a locally staged
+# build (a maintainer rebuilding a model wants their new one, and anyone who
+# built it from its recipe points BCDL_SRC_* at the output), else fetch the
+# published copy. When neither exists, say how to build it.
 copy_or_hf() {
-  local src="$1" repo="$2" name
+  local src="$1" repo="$2" hint="${3:-}" name
   name="$(basename "$src")"
   if [[ -f "$src" ]]; then copy "$src"; else from_hf "$name" "$repo"; fi
+  if [[ ! -f "${DEST}/${name}" && -n "$hint" ]]; then
+    printf '  %-46s   -> %s\n' "" "$hint"
+  fi
 }
 
 # from_hf <name> <hf-repo> — a converted model published on Hugging Face.
@@ -115,7 +120,7 @@ from_hf() {
   fi
   local url="https://huggingface.co/${repo}/resolve/main/${name}?download=true"
   if command -v curl >/dev/null && \
-     curl -fsSL --retry 3 -o "${DEST}/${name}.part" "$url"; then
+     curl -fsSL --retry 3 -o "${DEST}/${name}.part" "$url" 2>/dev/null; then
     mv -f "${DEST}/${name}.part" "${DEST}/${name}"
     printf '  %-46s %6.1f MB (Hugging Face: %s)\n' "$name" \
       "$(echo "scale=1; $(stat -c%s "${DEST}/${name}")/1048576" | bc)" "$repo"
@@ -350,23 +355,28 @@ download paraformer_am.mvn \
 # its 64 samples of context in, the LSTM state in and out. The context and the
 # reflection pad are done on the CPU.
 VAD_DIR="${BCDL_SRC_VAD:-/path/to/converted/silero_vad}"
-copy_or_hf "${VAD_DIR}/silero_vad_16k_int16_nashm.hbm" ruisv/bcdl-silero-vad
+copy_or_hf "${VAD_DIR}/silero_vad_16k_int16_nashm.hbm" ruisv/bcdl-silero-vad \
+  "build it with bcdl-model-zoo models/silero_vad, then BCDL_SRC_VAD=<that dir> scripts/fetch_models.sh"
 # Keyword spotting (wake word): sherpa-onnx's zipformer2 KWS model (zh-en, 3M,
 # chunk 16 / left 64). The encoder is converted offline at int16 after a graph
 # rewrite (the int64 processed_lens becomes a float pad_mask, the softplus is
 # made fixed-point safe, the relative-position gathers become slices); the
 # decoder and joiner run on the CPU from one weight table.
 KWS_DIR="${BCDL_SRC_KWS:-/path/to/converted/kws}"
-copy_or_hf "${KWS_DIR}/kws_zipformer_zh_en_3m_c16_int16_nashm.hbm" ruisv/bcdl-kws-zipformer
-copy_or_hf "${KWS_DIR}/kws_zipformer_zh_en_3m_decoder_joiner.npy" ruisv/bcdl-kws-zipformer
-copy_or_hf "${KWS_DIR}/kws_zipformer_zh_en_3m_tokens.txt" ruisv/bcdl-kws-zipformer
+copy_or_hf "${KWS_DIR}/kws_zipformer_zh_en_3m_c16_int16_nashm.hbm" ruisv/bcdl-kws-zipformer \
+  "build it with bcdl-model-zoo models/kws_zipformer, then BCDL_SRC_KWS=<that dir> scripts/fetch_models.sh"
+copy_or_hf "${KWS_DIR}/kws_zipformer_zh_en_3m_decoder_joiner.npy" ruisv/bcdl-kws-zipformer \
+  "build it with bcdl-model-zoo models/kws_zipformer, then BCDL_SRC_KWS=<that dir> scripts/fetch_models.sh"
+copy_or_hf "${KWS_DIR}/kws_zipformer_zh_en_3m_tokens.txt" ruisv/bcdl-kws-zipformer \
+  "build it with bcdl-model-zoo models/kws_zipformer, then BCDL_SRC_KWS=<that dir> scripts/fetch_models.sh"
 # Speech synthesis back end: Vocos (16 kHz, n_fft 1024 / hop 256) for the
 # Matcha-TTS zh-en acoustic model, converted offline at int16 with a fixed
 # 256-frame window; VocosVocoder chunks longer mels with exact seams. The graph
 # stops at the head's log-magnitude and phase - exp/cos/sin and the iSTFT run
 # on the CPU, because the compiler's quantised cos/sin ruin the phase.
 VOCOS_DIR="${BCDL_SRC_VOCOS:-/path/to/converted/vocos}"
-copy_or_hf "${VOCOS_DIR}/vocos_16k_t256_int16_nashm.hbm" ruisv/bcdl-vocos
+copy_or_hf "${VOCOS_DIR}/vocos_16k_t256_int16_nashm.hbm" ruisv/bcdl-vocos \
+  "build it with bcdl-model-zoo models/vocos, then BCDL_SRC_VOCOS=<that dir> scripts/fetch_models.sh"
 # Speech synthesis acoustic model: Matcha-TTS zh-en, two int16 graphs (encoder
 # with the duration predictor, 128 tokens; decoder with three flow-matching
 # steps, 512 frames = 8.2 s), plus the front end's token table and lexicon.
@@ -375,9 +385,14 @@ copy_or_hf "${VOCOS_DIR}/vocos_16k_t256_int16_nashm.hbm" ruisv/bcdl-vocos
 # The token embedding lookup runs on the CPU (the table is the .npy), because a
 # float token-id input gets quantised like any activation.
 MATCHA_DIR="${BCDL_SRC_MATCHA:-/path/to/converted/matcha}"
-copy_or_hf "${MATCHA_DIR}/matcha_zh_en_enc_l128_int16_nashm.hbm" ruisv/bcdl-matcha-tts
-copy_or_hf "${MATCHA_DIR}/matcha_zh_en_dec_t512_int16_nashm.hbm" ruisv/bcdl-matcha-tts
-copy_or_hf "${MATCHA_DIR}/matcha_zh_en_embedding.npy" ruisv/bcdl-matcha-tts
-copy_or_hf "${MATCHA_DIR}/matcha_zh_en_tokens.txt" ruisv/bcdl-matcha-tts
-copy_or_hf "${MATCHA_DIR}/matcha_zh_en_lexicon.txt" ruisv/bcdl-matcha-tts
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_enc_l128_int16_nashm.hbm" ruisv/bcdl-matcha-tts \
+  "build it with bcdl-model-zoo models/matcha_tts, then BCDL_SRC_MATCHA=<that dir> scripts/fetch_models.sh"
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_dec_t512_int16_nashm.hbm" ruisv/bcdl-matcha-tts \
+  "build it with bcdl-model-zoo models/matcha_tts, then BCDL_SRC_MATCHA=<that dir> scripts/fetch_models.sh"
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_embedding.npy" ruisv/bcdl-matcha-tts \
+  "build it with bcdl-model-zoo models/matcha_tts, then BCDL_SRC_MATCHA=<that dir> scripts/fetch_models.sh"
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_tokens.txt" ruisv/bcdl-matcha-tts \
+  "build it with bcdl-model-zoo models/matcha_tts, then BCDL_SRC_MATCHA=<that dir> scripts/fetch_models.sh"
+copy_or_hf "${MATCHA_DIR}/matcha_zh_en_lexicon.txt" ruisv/bcdl-matcha-tts \
+  "build it with bcdl-model-zoo models/matcha_tts, then BCDL_SRC_MATCHA=<that dir> scripts/fetch_models.sh"
 echo ">> done. ($(ls -1 "${DEST}"/*.hbm 2>/dev/null | wc -l) models)"

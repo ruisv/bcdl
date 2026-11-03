@@ -747,6 +747,20 @@ python examples/voice_assistant.py my.wav     # 你自己的 16 kHz 单声道录
    13.71 s  heard '给我唱首歌吧' (1.1 s, 33 ms to recognise) -> not a command
 ```
 
+**获取模型。** `scripts/fetch_models.sh` 会下载语音识别模型（D-Robotics 官方预编译的
+Paraformer）。另外四个——唤醒词、VAD、Matcha、Vocos——是从上游模型自己转换的，每个在
+[bcdl-model-zoo](https://github.com/ruisv/bcdl-model-zoo) 里都有转换配方（`models/kws_zipformer`、
+`silero_vad`、`matcha_tts`、`vocos`）：在装有 OpenExplorer 工具链的 x86 机器上导出、校准、
+`hb_compile`。转换好后，让获取脚本指向产物所在目录，它会按 BCDL 需要的文件名复制到 `models/`：
+
+```bash
+BCDL_SRC_KWS=/path/to/kws_build BCDL_SRC_VAD=/path/to/vad_build \
+BCDL_SRC_MATCHA=/path/to/matcha_build BCDL_SRC_VOCOS=/path/to/vocos_build \
+  scripts/fetch_models.sh
+```
+
+找不到的文件会显示 `MISSING`，并给出对应的配方；依赖它们的测试会自动跳过，不会报错。
+
 主循环很短，关键是这几行：
 
 ```python

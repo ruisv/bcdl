@@ -805,6 +805,23 @@ python examples/voice_assistant.py my.wav     # your own 16 kHz mono recording
    13.71 s  heard '给我唱首歌吧' (1.1 s, 33 ms to recognise) -> not a command
 ```
 
+**Getting the models.** `scripts/fetch_models.sh` downloads the recogniser
+(D-Robotics' prebuilt Paraformer). The other four — wake word, VAD, Matcha and
+Vocos — are converted from their upstream checkpoints, and each has a recipe in
+[bcdl-model-zoo](https://github.com/ruisv/bcdl-model-zoo) (`models/kws_zipformer`,
+`silero_vad`, `matcha_tts`, `vocos`): export, calibration and `hb_compile` on an
+x86 host with the OpenExplorer toolchain. Point the fetch script at what you
+built and it copies the files into `models/` under the names BCDL expects:
+
+```bash
+BCDL_SRC_KWS=/path/to/kws_build BCDL_SRC_VAD=/path/to/vad_build \
+BCDL_SRC_MATCHA=/path/to/matcha_build BCDL_SRC_VOCOS=/path/to/vocos_build \
+  scripts/fetch_models.sh
+```
+
+Anything it cannot find is reported as `MISSING` with the recipe to build it,
+and the tests that need it skip rather than fail.
+
 The loop is short; the parts that matter:
 
 ```python

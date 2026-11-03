@@ -204,9 +204,10 @@ cannot be a graph input: the compiler quantises a float id input like any
 activation (it chose a range of 127 for a 2190-entry vocabulary), which put the
 encoder's duration output at cosine 0.83. The embedding lookup runs on the CPU
 instead, and the encoder outputs come out at 0.99999. Durations are
-`ceil(exp(logw))`, so where `exp(logw)` sits on an integer the int16 build can
-land one frame either side of float — 1 token of 8 and 1 of 17 on the two
-test sentences. Scored on the
+`ceil(exp(logw))`, so the int16 build can move a token's duration: across 147
+tokens of 19 sentences, 30 differ from float — tokens whose duration sits on
+an integer flip by one frame, and long pause tokens (8–58 frames) move by 1–3 —
+while no sentence's total length changes by more than 2 frames. Scored on the
 same 60 sentences:
 
 | | round-trip CER (FireRedASR2) | UTMOS | real-time factor on the board |
@@ -263,10 +264,11 @@ to those. Each rewrite was checked against the published graph in float
 (encoder output within 1.5e-4, and the same detections on 87 clips). One of
 the optimizer's passes crashes onnxruntime on this graph; it was disabled for
 the build. Built at int16 with calibration on real streaming states (wake-word clips,
-confusables, noisy speech, noise), the encoder output is at per-frame cosine
-0.995 against float; the whole-array cosine is 0.915 because some frames come
-out smaller rather than turned, which the joiner's tanh and the softmax do not
-notice. On the full test sets:
+confusables, noisy speech, noise). Streamed over 87 clips with the caches fed
+back, the encoder output is at a mean per-frame cosine of 0.993 against float,
+with single frames as low as 0.5–0.65; detections match float on 86 of the 87.
+Cosine says little here: what counts is that the joiner's tanh and the softmax
+rarely move a decision. On the full test sets:
 
 | | wake words found, clean / noisy | false wake-ups | confusable phrases that fire, clean / noisy |
 |---|---|---|---|
@@ -276,10 +278,18 @@ notice. On the full test sets:
 **The VAD's spectrum is computed on the CPU.** Silero VAD opens with an STFT
 written as a strided convolution followed by `sqrt(re² + im²)`. Compiled whole,
 the squared terms span ~5000, int16 resolves them in steps of 0.15, every
-quiet bin rounds away, and the LSTM state drifted to cosine 0.989 per step —
-enough for the speech probability to sag to 0.2–0.5 in the middle of a
-sentence. The shipped graph starts at the magnitude spectrum (4 frames × 129
-bins, computed by an FFT on the CPU); its state outputs are at cosine 0.9998.
+quiet bin rounds away, and the speech probability sagged to 0.2–0.5 in the
+middle of a sentence. The shipped graph starts at the magnitude spectrum
+(4 frames × 129 bins, computed by an FFT on the CPU). Streamed over 13,736
+chunks of held-out audio its probability is within 0.015 of float on average
+and makes the same speech / non-speech call 98.4% of the time. The output
+cosines `hb_compile` prints for this model say little: they are computed on
+the first calibration sample alone (one build printed 0.925 for a state whose
+median over all samples is 0.9998), and the probability, a single number,
+always prints 1.0. Calibrate with `calibration_type: max`: on a fresh
+calibration set the default search picked KL and clipped the spectrum input
+at 1.8 against speech that reaches 13, which compiles cleanly and doubles the
+worst-case error.
 On 100 noisy AISHELL-1 sessions and 24 minutes of MUSAN noise, with the
 default segmenter (0.5 threshold, 250 ms to open, 300 ms to close):
 
