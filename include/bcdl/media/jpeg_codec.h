@@ -61,7 +61,9 @@ class JpegEncoder {
 ///
 /// Input reuse: a single device buffer (in_buf_) holds the JPEG bytes handed to
 /// the JPU. It is grown only when an incoming stream is larger than its current
-/// capacity, so steady-state decoding does no per-call allocation.
+/// capacity, so steady-state decoding does no per-call allocation. It is never
+/// smaller than 10 MiB, because the JPU maps a fixed 10 MiB window from its
+/// start; a decoder therefore holds 10 MiB of ION memory for its lifetime.
 class JpegDecoder {
  public:
   explicit JpegDecoder(hbVPImageFormat outFormat = HB_VP_IMAGE_FORMAT_NV12);

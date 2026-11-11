@@ -4,7 +4,7 @@
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
 [![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-3776AB.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-RDK%20S100%20%2F%20S100P%20%2F%20S600%20(aarch64)-0A7BBB.svg)](#requirements)
-[![Version](https://img.shields.io/badge/version-0.8.0-informational.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.8.1-informational.svg)](CHANGELOG.md)
 
 **English** | [简体中文](README.md)
 
@@ -185,7 +185,7 @@ Prefer a clean, reproducible environment? Create one and pin a version:
 conda create -n bcdl -c https://mirrors.ruis.ai/conda -c conda-forge \
     python=3.12 bcdl
 conda activate bcdl
-# or pin an exact build:   conda install ... "bcdl=0.8.0"
+# or pin an exact build:   conda install ... "bcdl=0.8.1"
 ```
 
 To avoid passing `-c` every time, add the channel to the env (it must sit
@@ -654,7 +654,10 @@ default: one needs an explicit `--hbm`, two need a separate reference bundle.
 > Run in one process, the suite loads several dozen models in turn. If another
 > program on the board is holding BPU memory (ION) at the same time, the factory
 > ION reservation can run out — it shows as `RESOURCE_EXHAUSTED` /
-> `Cannot malloc bpu memory`, not as a test failure. Run the files separately.
+> `Cannot malloc bpu memory`, not as a test failure. Run the files separately,
+> or raise ION to ~8 GB with the board's own
+> `sudo /usr/hobot/bin/hb_switch_ion.sh balanced` (takes effect on reboot, leaves
+> the system ~6 GB less RAM; `default` reverts it) and the suite runs in one go.
 
 | group | tests | needs an `.hbm`? |
 |-------|-------|--------------|

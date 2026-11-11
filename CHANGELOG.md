@@ -12,6 +12,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-11
+
+### Fixed
+- **`JpegDecoder` failed every decode on the board's "balanced" ION layout.**
+  The JPU maps its input as a fixed 10 MiB window from the start of the input
+  buffer, whatever the buffer's size, and the decoder staged each JPEG in a
+  buffer just big enough for it — 64 KiB, one page, for a small image. In the
+  balanced layout the carveout heap is 128 MiB and, with another BPU program
+  resident, nearly full, so that buffer landed 320 KiB from the end of the
+  heap, its window ran into the next ION region, the JPU driver refused the
+  mapping (`not in ion range`) and the decode timed out. The input buffer is
+  now at least 10 MiB, so the whole window is its own; each decoder holds
+  10 MiB of ION memory for its lifetime. Constructing one still costs ~5 ms.
+  On that layout the whole suite now passes in one process (512 passed,
+  3 skipped).
+
 ## [0.8.0] — 2026-11
 
 ### Added

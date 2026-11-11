@@ -4,7 +4,7 @@
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
 [![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-3776AB.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-RDK%20S100%20%2F%20S100P%20%2F%20S600%20(aarch64)-0A7BBB.svg)](#运行环境要求)
-[![Version](https://img.shields.io/badge/version-0.8.0-informational.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.8.1-informational.svg)](CHANGELOG.md)
 
 [English](README.en.md) | **简体中文**
 
@@ -170,7 +170,7 @@ python -c "import bcdl; print(bcdl.__version__)"
 conda create -n bcdl -c https://mirrors.ruis.ai/conda -c conda-forge \
     python=3.12 bcdl
 conda activate bcdl
-# 或锁定精确构建：   conda install ... "bcdl=0.8.0"
+# 或锁定精确构建：   conda install ... "bcdl=0.8.1"
 ```
 
 为了避免每次都带 `-c`，可以把该频道加进环境（它必须排在
@@ -569,7 +569,9 @@ PYTHONPATH=build:python pytest tests/
 
 > 整套在同一个进程里跑，会先后加载几十个模型。板上若同时还有别的程序占着 BPU
 > 内存（ION），出厂的 ION 预留可能不够，表现为 `RESOURCE_EXHAUSTED` /
-> `Cannot malloc bpu memory`——这不是测试失败，按文件分开跑即可。
+> `Cannot malloc bpu memory`——这不是测试失败。按文件分开跑即可；或者用板上自带的
+> `sudo /usr/hobot/bin/hb_switch_ion.sh balanced` 把 ION 提到约 8 GB（重启生效，系统可用
+> 内存相应少约 6 GB，`default` 还原），整套就能一次跑完。
 
 | 分组 | 测试数 | 需要 `.hbm`？ |
 |-------|-------|--------------|

@@ -12,6 +12,10 @@ namespace bcdl {
 
 namespace {
 
+/// The span the JPU maps from the start of the input buffer, regardless of the
+/// buffer's size. See JpegDecoder::decode for why the input buffer owns all of it.
+constexpr uint64_t kJpuStreamWindow = 10ull << 20;
+
 /// Drop stale CPU cache lines over a codec-owned buffer before the CPU reads it.
 ///
 /// The JPU (device) wrote these bytes, and the rule in core/sys_mem.h applies
@@ -196,8 +200,18 @@ VpImage JpegDecoder::decode(const uint8_t* data, std::size_t size) {
 
   // Stage the JPEG bytes in a device-readable buffer. Grow it only when the
   // incoming stream exceeds the current capacity.
+  //
+  // Never smaller than kJpuStreamWindow: the JPU maps its input as a fixed
+  // 10 MiB window from the buffer's physical address, whatever memSize says
+  // (a 64 KiB buffer is mapped as 10485760 bytes). A small buffer that lands
+  // within 10 MiB of the end of its ION heap therefore has a window that runs
+  // into the next region; the JPU driver refuses the mapping ("not in ion
+  // range") and the decode times out. It shows when the carveout heap is small
+  // and nearly full — the board's "balanced" ION layout with another BPU
+  // program resident, where every decode failed. Owning the whole window keeps
+  // it inside one heap.
   if (!in_buf_.valid() || in_buf_.size() < size) {
-    in_buf_ = SysMem(static_cast<uint64_t>(size), /*cached=*/true);
+    in_buf_ = SysMem(std::max<uint64_t>(size, kJpuStreamWindow), /*cached=*/true);
   }
   std::memcpy(in_buf_.data(), data, size);
   in_buf_.cleanCache();  // CPU wrote the JPEG bytes; flush so the JPU reads them.
