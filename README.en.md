@@ -4,7 +4,7 @@
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
 [![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-3776AB.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-RDK%20S100%20%2F%20S100P%20%2F%20S600%20(aarch64)-0A7BBB.svg)](#requirements)
-[![Version](https://img.shields.io/badge/version-0.5.0-informational.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.8.0-informational.svg)](CHANGELOG.md)
 
 **English** | [简体中文](README.md)
 
@@ -99,7 +99,7 @@ does it correctly.
   BPU compilation, the face detector pads bottom-right, embedding towers want a
   squashing resize rather than a letterbox… all dealt with in the library
   (see [Capabilities](#capabilities)) instead of costing you a week.
-- **✅ Verifiable and reproducible** — 335 tests (261 of which touch no model at all,
+- **✅ Verifiable and reproducible** — 515 tests (356 of which touch no model at all,
   running the pure-numpy decode paths), and
   an on-board benchmark that reruns itself until the board is provably quiet.
 
@@ -114,7 +114,7 @@ media codec). The difference is the **level of abstraction**:
 | Shape | low-level runtime + sample programs | a reusable framework (library) |
 | Interface | mostly C APIs | C++17 RAII classes + Python bindings |
 | Device memory | malloc/free `hbUCPSysMem` yourself, clean/invalidate yourself | handled by `Engine` |
-| Post-processing | write your own (NMS / DFL / rotated IoU / CTC…) | 18 tasks out of the box |
+| Post-processing | write your own (NMS / DFL / rotated IoU / CTC…) | 22 vision tasks + the whole voice pipeline, out of the box |
 | Media plumbing | per-unit APIs, move buffers yourself | one `SysMem`, zero-copy pipelines |
 | Languages | C / C++ | C++ and Python as peers, NumPy in/out |
 | Getting started | copy a sample, adapt per model | `conda install` + ten lines |
@@ -156,7 +156,9 @@ Repository layers:
 ```
 python/    nanobind bindings (NumPy <-> tensors), GIL-released infer
 tasks/     det · cls · pose · seg · obb · semseg · depth · mono3d · ocr · open-vocab · sam · embed
-           drive · face · wholebody · features · superres · depth-refine
+           drive · face · wholebody · features · superres · depth-refine · flow · anomaly
+           e2e-drive · lidar3d
+           speech: kws · vad · asr · command · tts · vocoder
 tracks/    ByteTrack multi-object tracker · ReID appearance embeddings
 pipeline/  sync / async detection · tracking · stereo  (JPU -> VP -> BPU -> CPU/VPU)
 media/     JpegCodec (JPU) · VideoCodec H.264/H.265 (VPU)
@@ -183,7 +185,7 @@ Prefer a clean, reproducible environment? Create one and pin a version:
 conda create -n bcdl -c https://mirrors.ruis.ai/conda -c conda-forge \
     python=3.12 bcdl
 conda activate bcdl
-# or pin an exact build:   conda install ... "bcdl=0.5.0"
+# or pin an exact build:   conda install ... "bcdl=0.8.0"
 ```
 
 To avoid passing `-c` every time, add the channel to the env (it must sit
@@ -232,7 +234,8 @@ BCDL is a generic runtime and loads any `.hbm`. The four fastest routes:
 
 - **models we already compiled, ready to download** — OCR, zero-shot stereo,
   RGB-D depth refinement, super-resolution, sparse features, whole-body pose,
-  real-time segmentation, panoptic driving — on Hugging Face at
+  real-time segmentation, panoptic driving, industrial anomaly detection, and
+  wake words, voice activity detection and speech synthesis — on Hugging Face at
   [`ruisv/bcdl-*`](https://huggingface.co/ruisv). **No ONNX export, no
   calibration, no `hb_compile`, no x86 conversion host**;
   `scripts/fetch_models.sh` fetches them for you. Only models whose *weights*
@@ -260,6 +263,7 @@ The Python snippet at the top is the whole program. On the C++ side,
 ./build/ocr_demo    data/images/ocr.jpg          # PP-OCR det -> cls -> rec
 ./build/track_demo  models/yolo26s_det_nashm_640x640_nv12.hbm  # detect + ByteTrack
 ./build/video_det_demo  stream.h264 model.hbm    # VPU decode -> BPU detect
+./build/voice_assistant                          # wake word -> VAD -> ASR -> command -> spoken reply
 ```
 
 ## Community
@@ -537,6 +541,16 @@ decode runs at 452 / 481 FPS. The input must be an **Annex-B elementary stream**
 demux an MP4 first with `ffmpeg -c:v copy -bsf:v h264_mp4toannexb` (container
 only, pixels untouched).
 
+The voice pipeline (every network on the BPU; accuracy against float is in
+[Capabilities](#capabilities)):
+
+| stage | model | per | time |
+|-------|-------|-----|------|
+| wake word | zipformer2 KWS zh-en 3M (int16) | 160 ms of audio | 2.0 ms of BPU; RTF 0.023 with the CPU search |
+| VAD | Silero VAD v6 (int16) | 32 ms of audio | 0.39 ms |
+| recognition | Paraformer-large (int16, three stages) | utterance, front end included | ~36 ms |
+| synthesis | Matcha-TTS zh-en + Vocos (int16) | sentence | 26 ms (RTF 0.009) |
+
 Reproduce on the board:
 
 ```bash
@@ -634,18 +648,21 @@ PYTHONPATH=build:python pytest tests/
 
 Two layers: the post-processing math is pinned by **deterministic NumPy tests**
 through the Engine-free `decode_*` bindings (run anywhere), then the **on-board
-suite** validates the full BPU/codec path on real models. On RDK S100P,
-end-to-end against the **conda packages** (`bcdl` + `libbcdl` + `hobot-dnn` +
-`hobot-media`): **96 passed, 1 skipped** (97 collected; the skip needs an
-explicit `--hbm`).
+suite** validates the full BPU/codec path on real models. Three tests skip by
+default: one needs an explicit `--hbm`, two need a separate reference bundle.
+
+> Run in one process, the suite loads several dozen models in turn. If another
+> program on the board is holding BPU memory (ION) at the same time, the factory
+> ION reservation can run out — it shows as `RESOURCE_EXHAUSTED` /
+> `Cannot malloc bpu memory`, not as a test failure. Run the files separately.
 
 | group | tests | needs an `.hbm`? |
 |-------|-------|--------------|
-| **Decode and geometry math** — the pure-numpy path for every task family: detection, classification, pose, OBB, instance seg, semantic seg, depth, RGB-D refinement, OCR, stereo, embeddings, features, super-resolution, ReID, optical flow, anomaly, end-to-end driving, lidar 3-D — plus calibration geometry and memory safety | **261** | no |
-| **Real models, end to end** — each task's result gate on a real `.hbm`, media codecs (JPU / VPU), pipelines (ByteTrack, async detection), Engine input/output stride | **74** | yes |
-| **total** | **335** | |
+| **Decode and geometry math** — the pure-numpy path for every task family: detection, classification, pose, OBB, instance seg, semantic seg, depth, RGB-D refinement, OCR, stereo, embeddings, features, super-resolution, ReID, optical flow, anomaly, end-to-end driving, lidar 3-D; for speech the fbank / LFR / CMVN front end, CIF, command matching, the inverse STFT, the TTS text front end and pause shortening — plus calibration geometry and memory safety | **356** | no |
+| **Real models, end to end** — each task's result gate on a real `.hbm` (wake word, VAD, recognition, vocoder and synthesis included), media codecs (JPU / VPU), pipelines (ByteTrack, async detection), Engine input/output stride | **159** | yes |
+| **total** | **515** | |
 
-The 261 that need no `.hbm` are deliberately the thick half: a decoder's
+The 356 that need no `.hbm` are deliberately the thick half: a decoder's
 arithmetic can be caught without a board, while board tests are slow and depend
 on which models have been downloaded.
 
@@ -681,6 +698,11 @@ Contributions are welcome — issues and pull requests alike. See
   **PaddleOCR / PaddlePaddle** (PP-OCRv6 / v5, PP-LCNet), **Ultralytics** (YOLO
   family), **Depth-Anything-V2**, and **DeepLabV3+**. See [Models](#models) for
   their licenses; BCDL bundles none of these weights.
+- The upstream projects the voice pipeline reproduces or ports — **k2-fsa /
+  sherpa-onnx** (the zipformer wake-word model and keyword search, the Matcha-TTS
+  zh-en text front end), **FunASR** (Paraformer and its Kaldi-compatible front
+  end), **Silero VAD**, **Matcha-TTS** and **Vocos**; the built-in pinyin table
+  is generated from **pypinyin** (MIT).
 
 If this project helped you, consider giving it a **Star** ⭐ — thanks for reading this far.
 

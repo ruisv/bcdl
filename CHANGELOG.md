@@ -12,19 +12,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-- **The shipped LAS2 stereo builds clipped disparity at 131 px and 47.7 px.**
-  An int16 output threshold is the largest value the calibration set produced,
-  and the crop and resize builds were calibrated on scenes with no near field —
-  so anything closer than that read as farther away, out of the model's
-  0–192 px, with no error. The repo's own stereo pair spans 44–129 px, just
-  under the crop cap, so no test noticed. The replacements,
-  `las2_m_crop2_nashm.hbm` and `las2_m_resize2_nashm.hbm`, are calibrated across
-  the full range (output thresholds 180–187 px). On held-out ETH3D and
-  Middlebury 2021 scenes with ground truth, the worst crop scene went from
-  14.7 px to 0.30–0.43 px against the float model, and resize EPE from 2.17 px
-  to 0.60 px. A new test shifts the repo pair to ~175 px and fails on the old
-  builds.
+## [0.8.0] — 2026-11
 
 ### Added
 - **`examples/voice_assistant.py` and `voice_assistant.cc`**: a voice-controlled
@@ -107,6 +95,20 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **BCDL now stands for BPU Common Deep Learning**, and the README presents it
   as a framework for vision *and* speech; the speech pieces are grouped on
   their own in the capability list.
+
+### Fixed
+- **The shipped LAS2 stereo builds clipped disparity at 131 px and 47.7 px.**
+  An int16 output threshold is the largest value the calibration set produced,
+  and the crop and resize builds were calibrated on scenes with no near field —
+  so anything closer than that read as farther away, out of the model's
+  0–192 px, with no error. The repo's own stereo pair spans 44–129 px, just
+  under the crop cap, so no test noticed. The replacements,
+  `las2_m_crop2_nashm.hbm` and `las2_m_resize2_nashm.hbm`, are calibrated across
+  the full range (output thresholds 180–187 px). On held-out ETH3D and
+  Middlebury 2021 scenes with ground truth, the worst crop scene went from
+  14.7 px to 0.30–0.43 px against the float model, and resize EPE from 2.17 px
+  to 0.60 px. A new test shifts the repo pair to ~175 px and fails on the old
+  builds.
 
 ## [0.7.5] — 2026-08
 

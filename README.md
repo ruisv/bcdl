@@ -4,7 +4,7 @@
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
 [![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-3776AB.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-RDK%20S100%20%2F%20S100P%20%2F%20S600%20(aarch64)-0A7BBB.svg)](#运行环境要求)
-[![Version](https://img.shields.io/badge/version-0.5.0-informational.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.8.0-informational.svg)](CHANGELOG.md)
 
 [English](README.en.md) | **简体中文**
 
@@ -89,7 +89,7 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 - **✅ 踩过的坑写在代码里** —— YOLOP 的 anchor 解码编译不出来、人脸检测器的 padding
   在左上角、嵌入模型要挤压式 resize 而不是 letterbox…… 这些都已经在库里处理好了，
   不用再花一周复现一遍（见[能力清单](#能力清单)）。
-- **✅ 可验证、可复现** —— 335 个测试（其中 261 个不碰模型，纯 numpy 解码路径），板端基准一条命令复现，
+- **✅ 可验证、可复现** —— 515 个测试（其中 356 个不碰模型，纯 numpy 解码路径），板端基准一条命令复现，
   并且带“板子是否干净”的结果闸门。
 
 ## 与官方 SDK 的关系
@@ -102,7 +102,7 @@ hobot 运行时（`hbDNN` / `hbUCP` / 多媒体编解码）。区别只在**抽�
 | 形态 | 底层运行时 + 示例程序 | 可复用的框架（库） |
 | 接口 | 以 C API 为主 | C++17 RAII 类 + Python 绑定 |
 | 设备内存 | 自己 malloc / free `hbUCPSysMem`，自己 clean / invalidate 缓存 | `Engine` 自动处理 |
-| 后处理 | 自己写（NMS / DFL / 旋转 IoU / CTC…） | 23 类任务开箱即用 |
+| 后处理 | 自己写（NMS / DFL / 旋转 IoU / CTC…） | 22 类视觉任务 + 整条语音链开箱即用 |
 | 多媒体拼接 | 各单元各自的 API，自己搬 buffer | 统一 `SysMem`，流水线零拷贝 |
 | 语言 | C / C++ | C++ 与 Python 对等，NumPy 进出 |
 | 上手 | 从示例复制，逐个模型改 | `conda install` + 十行代码 |
@@ -141,7 +141,9 @@ BCDL 是这套底层结构之上一层薄而 RAII 干净的 C++ 封装，外加�
 ```
 python/    nanobind 绑定（NumPy <-> 张量），推理时释放 GIL
 tasks/     det · cls · pose · seg · obb · semseg · depth · mono3d · ocr · open-vocab · sam · embed
-           drive · face · wholebody · features · superres · depth-refine
+           drive · face · wholebody · features · superres · depth-refine · flow · anomaly
+           e2e-drive · lidar3d
+           语音：kws · vad · asr · command · tts · vocoder
 tracks/    ByteTrack 多目标跟踪 · ReID 外观嵌入
 pipeline/  同步 / 异步检测 · 跟踪 · 双目  (JPU -> VP -> BPU -> CPU/VPU)
 media/     JpegCodec (JPU) · VideoCodec H.264/H.265 (VPU)
@@ -168,7 +170,7 @@ python -c "import bcdl; print(bcdl.__version__)"
 conda create -n bcdl -c https://mirrors.ruis.ai/conda -c conda-forge \
     python=3.12 bcdl
 conda activate bcdl
-# 或锁定精确构建：   conda install ... "bcdl=0.5.0"
+# 或锁定精确构建：   conda install ... "bcdl=0.8.0"
 ```
 
 为了避免每次都带 `-c`，可以把该频道加进环境（它必须排在
@@ -214,7 +216,8 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge libbcdl
 BCDL 是通用运行时，能加载任意 `.hbm`。最快的四条路：
 
 - **我们编译好的，直接下载** —— OCR、双目立体、RGB-D 深度精修、超分、特征点、
-  全身姿态、实时分割、全景驾驶，都在 Hugging Face 上：
+  全身姿态、实时分割、全景驾驶、工业异常检测，以及唤醒词、端点检测、语音合成，
+  都在 Hugging Face 上：
   [`ruisv/bcdl-*`](https://huggingface.co/ruisv)。**不用导 ONNX、不用校准、
   不用 `hb_compile`、不用 x86 转换机**；`scripts/fetch_models.sh` 会自动去取。
   只有**权重本身可再分发**的模型在那里，清单与许可证见
@@ -237,6 +240,7 @@ build、许可证如何，见 [`docs/MODELS.md`](docs/MODELS.md)。
 ./build/ocr_demo    data/images/ocr.jpg          # PP-OCR det -> cls -> rec
 ./build/track_demo  models/yolo26s_det_nashm_640x640_nv12.hbm  # 检测 + ByteTrack
 ./build/video_det_demo  stream.h264 model.hbm    # VPU 解码 -> BPU 检测
+./build/voice_assistant                          # 唤醒词 -> VAD -> 识别 -> 指令 -> 语音回复
 ```
 
 ## 社区交流
@@ -458,6 +462,15 @@ CPU（零拷贝 NV12→BPU）。
 输入必须是 **Annex-B 裸流**——mp4 请先用 `ffmpeg -c:v copy -bsf:v h264_mp4toannexb`
 解封装（只拆容器，不碰像素）。
 
+语音链（网络全在 BPU；精度对照见[能力清单](#能力清单)）：
+
+| 环节 | 模型 | 计量单位 | 耗时 |
+|------|------|----------|------|
+| 唤醒词 | zipformer2 KWS zh-en 3M（int16） | 每 160 ms 音频 | BPU 2.0 ms；含 CPU 搜索实时率 0.023 |
+| 端点检测 | Silero VAD v6（int16） | 每 32 ms 音频 | 0.39 ms |
+| 识别 | Paraformer-large（int16，三段） | 每句，含前端 | 约 36 ms |
+| 合成 | Matcha-TTS zh-en + Vocos（int16） | 每句 | 26 ms（实时率 0.009） |
+
 在板上复现：
 
 ```bash
@@ -552,17 +565,19 @@ PYTHONPATH=build:python pytest tests/
 
 两层：后处理数学由 **确定性 NumPy 测试** 通过无需 Engine 的 `decode_*` 绑定
 钉死（任何地方都能跑），随后 **板端套件** 在真实模型上验证完整的 BPU/编解码路径。
-在 RDK S100P 上，对 **conda 包**（`bcdl` + `libbcdl` + `hobot-dnn` +
-`hobot-media`）端到端：**96 通过、1 跳过**（共收集 97 个；该跳过项需要显式
-`--hbm`）。
+默认有 3 项跳过：一项需要显式 `--hbm`，两项需要单独的参照数据包。
+
+> 整套在同一个进程里跑，会先后加载几十个模型。板上若同时还有别的程序占着 BPU
+> 内存（ION），出厂的 ION 预留可能不够，表现为 `RESOURCE_EXHAUSTED` /
+> `Cannot malloc bpu memory`——这不是测试失败，按文件分开跑即可。
 
 | 分组 | 测试数 | 需要 `.hbm`？ |
 |-------|-------|--------------|
-| **解码与几何数学** —— 每个任务族的纯 numpy 路径：检测 / 分类 / 姿态 / OBB / 实例分割 / 语义分割 / 深度 / RGB-D 精修 / OCR / 立体 / 嵌入 / 特征点 / 超分 / ReID / 光流 / 异常检测 / 端到端驾驶 / 激光雷达 3D，加上标定几何与内存安全 | **261** | 否 |
-| **真实模型端到端** —— 各任务在真 `.hbm` 上的结果闸门、媒体编解码（JPU / VPU）、流水线（ByteTrack、异步检测）、Engine 输入输出 stride | **74** | 是 |
-| **合计** | **335** | |
+| **解码与几何数学** —— 每个任务族的纯 numpy 路径：检测 / 分类 / 姿态 / OBB / 实例分割 / 语义分割 / 深度 / RGB-D 精修 / OCR / 立体 / 嵌入 / 特征点 / 超分 / ReID / 光流 / 异常检测 / 端到端驾驶 / 激光雷达 3D；语音的 fbank / LFR / CMVN 前端、CIF、指令匹配、逆 STFT、TTS 文本前端与停顿压缩；加上标定几何与内存安全 | **356** | 否 |
+| **真实模型端到端** —— 各任务在真 `.hbm` 上的结果闸门（含唤醒词、VAD、识别、声码器、合成）、媒体编解码（JPU / VPU）、流水线（ByteTrack、异步检测）、Engine 输入输出 stride | **159** | 是 |
+| **合计** | **515** | |
 
-不需要 `.hbm` 的那 261 项是刻意做厚的：解码器的数学错误不需要板子就能抓，
+不需要 `.hbm` 的那 356 项是刻意做厚的：解码器的数学错误不需要板子就能抓，
 而板端测试跑得慢、又依赖模型是否已下载。
 
 ## 参与贡献
@@ -593,6 +608,9 @@ PYTHONPATH=build:python pytest tests/
 - BCDL 重新实现了其后处理的上游模型作者 —— **PaddleOCR / PaddlePaddle**
   （PP-OCRv6 / v5、PP-LCNet）、**Ultralytics**（YOLO 系列）、**Depth-Anything-V2**
   与 **DeepLabV3+**。其许可证见[模型](#模型)；BCDL 不打包这些权重中的任何一个。
+- 语音链复现或移植的上游 —— **k2-fsa / sherpa-onnx**（zipformer 唤醒词与关键词搜索、
+  Matcha-TTS zh-en 文本前端）、**FunASR**（Paraformer 与 Kaldi 兼容前端）、
+  **Silero VAD**、**Matcha-TTS** 与 **Vocos**；内置拼音表由 **pypinyin**（MIT）生成。
 
 如果这个项目对你有帮助，欢迎给它一个 **Star** ⭐ —— 谢谢你读到这里。
 
