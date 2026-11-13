@@ -92,6 +92,31 @@ def test_instance_seg_masks():
         assert _in_image((m.x1, m.y1, m.x2, m.y2), t.orig_w, t.orig_h)
 
 
+def test_indoor_seg_office():
+    # 99-class indoor YOLOE-26m on office_desk.jpg: a desk with a laptop, two
+    # keyboards, a mouse, books and a bottle. Only the confident, stable classes
+    # are asserted; the centre monitor is a known miss for this model.
+    t = _task("yoloe_indoor_seg")
+    res = t.decode()
+    names = {bm.INDOOR99_NAMES[m.class_id] for m in res}
+    assert {"laptop", "keyboard"} <= names, f"got {sorted(names)}"
+    for m in res:
+        assert m.score >= 0.25
+        assert m.mask.shape == (t.orig_h, t.orig_w) and m.mask.any()
+        assert _in_image((m.x1, m.y1, m.x2, m.y2), t.orig_w, t.orig_h)
+
+
+def test_scene_office():
+    # Places365 ResNet50 scene classifier on the same frame: an office.
+    t = _task("scene")
+    if t.names is None:
+        pytest.skip("models/categories_places365.txt missing (run scripts/fetch_models.sh)")
+    res = t.decode()
+    assert len(res) == 5
+    top = t.names[res[0].class_id]
+    assert top in ("office", "office_cubicles", "home_office"), f"top-1 {top}"
+
+
 def test_obb_rotated_boxes():
     t = _task("obb")
     res = t.decode()

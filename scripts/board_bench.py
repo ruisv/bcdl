@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", "tests"))
 import board_models as bm  # noqa: E402
 
 TASK_ORDER = ["cls", "det", "det_dfl", "pose", "seg", "obb", "semseg", "depth", "stereo", "ocr",
-              "yoloe_det", "yoloe_seg", "wholebody", "features", "superres",
+              "yoloe_det", "yoloe_seg", "yoloe_indoor_seg", "scene", "wholebody", "features", "superres",
               "superres_span", "reid", "flow", "anomaly", "drive", "lidar3d"]
 
 

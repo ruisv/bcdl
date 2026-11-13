@@ -12,6 +12,28 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Indoor objects with instance masks: `yoloe26m_indoor99_seg`.** YOLOE-26m
+  with a fixed 99-class indoor vocabulary folded into its head — ten navigation
+  landmarks (door, open door, glass door, elevator, elevator door, escalator,
+  stairs, handrail, exit sign, wet floor sign) followed by furniture,
+  appliances, electronics, tableware, bathroom fittings, lighting and decor. It
+  decodes through the existing `InstanceSegmenter` into boxes and masks; the
+  class names ship beside it as `yoloe26m_indoor99_labels.txt`. On 1952
+  held-out Open Images indoor images the int8 board build scores 0.484 mAP50
+  over the 25 classes with at least 20 boxes (float: 0.478). It is zero-shot,
+  and `docs/MODELS.md` lists where that shows: monitors are a blind spot,
+  stairs trail a supervised detector, and the navigation classes need a lower
+  score threshold than 0.25.
+- **Scene classification: `places365_resnet50`.** CSAIL's Places365 ResNet50,
+  365 scenes with an indoor/outdoor flag, through the existing `Classifier`.
+  54.5% top-1 / 84.6% top-5 on the board over the Places365 validation images
+  not used for calibration (float: 54.6% / 85.0%). Feed it a resize and centre
+  crop, not a letterbox — letterboxing a 4:3 frame costs 3.6 points top-1.
+- `scripts/fetch_models.sh` fetches both, plus the Places365 class names and
+  indoor flags from upstream; the board tests and `board_bench.py` cover both.
+  Conversion recipes: `yoloe26_indoor` and `places365` in bcdl-model-zoo.
+
 ## [0.8.1] — 2026-11
 
 ### Fixed

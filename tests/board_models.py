@@ -76,6 +76,47 @@ DOTA_NAMES = [
     "soccer-ball-field", "swimming-pool",
 ]
 
+# The fixed vocabulary baked into the indoor YOLOE-26m head, in class-id order:
+# navigation landmarks first, then household objects. The same list ships next
+# to the model as yoloe26m_indoor99_labels.txt.
+INDOOR99_NAMES = [
+    "door", "open door", "glass door", "elevator", "elevator door", "escalator",
+    "stairs", "handrail", "exit sign", "wet floor sign",
+    "person", "dog", "cat",
+    "chair", "office chair", "armchair", "stool", "bench", "table", "desk",
+    "coffee table", "sofa", "bed", "cabinet", "wardrobe", "chest of drawers",
+    "nightstand", "shelf", "bookcase",
+    "television", "refrigerator", "microwave", "oven", "gas stove", "range hood",
+    "dishwasher", "washing machine", "air conditioner", "electric fan",
+    "ceiling fan", "vacuum cleaner", "kettle",
+    "laptop", "computer monitor", "keyboard", "computer mouse", "mobile phone",
+    "tablet computer", "printer", "speaker", "remote control",
+    "cup", "mug", "bottle", "wine glass", "bowl", "plate", "cooking pot",
+    "frying pan", "kitchen knife", "cutting board",
+    "toilet", "sink", "bathtub", "shower", "mirror", "towel", "toilet paper",
+    "lamp", "ceiling light", "chandelier", "painting", "picture frame", "clock",
+    "vase", "curtain", "window blind", "rug", "pillow", "blanket",
+    "potted plant", "candle",
+    "window", "light switch", "power outlet", "radiator", "fireplace",
+    "box", "trash can", "handbag", "backpack", "suitcase", "book", "umbrella",
+    "shoes", "basket", "stuffed toy", "fire extinguisher", "whiteboard",
+]
+assert len(INDOOR99_NAMES) == 99
+
+
+def places365_names():
+    """Places365 scene names from models/categories_places365.txt (fetched by
+    scripts/fetch_models.sh), e.g. '/o/office 244' -> 'office'. None if absent."""
+    p = os.path.join(MODELS, "categories_places365.txt")
+    if not os.path.exists(p):
+        return None
+    names = []
+    with open(p) as f:
+        for line in f:
+            if line.strip():
+                names.append(line.split()[0][3:])
+    return names
+
 
 SEMSEG_MODEL = os.environ.get(
     "BCDL_SEMSEG_MODEL",
@@ -288,7 +329,14 @@ TASKS = {
     # --- SOTA additions (2026-07): open-vocab det/seg, transformer det ---------
     "yoloe_det": dict(model="yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm", image="bus.jpg", wh=(640, 640), kind="nv12", names=COCO_NAMES),
     "yoloe_seg": dict(model="yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm", image="bus.jpg", wh=(640, 640), kind="nv12", names=COCO_NAMES),
+    # --- indoor scenes: 99-class YOLOE-26m (boxes + masks) and Places365 scenes -
+    "yoloe_indoor_seg": dict(model="yoloe26m_indoor99_seg_nashm_640x640_nv12.hbm", image="office_desk.jpg", wh=(640, 640), kind="nv12", names=INDOOR99_NAMES),
+    "scene": dict(model="places365_resnet50_nashm_224x224_nv12.hbm", image="office_desk.jpg", wh=(224, 224), kind="nv12_crop", names=places365_names()),
 }
+
+# Task keys that share a decoder (and so every branch below that dispatches on it).
+SEG_KEYS = ("seg", "yoloe_seg", "yoloe_indoor_seg")
+CLS_KEYS = ("cls", "scene")
 
 
 def available(task):
@@ -341,6 +389,18 @@ def preprocess_nv12(bcdl, img_bgr, dst_w, dst_h=None):
     y = np.ascontiguousarray(nv12[:dst_h])       # (dst_h, dst_w)        -> input0
     uv = np.ascontiguousarray(nv12[dst_h:])      # (dst_h//2, dst_w)     -> input1
     return y, uv, lb
+
+
+def preprocess_crop_nv12(bcdl, img_bgr, size=224, resize=256):
+    """Places365 preprocessing: stretch-resize to resize x resize, centre-crop
+    size x size, then NV12 [Y, UV]. The classifier was trained on whole-scene
+    crops, not letterboxed frames, so this does not pad."""
+    import cv2
+
+    im = cv2.resize(img_bgr, (resize, resize), interpolation=cv2.INTER_LINEAR)
+    o = (resize - size) // 2
+    nv12 = bcdl.bgr_to_nv12(np.ascontiguousarray(im[o:o + size, o:o + size]))
+    return np.ascontiguousarray(nv12[:size]), np.ascontiguousarray(nv12[size:])
 
 
 def preprocess_depth_f32(img_bgr, dst_w, dst_h):
@@ -519,6 +579,8 @@ class Task:
         self.lb = None
         if self.kind == "depth":                          # single F32 NCHW RGB input (ImageNet norm)
             self.x = preprocess_depth_f32(self.img, self.in_w, self.in_h)
+        elif self.kind == "nv12_crop":                    # resize + centre crop, no letterbox
+            self.y, self.uv = preprocess_crop_nv12(bcdl, self.img, self.in_w)
         else:                                             # 2-input NV12
             self.y, self.uv, self.lb = preprocess_nv12(bcdl, self.img, self.in_w, self.in_h)
         self._build_decoder()
@@ -534,14 +596,14 @@ class Task:
             cfg = b.PoseConfig(); cfg.num_keypoints = 17; cfg.conf_thresh = 0.25
             cfg.strides = [8, 16, 32]
             self.dec = b.PoseEstimator(self.engine, cfg)
-        elif k in ("seg", "yoloe_seg"):   # InstanceSegmenter auto-detects LTRB vs DFL box
+        elif k in SEG_KEYS:   # InstanceSegmenter auto-detects LTRB vs DFL box
             cfg = b.InstanceSegConfig(); cfg.conf_thresh = 0.25; cfg.strides = [8, 16, 32]
             self.dec = b.InstanceSegmenter(self.engine, cfg)
         elif k == "obb":
             cfg = b.ObbConfig(); cfg.num_classes = 15; cfg.conf_thresh = 0.25
             cfg.strides = [8, 16, 32]
             self.dec = b.ObbDetector(self.engine, cfg)
-        elif k == "cls":
+        elif k in CLS_KEYS:
             self.dec = b.Classifier(self.engine)
         elif k == "semseg":
             cfg = b.SegConfig(); cfg.channels_first = False  # deeplabv3plus is NHWC [1,H,W,C]
@@ -570,9 +632,9 @@ class Task:
         k = self.key
         if k in ("det", "det_dfl", "yoloe_det", "pose", "obb"):
             return self.dec.detect([self.y, self.uv], self.lb)
-        if k in ("seg", "yoloe_seg"):
+        if k in SEG_KEYS:
             return self.dec.detect([self.y, self.uv], self.lb, self.orig_w, self.orig_h)
-        if k == "cls":
+        if k in CLS_KEYS:
             return self.dec.classify([self.y, self.uv])
         if k in ("semseg", "semseg_rt", "semseg_yolo26"):   # 2-input NV12 -> feed both, then argmax decode
             self.engine._e.set_input(0, self.y)
@@ -586,20 +648,20 @@ class Task:
     def postprocess(self):
         """Decode the engine's current output (after feed()+infer())."""
         k = self.key
-        if k in ("seg", "yoloe_seg"):
+        if k in SEG_KEYS:
             return self.dec.postprocess(self.lb, self.orig_w, self.orig_h)
-        if k in ("cls", "semseg", "semseg_rt", "semseg_yolo26", "depth"):
+        if k in CLS_KEYS + ("semseg", "semseg_rt", "semseg_yolo26", "depth"):
             return self.dec.postprocess()
         return self.dec.postprocess(self.lb)
 
     # -- summaries + figures ------------------------------------------------
     def summarize(self, results):
         k = self.key
-        if k == "cls":
+        if k in CLS_KEYS:
             return ", ".join(f"{r.class_id}:{r.score:.2f}" for r in results[:3])
         if k == "pose":
             return f"{len(results)} pose(s)"
-        if k in ("seg", "yoloe_seg"):
+        if k in SEG_KEYS:
             return f"{len(results)} instance(s)"
         if k == "obb":
             return f"{len(results)} rotated box(es)"
@@ -620,7 +682,7 @@ class Task:
 
         vis = self.img.copy()
         k = self.key
-        if k == "cls":
+        if k in CLS_KEYS:
             for i, r in enumerate(results[:3]):        # ranked banner, top-3
                 put_label(vis, f"{self._name(r.class_id)}  {r.score:.2f}",
                           8, 12 + i * 30 + 24, palette(r.class_id), fh=22)
@@ -634,7 +696,7 @@ class Task:
                 put_label(vis, self._name(d.class_id), box[:, 0].min(),
                           box[:, 1].min(), c, fh=16)
             return vis
-        if k in ("seg", "yoloe_seg"):
+        if k in SEG_KEYS:
             overlay = vis.copy()
             for d in results:                          # masks first, boxes/labels on top
                 c = palette(d.class_id)

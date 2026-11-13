@@ -184,6 +184,19 @@ copy_staged yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm \
             yoloe/yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm
 copy_staged yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm \
             yoloe/yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm
+# Indoor scenes: YOLOE-26m with a fixed 99-class indoor vocabulary (navigation
+# landmarks + household objects, boxes + instance masks) and its class list, plus
+# the Places365 ResNet50 scene classifier. The Places365 class names and the
+# per-class indoor/outdoor flag come straight from the upstream repo.
+copy_staged yoloe26m_indoor99_seg_nashm_640x640_nv12.hbm \
+            yoloe26_indoor/out_int8/yoloe26m_indoor99_seg_nashm_640x640_nv12.hbm
+copy_staged yoloe26m_indoor99_labels.txt yoloe26_indoor/yoloe26m_indoor99_labels.txt
+copy_staged places365_resnet50_nashm_224x224_nv12.hbm \
+            places365/out_int8/places365_resnet50_nashm_224x224_nv12.hbm
+download categories_places365.txt \
+  https://raw.githubusercontent.com/CSAILVision/places365/master/categories_places365.txt
+download IO_places365.txt \
+  https://raw.githubusercontent.com/CSAILVision/places365/master/IO_places365.txt
 copy_staged edge_sam_encoder_nashm.hbm     edgesam/enc_out/edge_sam_encoder_nashm.hbm
 copy_staged edge_sam_decoder_sp1_nashm.hbm edgesam/dec_out/edge_sam_decoder_sp1_nashm.hbm
 copy_staged edge_sam_decoder_bp2_nashm.hbm edgesam/dec_bp_out/edge_sam_decoder_bp2_nashm.hbm

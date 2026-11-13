@@ -47,6 +47,8 @@ here, see [Getting the models](#getting-the-models)).
 | RGB-D depth refinement | `lingbot_depth_v05_int16_nashm.hbm` | LingBot-Depth v0.5 (MDM, DINOv2 ViT-L/14 RGBD) | 640×480 RGB + depth | converted |
 | open-vocab det | `yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm` | YOLOE-11s | 640×640 | converted |
 | open-vocab seg | `yoloe_11s_coco80_seg_bpu_nashm_640x640_nv12.hbm` | YOLOE-11s | 640×640 | converted |
+| indoor objects + masks (99 classes) | `yoloe26m_indoor99_seg_nashm_640x640_nv12.hbm` + `yoloe26m_indoor99_labels.txt` | YOLOE-26m, fixed indoor vocabulary (see [below](#the-indoor-yoloe-build-is-zero-shot)) | 640×640 | converted |
+| scene classification (365 scenes) | `places365_resnet50_nashm_224x224_nv12.hbm` + `categories_places365.txt`, `IO_places365.txt` | Places365 ResNet50 (CSAIL) | 224×224 | converted |
 | promptable seg | `edge_sam_encoder_nashm.hbm` | EdgeSAM encoder | 1024×1024 | converted |
 | promptable seg | `edge_sam_decoder_sp1_nashm.hbm` | EdgeSAM decoder, 1 point | — | converted |
 | promptable seg | `edge_sam_decoder_bp2_nashm.hbm` | EdgeSAM decoder, box (2 pts) | — | converted |
@@ -412,6 +414,55 @@ Two more choices in the table are **not** better/worse pairs:
 To verify a fetch actually gave you these builds: empty `models/`, re-run the
 fetch script, and run the test suite.
 
+### The indoor YOLOE build is zero-shot
+
+`yoloe26m_indoor99_seg` is YOLOE-26m with a **fixed 99-class vocabulary**
+folded into its head: ten navigation landmarks first (door, open door, glass
+door, elevator, elevator door, escalator, stairs, handrail, exit sign, wet
+floor sign), then household objects (furniture, appliances, electronics,
+tableware, bathroom fittings, lighting and decor). The class order is the line
+order of `yoloe26m_indoor99_labels.txt`. Nothing was trained: every class is
+YOLOE's open-vocabulary prior for that prompt. It decodes through the ordinary
+`InstanceSegmenter` (boxes and masks); keep `compute_masks` off when only boxes
+are needed, because assembling the masks costs far more CPU time than the BPU
+spends on the network.
+
+What that buys and costs, measured against held-out ground truth rather than
+read off a cosine:
+
+- **On par with a supervised detector overall, not class by class.** On 1952
+  Open Images V7 indoor images (validation + test splits, none used for
+  calibration), the board build's mAP50 over the 25 classes with at least 20
+  boxes is 0.484, against 0.478 for the float model and 0.481 for Ultralytics'
+  YOLOv8s trained on Open Images itself — which also has those images'
+  annotation conventions on its side. YOLOE is ahead on beds, toilets,
+  appliances and bottles, level on doors (0.44 vs 0.42), and behind on stairs
+  (0.33 vs 0.45), windows, shelves, cabinets and books.
+- **Screens are a blind spot.** Computer monitors score near zero under every
+  prompt tried (`computer monitor`, `monitor`, `computer screen`, `lcd monitor`
+  …), even with a three-class vocabulary. This is the model, not the
+  vocabulary.
+- **Navigation classes come out with low scores.** On Places365 scene images
+  used as presence labels, image-level AP is 0.74 for escalators, 0.46 for
+  elevators and 0.35 for stairs, but at the usual 0.25 threshold only about a
+  fifth of the elevator images get a detection at all. Use a lower threshold for
+  these classes and check it on your own frames; where missing a staircase
+  matters, use a detector trained on stairs.
+- **int8 moves near-tied classes.** The board build is no worse than float in
+  aggregate, but individual classes shift both ways (stairs and windows up;
+  window blinds and bottles down) because quantisation flips which of two close
+  classes wins at a cell. Masks of instances found by both agree closely (mean
+  IoU 0.93).
+
+`places365_resnet50` returns logits over the 365 Places365 scenes; take the
+names from `categories_places365.txt` and the indoor/outdoor flag (1 = indoor)
+from `IO_places365.txt`. Preprocess the way it was trained — stretch to 256×256
+and centre-crop 224×224, not a letterbox (letterboxing a 4:3 frame costs 3.6
+points top-1 in float). On the 36,380 Places365 validation
+images not used for calibration, the board build scores 54.5% top-1 / 84.6%
+top-5 (float: 54.6% / 85.0%); 365-way scene labels are ambiguous by nature, so
+top-5 is the more useful number.
+
 ## Getting the models
 
 The `.hbm` files are **not committed** (too large; `.gitignore` excludes
@@ -432,10 +483,10 @@ live in the companion
 [**bcdl-model-zoo**](https://github.com/ruisv/bcdl-model-zoo) repository, one
 directory per model at `models/<name>/`. Every **converted** entry above has a
 recipe there: `las2`, `ppocr_v6`, `ppocr_v5`, `osnet`, `yolop`, `pidnet`,
-`superres`, `span`, `xfeat`, `yoloe`, `vitpose`, `yolo26`, `yolo26_sem`, `face`,
-`edgesam`, plus `pointpillars` — the one recipe there whose output is not in the
-table above at all, because its weights cannot be redistributed (see the two
-chains, above).
+`superres`, `span`, `xfeat`, `yoloe`, `yoloe26_indoor`, `places365`, `vitpose`,
+`yolo26`, `yolo26_sem`, `face`, `edgesam`, plus `pointpillars` — the one recipe
+there whose output is not in the table above at all, because its weights cannot
+be redistributed (see the two chains, above).
 The **board** and **zoo** entries are prebuilt downloads, not conversions, so
 their "recipe" is the source URL and they are fetched by `scripts/fetch_models.sh`
 rather than rebuilt.
@@ -617,7 +668,8 @@ answers, not ones nobody looked at.
 | upstream | licence |
 |---|---|
 | PP-OCRv6 det/rec, PP-OCRv5 det/rec, PP-LCNet cls (PaddleOCR) | Apache-2.0, code **and** weights (each model card declares it) |
-| YOLO26 / YOLOv8 / YOLOE (Ultralytics) | **AGPL-3.0** — copyleft; commercial use needs their Enterprise licence |
+| YOLO26 / YOLOv8 / YOLOE (Ultralytics) | **AGPL-3.0** — copyleft; commercial use needs their Enterprise licence. The indoor YOLOE build also carries class embeddings computed with the MobileCLIP2 text encoder that Ultralytics distributes; that encoder's own terms are **unresolved** — not reviewed |
+| Places365 CNNs (CSAIL) | MIT **code**; the upstream README releases the pretrained Places365-CNN weights under **CC BY** (attribution). The training images remain their owners' copyright |
 | Depth-Anything-V2 | Apache-2.0 (Small) / CC-BY-NC-4.0 (Base and up) — check the variant |
 | DeepLabV3+, SigLIP | via D-Robotics `rdk_model_zoo` — check its terms |
 | SCRFD, ArcFace (insightface) | MIT **code**, but the pretrained **weights are academic / non-commercial**. For a commercial build swap in YuNet (OpenCV Zoo — plain CNN, int8-safe) and pick another recognition backbone |
