@@ -4,7 +4,7 @@
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
 [![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-3776AB.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-RDK%20S100%20%2F%20S100P%20%2F%20S600%20(aarch64)-0A7BBB.svg)](#运行环境要求)
-[![Version](https://img.shields.io/badge/version-0.8.1-informational.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.0-informational.svg)](CHANGELOG.md)
 
 [English](README.en.md) | **简体中文**
 
@@ -170,7 +170,7 @@ python -c "import bcdl; print(bcdl.__version__)"
 conda create -n bcdl -c https://mirrors.ruis.ai/conda -c conda-forge \
     python=3.12 bcdl
 conda activate bcdl
-# 或锁定精确构建：   conda install ... "bcdl=0.8.1"
+# 或锁定精确构建：   conda install ... "bcdl=0.9.0"
 ```
 
 为了避免每次都带 `-c`，可以把该频道加进环境（它必须排在
@@ -188,28 +188,30 @@ conda config --env --add channels conda-forge
 python -c "import bcdl, bcdl_py; print('bcdl', bcdl.__version__); print(bcdl_py.__file__)"
 ```
 
-这会把整个栈解析为四个 bcdl 包 —— Python 绑定、C++ 库，以及它们链接的、打包好的
-D-Robotics hobot SDK —— 外加来自 conda-forge 的 OpenCV：
+这会解析出两个 bcdl 包 —— Python 绑定与 C++ 库 —— 外加来自 conda-forge 的 OpenCV。
+D-Robotics hobot SDK **不在包里**：BCDL 链接的是板子系统镜像自带的那一份
+（`/usr/hobot/lib`），所以运行时永远与板子的固件和 BPU 匹配，同一个包在 S100 / S100P /
+S600 上通用：
 
 | 包 | 内容 |
 |---------|-------|
 | **bcdl** | `bcdl` / `bcdl_py` Python 绑定（每个 Python 3.9–3.14 各一份构建） |
 | **libbcdl** | C++ 库 —— `libbcdl.so`、公共头文件，以及 `find_package(bcdl)` 的 CMake 配置 |
-| **hobot-dnn** | BPU/DNN 运行时 SDK（`libdnn`、`libhbucp`、`libhbvp`…）+ `hobot/` 头文件 |
-| **hobot-media** | 多媒体/编解码线（`libffmedia`、`libgdcbin`、`libmultimedia`…）+ 多媒体开发头文件 |
 | **libopencv** / **py-opencv** | OpenCV，来自 conda-forge。C++ 那半是 `libbcdl` 链接的；绑定那半是 letterbox、NV12、JPEG 这些辅助函数 import 的 |
 
 如果只是 **纯 C++** 的使用方，只装库即可，并用 `find_package(bcdl)` 来构建
-（它会一并拉入 `libbcdl` + `hobot-dnn` + `hobot-media`）：
+（hobot 头文件与库同样取自板上的 `/usr/include/hobot` 与 `/usr/hobot/lib`）：
 
 ```bash
 conda install -c https://mirrors.ruis.ai/conda -c conda-forge libbcdl
 ```
 
-> 打包的 hobot SDK 仍依赖板上的 **设备平台库**
-> （`libbpu`、`libhbmem`、`libalog`、`libvdsp`、`libhbipcfhal`），位于
-> `/usr/hobot/lib` —— 它们随 RDK 系统镜像一起提供，通过 `ldconfig` 解析，
-> 出于设计目的不随包重新分发。
+> hobot 运行时（`libdnn`、`libhbucp`…）和它依赖的设备平台库（`libbpu`、`libhbmem`…）
+> 都随 RDK 系统镜像提供，必须与板子的固件版本一致，所以刻意不随包分发。0.9.0 之前的包
+> 带了一份 S100 的 SDK，它会挡住板上的那份 —— 在 S600 上输出因此错位或变成 NaN。
+> 从旧版本升级时，conda 会把 `hobot-dnn` / `hobot-media` 一并移除。想确认实际加载的
+> 是哪一份运行时，运行 `python -c "import bcdl; print(bcdl.runtime_info())"`，
+> `dnn_library` 应当位于 `/usr/hobot/lib` 下。
 
 ### 2. 拿一个模型（一分钟）
 
@@ -500,9 +502,9 @@ PYTHONPATH=build:python python scripts/board_bench.py --retry-until-clean 3
 
 ## 运行环境要求
 
-- 一块 **RDK S100 / S100P / S600** 开发板（Ubuntu 22.04，aarch64），且板上已有
+- 一块 **RDK S100 / S100P / S600** 开发板（RDK OS，aarch64），板上的系统镜像自带
   D-Robotics hobot SDK（`/usr/include/hobot`、`/usr/hobot/lib`：`libdnn`、
-  `libhbucp`、`libhbvp`）—— 或安装上文的 `hobot-dnn` / `hobot-media` conda 包。
+  `libhbucp`、`libhbvp`）。
   BCDL 的源码在整个 S 系列上一致；而编译出的 `.hbm` 是 **march 相关的**，
   所以请运行为你目标板编译的模型（见[模型](#模型)）。
 - CMake ≥ 3.22、GCC 11、Ninja。
@@ -511,9 +513,8 @@ PYTHONPATH=build:python python scripts/board_bench.py --retry-until-clean 3
 
 ## 从源码构建
 
-在板上、在你的 Python/conda 环境里构建（需要 hobot SDK —— 来自上文的
-`hobot-dnn` / `hobot-media` conda 包，或系统镜像里的 `/usr/include/hobot` +
-`/usr/hobot/lib`）：
+在板上、在你的 Python/conda 环境里构建（需要系统镜像里的 hobot SDK：
+`/usr/include/hobot` + `/usr/hobot/lib`）：
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

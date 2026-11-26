@@ -8,6 +8,11 @@ import numpy
 from numpy.typing import NDArray
 
 
+def runtime_info() -> dict:
+    """
+    The hobot runtime this process loaded: dnn_version, ucp_version, soc_name, and dnn_library (the file libdnn was resolved from; normally under /usr/hobot/lib).
+    """
+
 class Engine:
     def __init__(self, hbm_path: str, model_name: str = '') -> None: ...
 

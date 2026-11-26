@@ -9,7 +9,7 @@ summarizes them with usage. For the Python bindings see
 
 - [Linking](#linking) · [Conventions](#conventions) · [Worked example](#worked-example)
 - Core: [Error handling](#error-handling) · [SysMem](#sysmem) · [Task](#task) ·
-  [MemPool](#mempool)
+  [MemPool](#mempool) · [Runtime info](#runtime-info)
 - Backend: [Engine](#engine)
 - Preprocessing: [Geometry & letterbox](#geometry--letterbox) · [VpImage](#vpimage)
 - Tasks: [Detection](#detection) · [Classification](#classification) ·
@@ -31,15 +31,16 @@ The umbrella header pulls in everything:
 ```
 
 With CMake, `find_package(bcdl)` exposes the `bcdl::bcdl` target (it transitively
-brings the headers and the hobot SDK link libs):
+brings the headers and the hobot SDK link libs — the board's own, under
+`/usr/include/hobot` and `/usr/hobot/lib`):
 
 ```cmake
 find_package(bcdl CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE bcdl::bcdl)
 ```
 
-See the [README](../README.en.md#build-from-source) for the conda packages
-(`libbcdl` + `hobot-dnn` + `hobot-media`) and the on-board build. Everything here
+See the [README](../README.en.md#build-from-source) for the conda package
+(`libbcdl`) and the on-board build. Everything here
 runs **only on an RDK S100 / S100P / S600 board** — the hobot SDK and the BPU/JPU/VPU
 units are board-only.
 
@@ -125,6 +126,27 @@ pool.clear();                          // free all non-leased blocks
 
 The pool must outlive every `Lease`. Thread-safe (acquire/release are mutexed);
 recycled blocks are not zeroed.
+
+---
+
+## Runtime info
+
+`bcdl/core/runtime.h` — which hobot runtime the process actually loaded. BCDL
+links against the SDK that ships with the board's OS image rather than bundling
+one; when results differ between boards, this is the first thing to compare.
+
+```cpp
+bcdl::RuntimeInfo r = bcdl::runtimeInfo();   // safe before any Engine exists
+// r.dnn_version  "3.13.6_(4.7.5 HBRT)"   hbDNNGetVersion()
+// r.ucp_version  "3.13.6"                hbUCPGetVersion()
+// r.soc_name     "D-Robotics RDK S100P V1P0"
+// r.dnn_library  "/usr/hobot/lib/libdnn.so" — anywhere else means another copy
+//                of the SDK is shadowing the board's
+```
+
+| Member | Meaning |
+|---|---|
+| `runtimeInfo()` | `RuntimeInfo` with the four fields above (`dnn_library` is `""` if the linker cannot say) |
 
 ---
 

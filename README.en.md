@@ -4,7 +4,7 @@
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
 [![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-3776AB.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-RDK%20S100%20%2F%20S100P%20%2F%20S600%20(aarch64)-0A7BBB.svg)](#requirements)
-[![Version](https://img.shields.io/badge/version-0.8.1-informational.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.0-informational.svg)](CHANGELOG.md)
 
 **English** | [简体中文](README.md)
 
@@ -185,7 +185,7 @@ Prefer a clean, reproducible environment? Create one and pin a version:
 conda create -n bcdl -c https://mirrors.ruis.ai/conda -c conda-forge \
     python=3.12 bcdl
 conda activate bcdl
-# or pin an exact build:   conda install ... "bcdl=0.8.1"
+# or pin an exact build:   conda install ... "bcdl=0.9.0"
 ```
 
 To avoid passing `-c` every time, add the channel to the env (it must sit
@@ -204,29 +204,34 @@ native extension path):
 python -c "import bcdl, bcdl_py; print('bcdl', bcdl.__version__); print(bcdl_py.__file__)"
 ```
 
-That resolves the whole stack as four bcdl packages — the Python bindings, the
-C++ library, and the packaged D-Robotics hobot SDK they link against — plus
-OpenCV from conda-forge:
+That resolves two bcdl packages — the Python bindings and the C++ library —
+plus OpenCV from conda-forge. The D-Robotics hobot SDK is **not** in them: BCDL
+links against the copy that ships with the board's OS image (`/usr/hobot/lib`),
+so the runtime always matches the board's firmware and BPU, and one package
+serves the S100, S100P and S600 alike:
 
 | package | ships |
 |---------|-------|
 | **bcdl** | the `bcdl` / `bcdl_py` Python bindings (one build per Python 3.9–3.14) |
 | **libbcdl** | the C++ library — `libbcdl.so`, public headers, and the `find_package(bcdl)` CMake config |
-| **hobot-dnn** | the BPU/DNN runtime SDK (`libdnn`, `libhbucp`, `libhbvp`, …) + `hobot/` headers |
-| **hobot-media** | the media/codec line (`libffmedia`, `libgdcbin`, `libmultimedia`, …) + media dev headers |
 | **libopencv** / **py-opencv** | OpenCV, from conda-forge. The C++ side is what `libbcdl` links; the bindings are what the letterbox, NV12 and JPEG helpers import |
 
 For a **C++-only** consumer, install just the library and build against it with
-`find_package(bcdl)` (it pulls `libbcdl` + `hobot-dnn` + `hobot-media`):
+`find_package(bcdl)` (the hobot headers and libraries come from the board's
+`/usr/include/hobot` and `/usr/hobot/lib` here too):
 
 ```bash
 conda install -c https://mirrors.ruis.ai/conda -c conda-forge libbcdl
 ```
 
-> The packaged hobot SDK still relies on the board's **device platform libraries**
-> (`libbpu`, `libhbmem`, `libalog`, `libvdsp`, `libhbipcfhal`) under
-> `/usr/hobot/lib` — they ship with the RDK system image and resolve via
-> `ldconfig`, and are intentionally not redistributed.
+> The hobot runtime (`libdnn`, `libhbucp`, …) and the device platform libraries it
+> needs (`libbpu`, `libhbmem`, …) ship with the RDK system image and must match the
+> board's firmware, so they are intentionally not redistributed. Packages before
+> 0.9.0 bundled an S100 build of the SDK that shadowed the board's — on an S600
+> that shifted outputs or turned them into NaN. Upgrading from one removes
+> `hobot-dnn` / `hobot-media` from the environment. To check which runtime was
+> loaded, run `python -c "import bcdl; print(bcdl.runtime_info())"`:
+> `dnn_library` should be under `/usr/hobot/lib`.
 
 ### 2. Get a model (one minute)
 
@@ -583,9 +588,9 @@ Public headers live in [`include/bcdl/`](include/bcdl/); runnable programs in
 
 ## Requirements
 
-- An **RDK S100 / S100P / S600** board (Ubuntu 22.04, aarch64) with the D-Robotics
-  hobot SDK present (`/usr/include/hobot`, `/usr/hobot/lib`: `libdnn`, `libhbucp`,
-  `libhbvp`) — or the `hobot-dnn` / `hobot-media` conda packages above. BCDL's
+- An **RDK S100 / S100P / S600** board (RDK OS, aarch64); its system image ships the
+  D-Robotics hobot SDK (`/usr/include/hobot`, `/usr/hobot/lib`: `libdnn`, `libhbucp`,
+  `libhbvp`). BCDL's
   source is the same across the S-series; a compiled `.hbm` is **march-specific**,
   so run a model built for your target board (see [Models](#models)).
 - CMake ≥ 3.22, GCC 11, Ninja.
@@ -594,9 +599,8 @@ Public headers live in [`include/bcdl/`](include/bcdl/); runnable programs in
 
 ## Build from source
 
-Build on the board in your Python/conda env (needs the hobot SDK — from the
-`hobot-dnn` / `hobot-media` conda packages above, or the system image at
-`/usr/include/hobot` + `/usr/hobot/lib`):
+Build on the board in your Python/conda env (needs the system image's hobot SDK
+at `/usr/include/hobot` + `/usr/hobot/lib`):
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

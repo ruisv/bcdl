@@ -37,8 +37,9 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 python -c "import bcdl; print(bcdl.__version__)"
 ```
 
-`import bcdl` 会传递性地带入 C++ 库与打包好的 hobot SDK，所以在一块 RDK S100 /
-S100P / S600 板子上不需要再装别的东西。
+`import bcdl` 会传递性地带入 C++ 库。hobot 运行时用的是板子系统镜像自带的那一份
+（`/usr/hobot/lib`），所以在一块 RDK S100 / S100P / S600 板子上不需要再装别的东西，
+而且它永远与板子的固件匹配。`bcdl.runtime_info()` 会报告进程实际加载的运行时。
 
 ## 两种使用方式
 
@@ -70,6 +71,9 @@ S100P / S600 板子上不需要再装别的东西。
   layout 不同）；而*流水线*（`TrackingPipeline`、`AsyncDetectionPipeline`、
   `StereoPipeline`）在 C++ 里自己做预处理，直接吃一帧原始 BGR。
 - **`__version__`** 即 `bcdl.__version__`。
+- **`runtime_info()`** 返回进程加载的 hobot 运行时：`dnn_version`、`ucp_version`、
+  `soc_name`，以及 `dnn_library` —— libdnn 实际加载自哪个文件，正常应在
+  `/usr/hobot/lib` 下。在别处说明有另一份 SDK 挡住了板上的那份；提交 bug 时请附上它。
 
 ---
 

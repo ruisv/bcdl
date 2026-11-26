@@ -81,6 +81,26 @@ def test_a_size_that_is_neither_packed_nor_device_is_rejected():
         e._e.set_input(0, short)
 
 
+def test_dynamic_strides_resolve_to_64_byte_rows():
+    """Dynamic (-1) input strides must resolve to a multiple of 64 bytes. S100 and
+    S100P accept 32, but the S600 runtime rejects anything short of 64 at infer
+    time ("stride should be align to 64, but get 224") — and 640-wide models hide
+    it, because 640 is already a multiple of 64. A 224-wide NV12 model is where
+    the two values differ: its 224-byte Y and UV rows must come out as 256."""
+    cls = os.path.join(bm.MODELS, "yolo26n_cls_nashm_224x224_nv12.hbm")
+    e = _engine(cls)
+    assert e.input_shape(0) == [1, 224, 224, 1]
+    assert e.input_shape(1) == [1, 112, 112, 2]
+    assert e.input_stride(0) == [57344, 256, 1, 1]
+    assert e.input_stride(1) == [28672, 256, 2, 1]
+    # A packed Y plane is still accepted and lands row-aligned, pad zeroed.
+    y = (np.arange(224 * 224, dtype=np.uint32) % 251).astype(np.uint8).reshape(1, 224, 224, 1)
+    e._e.set_input(0, np.ascontiguousarray(y))
+    view = np.frombuffer(e._e.input_buffer_bytes(0), dtype=np.uint8).reshape(224, 256)
+    np.testing.assert_array_equal(view[:, :224], y[0, :, :, 0])
+    assert not view[:, 224:].any(), "pad columns must be zeroed, not row-shifted data"
+
+
 def test_packed_equals_device_for_a_contiguous_model():
     """The common case stays a plain memcpy — no behaviour change for the NV12
     models the whole detection path runs on."""

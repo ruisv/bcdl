@@ -7,7 +7,7 @@ C++ 库（命名空间 `bcdl`）的完整参考。[`include/bcdl/`](../include/b
 [`API.zh.md`](API.zh.md)；两边的名字一一对应（Python snake_case ⇄ C++ camelCase）。
 
 - [链接与构建](#链接与构建) · [约定](#约定) · [完整示例](#完整示例)
-- core：[错误处理](#错误处理) · [SysMem](#sysmem) · [Task](#task) · [MemPool](#mempool)
+- core：[错误处理](#错误处理) · [SysMem](#sysmem) · [Task](#task) · [MemPool](#mempool) · [运行时信息](#运行时信息)
 - backend：[Engine](#engine)
 - 预处理：[几何与 letterbox](#几何与-letterbox) · [VpImage](#vpimage)
 - 任务：[检测 Detection](#检测-detection) · [分类 Classification](#分类-classification) ·
@@ -31,14 +31,15 @@ C++ 库（命名空间 `bcdl`）的完整参考。[`include/bcdl/`](../include/b
 ```
 
 在 CMake 里，`find_package(bcdl)` 会暴露 `bcdl::bcdl` 目标（传递性地带上头文件
-与 hobot SDK 的链接库）：
+与 hobot SDK 的链接库 —— 用的是板子自己的，位于 `/usr/include/hobot` 与
+`/usr/hobot/lib`）：
 
 ```cmake
 find_package(bcdl CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE bcdl::bcdl)
 ```
 
-conda 包（`libbcdl` + `hobot-dnn` + `hobot-media`）与板上构建见
+conda 包（`libbcdl`）与板上构建见
 [README](../README.md#从源码构建)。这里的一切**只能在 RDK S100 / S100P / S600
 板子上运行** —— hobot SDK 与 BPU/JPU/VPU 单元都只存在于板上。
 
@@ -122,6 +123,26 @@ pool.clear();                          // 释放所有未被租用的块
 
 池必须比每个 `Lease` 活得久。线程安全（acquire/release 有互斥保护）；
 回收的块不会被清零。
+
+---
+
+## 运行时信息
+
+`bcdl/core/runtime.h` —— 当前进程实际加载的是哪一份 hobot 运行时。BCDL 链接的是
+板子系统镜像自带的 SDK，不自带一份；不同板子上结果不一致时，先比较这个。
+
+```cpp
+bcdl::RuntimeInfo r = bcdl::runtimeInfo();   // 可以在任何 Engine 之前调用
+// r.dnn_version  "3.13.6_(4.7.5 HBRT)"   hbDNNGetVersion()
+// r.ucp_version  "3.13.6"                hbUCPGetVersion()
+// r.soc_name     "D-Robotics RDK S100P V1P0"
+// r.dnn_library  "/usr/hobot/lib/libdnn.so" —— 在别处说明有另一份 SDK
+//                挡住了板上的那份
+```
+
+| 成员 | 含义 |
+|---|---|
+| `runtimeInfo()` | 返回带上述四个字段的 `RuntimeInfo`（链接器给不出路径时 `dnn_library` 为 `""`） |
 
 ---
 

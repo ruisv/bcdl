@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "bcdl/backend/engine.h"
+#include "bcdl/core/runtime.h"
 #include "bcdl/version.h"
 #include "bcdl/media/jpeg_codec.h"
 #include "bcdl/media/video_codec.h"
@@ -119,6 +120,21 @@ nb::ndarray<nb::numpy, T> toNumpy(std::vector<T> vec,
 NB_MODULE(bcdl_py, m) {
   m.doc() = "BCDL — BPU Common Deep Learning (C++ core)";
   m.attr("__version__") = BCDL_VERSION_STRING;
+
+  m.def(
+      "runtime_info",
+      []() {
+        const bcdl::RuntimeInfo r = bcdl::runtimeInfo();
+        nb::dict d;
+        d["dnn_version"] = r.dnn_version;
+        d["ucp_version"] = r.ucp_version;
+        d["soc_name"] = r.soc_name;
+        d["dnn_library"] = r.dnn_library;
+        return d;
+      },
+      "The hobot runtime this process loaded: dnn_version, ucp_version, "
+      "soc_name, and dnn_library (the file libdnn was resolved from; normally "
+      "under /usr/hobot/lib).");
 
   nb::class_<bcdl::Engine>(m, "Engine")
       .def(nb::init<const std::string&, const std::string&>(), "hbm_path"_a,

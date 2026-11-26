@@ -42,8 +42,10 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 python -c "import bcdl; print(bcdl.__version__)"
 ```
 
-`import bcdl` pulls the C++ library and the packaged hobot SDK transitively, so
-nothing else is needed on an RDK S100 / S100P / S600 board.
+`import bcdl` pulls the C++ library transitively. The hobot runtime is the one
+that ships with the board's OS image (`/usr/hobot/lib`), so nothing else is
+needed on an RDK S100 / S100P / S600 board, and it always matches the board's
+firmware. `bcdl.runtime_info()` reports which runtime the process loaded.
 
 ## Two ways to use BCDL
 
@@ -79,6 +81,10 @@ Every task is available at two levels — pick per how much you want BCDL to own
   (`TrackingPipeline`, `AsyncDetectionPipeline`, `StereoPipeline`) own
   preprocessing in C++ and take a raw BGR frame.
 - **`__version__`** is `bcdl.__version__`.
+- **`runtime_info()`** returns the hobot runtime the process loaded:
+  `dnn_version`, `ucp_version`, `soc_name`, and `dnn_library` — the file libdnn
+  was resolved from, normally under `/usr/hobot/lib`. A path anywhere else means
+  another copy of the SDK is shadowing the board's; include it in bug reports.
 
 ---
 

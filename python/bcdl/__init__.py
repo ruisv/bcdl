@@ -16,6 +16,19 @@ import bcdl_py
 __version__ = bcdl_py.__version__
 
 
+def runtime_info() -> dict[str, str]:
+    """The hobot runtime this process actually loaded.
+
+    BCDL links against the hobot SDK that ships with the board's OS image rather
+    than bundling one, so the runtime always matches the board's firmware. Keys:
+    ``dnn_version``, ``ucp_version``, ``soc_name`` and ``dnn_library`` -- the file
+    libdnn was resolved from, normally under ``/usr/hobot/lib``. A path anywhere
+    else means another copy of the SDK is shadowing the board's; include this
+    dict in bug reports.
+    """
+    return dict(bcdl_py.runtime_info())
+
+
 class Engine:
     """Load an ``.hbm`` model and run BPU inference with numpy in/out."""
 
@@ -1896,6 +1909,7 @@ DbTextDetector = bcdl_py.DbTextDetector
 
 
 __all__ = [
+    "runtime_info",
     "Engine",
     "Detector",
     "DetectConfig",

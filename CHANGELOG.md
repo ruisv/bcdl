@@ -12,6 +12,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11
+
 ### Added
 - **Indoor objects with instance masks: `yoloe26m_indoor99_seg`.** YOLOE-26m
   with a fixed 99-class indoor vocabulary folded into its head — ten navigation
@@ -33,6 +35,37 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `scripts/fetch_models.sh` fetches both, plus the Places365 class names and
   indoor flags from upstream; the board tests and `board_bench.py` cover both.
   Conversion recipes: `yoloe26_indoor` and `places365` in bcdl-model-zoo.
+- **`runtime_info()` / `bcdl::runtimeInfo()`** — which hobot runtime the process
+  actually loaded: the DNN and UCP versions, the SoC name, and the file libdnn
+  was resolved from. Normally that file is under `/usr/hobot/lib`; anywhere else
+  means another copy of the SDK is shadowing the board's, which is invisible from
+  the results alone.
+
+### Changed
+- **The conda packages no longer bundle the hobot SDK.** `libbcdl` used to
+  depend on `hobot-dnn` / `hobot-media`, which put an S100 build of the runtime
+  (`libdnn`, `libhbucp`, `libhbrt4`, `libhbmem`, `libmultimedia`, …) into the
+  environment, ahead of the board's own in `/usr/hobot/lib`. That runtime has to
+  match the board's firmware, so on an S600 it ran against a platform it was not
+  built for, and `Engine.infer()` returned outputs that were shifted or NaN. Now
+  `libbcdl` links against the board's SDK — the headers are identical across the
+  S-series, so one package serves the S100, S100P and S600, and survives an OS
+  upgrade. Upgrading an existing environment removes `hobot-dnn` and
+  `hobot-media` from it. On S100P the published 0.8.1 binary passes the full
+  board suite unchanged once those two are gone.
+
+### Fixed
+- **Models whose input rows are not a multiple of 64 bytes failed on the S600.**
+  `Engine` resolves a model's dynamic input strides itself, and aligned them to
+  32 bytes. S100 and S100P accept that; the S600 runtime requires 64 and rejects
+  the stride at infer time ("stride should be align to 64, but get 224"), so a
+  224-wide classifier or a 672-wide detector could not run there at all. 640-wide
+  models were unaffected, which is why it went unnoticed. Strides now align to
+  64, which every S-series board accepts. On S100/S100P this changes the layout
+  only for such rows (a 224-wide NV12 plane is now 256 bytes per row), and the
+  outputs are bit-identical to the 32-byte layout. Code that writes an input
+  buffer directly instead of through `setInput()` must take the row stride from
+  `inputStride()` / `input_stride()` rather than assuming one.
 
 ## [0.8.1] — 2026-11
 

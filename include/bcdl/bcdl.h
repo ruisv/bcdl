@@ -9,6 +9,7 @@
 
 // Core: memory, tasks, errors
 #include "bcdl/core/mem_pool.h"
+#include "bcdl/core/runtime.h"
 #include "bcdl/core/status.h"
 #include "bcdl/core/sys_mem.h"
 #include "bcdl/core/task.h"

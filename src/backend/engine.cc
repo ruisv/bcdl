@@ -10,8 +10,13 @@
 namespace bcdl {
 
 namespace {
-// BPU width-stride alignment: S100/S100P/S600 -> 32, S300 -> 64.
-constexpr int64_t kBpuStrideAlign = 32;
+// Alignment for the dynamic (-1) input strides resolved below. The runtime checks
+// each one and rejects a misaligned stride at infer time: S100/S100P accept a
+// multiple of 32, S600 requires a multiple of 64. A multiple of 64 satisfies
+// both, so one value serves the whole S-series. It only changes the layout for
+// rows that are not already a multiple of 64 bytes (a 224-wide NV12 plane pads
+// to 256), and setInput() scatters a packed array into that padding.
+constexpr int64_t kBpuStrideAlign = 64;
 inline int64_t alignUp(int64_t v, int64_t a) { return (v + (a - 1)) & ~(a - 1); }
 }  // namespace
 

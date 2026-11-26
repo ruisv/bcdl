@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(bcdl LANGUAGES CXX VERSION 0.8.1)
+project(bcdl LANGUAGES CXX VERSION 0.9.0)
 
 # --- Guard: this project only builds on the aarch64 RDK board ----------------
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
@@ -68,6 +68,7 @@ add_library(bcdl SHARED
   src/core/sys_mem.cc
   src/core/task.cc
   src/core/mem_pool.cc
+  src/core/runtime.cc
   src/backend/engine.cc
   src/backend/output_reader.cc
   src/backend/input_writer.cc
@@ -127,6 +128,8 @@ target_include_directories(bcdl PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 # hobot::dnn = BPU runtime; hobot::media = hb_vp preproc (resize/warp/cvtcolor).
 target_link_libraries(bcdl PUBLIC hobot::dnn Threads::Threads)
+# dladdr() for runtimeInfo(); a separate libdl on glibc < 2.34.
+target_link_libraries(bcdl PRIVATE ${CMAKE_DL_LIBS})
 if(OpenMP_CXX_FOUND)
   target_link_libraries(bcdl PUBLIC OpenMP::OpenMP_CXX)
 else()
