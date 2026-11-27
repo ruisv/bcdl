@@ -1,5 +1,7 @@
 # Models
 
+**English** | [简体中文](MODELS.zh.md)
+
 The catalogue of compiled BPU models (`.hbm`) the examples, tests and benchmark
 suite consume. This file is the single place that records, per model, **what it
 is, where it came from, which build to take, and under what licence** — code

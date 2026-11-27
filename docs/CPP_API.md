@@ -10,16 +10,30 @@ summarizes them with usage. For the Python bindings see
 - [Linking](#linking) · [Conventions](#conventions) · [Worked example](#worked-example)
 - Core: [Error handling](#error-handling) · [SysMem](#sysmem) · [Task](#task) ·
   [MemPool](#mempool) · [Runtime info](#runtime-info)
-- Backend: [Engine](#engine)
-- Preprocessing: [Geometry & letterbox](#geometry--letterbox) · [VpImage](#vpimage)
-- Tasks: [Detection](#detection) · [Classification](#classification) ·
-  [Pose](#pose) · [Instance segmentation](#instance-segmentation) ·
+- Backend: [Engine](#engine) · [Output reader & input writer](#output-reader--input-writer)
+- Preprocessing: [Geometry & letterbox](#geometry--letterbox) ·
+  [GDC hardware warp](#gdc-hardware-warp) · [VpImage](#vpimage)
+- Tasks: [Detection](#detection) · [Panoptic driving (YOLOP)](#panoptic-driving-perception-yolop) ·
+  [Classification](#classification) · [Image embeddings](#image-embeddings) ·
+  [Face detection & alignment](#face-detection--alignment) · [Pose](#pose) ·
+  [Whole-body pose](#whole-body-pose-133-keypoints) ·
+  [Super-resolution](#super-resolution-tiled) · [XFeat](#sparse-local-features-xfeat) ·
+  [Instance segmentation](#instance-segmentation) ·
+  [Open-vocabulary detection (YOLOE)](#open-vocabulary-detection-yoloe) ·
+  [Promptable segmentation (EdgeSAM)](#promptable-segmentation-edgesam) ·
   [Oriented boxes (OBB)](#oriented-boxes-obb) ·
-  [Semantic segmentation](#semantic-segmentation) · [Depth](#depth) · [OCR](#ocr) ·
+  [Semantic segmentation](#semantic-segmentation) ·
+  [Monocular 3-D detection (SMOKE)](#monocular-3-d-detection-smoke) ·
+  [Lidar 3-D detection](#lidar-3-d-detection) ·
+  [Anomaly detection](#anomaly-detection-one-class) · [Optical flow](#optical-flow) ·
+  [End-to-end driving](#end-to-end-driving-camera--lidar--trajectory) ·
+  [Depth](#depth) · [Depth refinement](#depth-refinement-rgb-d) · [OCR](#ocr)
+- Speech: [Voice pipeline](#voice-pipeline) ·
   [Speech recognition](#speech-recognition-paraformer)
 - Media: [JPEG (JPU)](#jpeg-jpu) · [Video (VPU)](#video-vpu)
 - Tracking & pipelines: [ByteTracker](#bytetracker) · [DetectionPipeline](#detectionpipeline) ·
   [AsyncDetectionPipeline](#asyncdetectionpipeline) ·
+  [AsyncVideoDetectionPipeline](#asyncvideodetectionpipeline) ·
   [TrackingPipeline](#trackingpipeline) · [StereoPipeline](#stereopipeline)
 
 ## Linking
@@ -173,6 +187,7 @@ std::size_t obytes = engine.outputBytes(0);
 |--------|-------------|
 | `Engine(hbm_path, model_name="")` | Load a model (pick by name if the package holds several). |
 | `modelName()` | Active model name. |
+| `static modelNames(hbm_path)` | Every model name packed into the `.hbm`, without building an Engine — what to pass as `model_name`. A `.hbm` is a package; the SigLIP encoders, for one, hold two models. |
 | `numInputs()` / `numOutputs()` | Tensor counts. |
 | `inputName(i)` / `outputName(i)` | Tensor name as compiled (the ONNX name). |
 | `inputShape(i)` / `outputShape(i)` | `std::vector<int>` shape. |
@@ -191,7 +206,44 @@ std::size_t obytes = engine.outputBytes(0);
 
 > Prefer a **task class** (`Detector`, `Segmenter`, …) over reading
 > `outputData()` yourself — it dequantizes (F16/int8/int16) and de-strides for
-> you. Drop to the raw output only for a custom decoder.
+> you. Drop to the raw output only for a custom decoder, and even then read it
+> through `outputAsFloat()` ([below](#output-reader--input-writer)).
+
+## Output reader & input writer
+
+`bcdl/backend/output_reader.h`, `bcdl/backend/input_writer.h` — the float view of
+an Engine's tensors that every task class is built on. Use them when you decode
+(or feed) a model yourself, rather than reading `outputData()` or writing raw
+bytes.
+
+```cpp
+std::vector<float> scratch;            // reuse across frames
+std::vector<int> shape;
+const float* out = bcdl::outputAsFloat(engine, /*out_idx=*/0, scratch, shape);
+// logical row-major floats; valid until `scratch` is destroyed or the next infer()
+
+std::vector<std::uint8_t> stage;       // one per input, reused across frames
+std::size_t n = bcdl::inputElementCount(engine, /*in_idx=*/0);
+bcdl::setInputFromFloat(engine, /*in_idx=*/0, values, n, stage);   // quantizes if needed
+```
+
+| member | description |
+|---|---|
+| `outputAsFloat(engine, out_idx, scratch, shape)` | Logical row-major float view of output `out_idx`; fills `shape`. A packed F32 tensor comes back zero-copy (a pointer into the already-invalidated device buffer); F16, quantized-integer and stride-padded tensors are gathered and dequantized into `scratch`. |
+| `setInputFromFloat(engine, in_idx, data, count, scratch)` | Write `count` floats into input `in_idx` in the dtype the model declared: F32 as-is, an integer type (S8 … U32) as `round(value / scale) + zero_point` clamped to its range; `setInput()` then scatters the packed buffer into the device layout. |
+| `inputElementCount(engine, in_idx)` | Element count of the input's valid shape — what `count` must be. |
+| `sigmoid(x)` | The logistic sigmoid every YOLO-family decoder shares (header-only). |
+
+The zero-copy path is not a micro-optimization: detection, pose, segmentation
+and OBB heads emit 10^5–10^6 elements per frame, and skipping the gather is the
+difference between ~10 ms and ~1 ms of post-processing.
+
+`setInputFromFloat` exists for models compiled with **quantized inputs**. Their
+input buffer holds integers with a per-tensor (or per-axis) scale, and handed
+raw float bytes such a model runs on noise without an error anywhere. It throws
+`Error(-1)` when `count` does not match the valid shape, and for an F16 input —
+no model in this library has one, and an untested float→half path would be
+worse than a clear refusal.
 
 ---
 
@@ -219,10 +271,14 @@ bcdl::VpImage src(w, h, HB_VP_IMAGE_FORMAT_BGR);
 bcdl::VpImage nv12(inW, inH, HB_VP_IMAGE_FORMAT_NV12);
 bcdl::LetterboxInfo lb = bcdl::letterboxToNv12Cpu(nv12, src, /*padValue=*/114);
 // also: letterboxCpu(dstBgrOrY, src, pad) ; bgrToNv12Cpu(dstNv12, srcBgr)
+//       letterboxNv12Cpu(dstNv12, srcNv12, pad, range)   // NV12 -> NV12, no BGR
 ```
 
 `bgrToNv12Cpu` uses BT.601 **full-range** (matches cv2's `COLOR_BGR2YUV_I420`);
-verify against your model's calibrated range.
+verify against your model's calibrated range. `letterboxNv12Cpu` resamples each
+plane directly: luma is exact, chroma differs slightly from the BGR path (the UV
+plane is resampled at half resolution), and `range` (`YuvRange`, default
+`kStudioToFull`) says whether to expand a video decoder's studio-swing levels.
 
 **hbVP path** (`bcdl/preproc/letterbox.h`, DSP required): `letterbox(dst, src,
 padValue, interp)`, `cvtColor(dst, src)`, `resizeExact(dst, src, interp)`.
@@ -236,20 +292,47 @@ padValue, interp)`, `cvtColor(dst, src)`, `resizeExact(dst, src, interp)`.
 > frame. On a board where the DSP does come up, check the first output for
 > mirroring or a wrong scale before trusting it.
 
-**GDC hardware path** (`bcdl/preproc/gdc_letterbox.h`, `gdc_remap.h`; only
-when built with `BCDL_HAVE_GDC`) — fixed transforms on the VPS GDC engine,
-NV12 in/out, CPU idle during the op. Semantics + reverse-engineered
-CUSTOM-grid notes: [docs/GDC.md](GDC.md).
+**GDC hardware path** — `GdcLetterbox` and `GdcRemap` run fixed NV12
+transforms on the VPS GDC engine with the CPU idle; see
+[GDC hardware warp](#gdc-hardware-warp).
+
+## GDC hardware warp
+
+`bcdl/preproc/gdc_letterbox.h`, `bcdl/preproc/gdc_remap.h` (only when built with
+`BCDL_HAVE_GDC`) — fixed transforms on the VPS GDC engine, NV12 in / NV12 out,
+CPU idle during the op. Both classes generate their warp LUT at construction (no
+offline `.bin`) and keep a persistent vnode and device input buffer, so `run()`
+costs two NV12 copies around the hardware op; `BCDL_GDC_TIMING=1` prints the
+per-run breakdown. Semantics, the measured comparison with the CPU path, and the
+reverse-engineered CUSTOM-grid notes: [GDC.md](GDC.md).
 
 ```cpp
-// letterbox from an offline-generated AFFINE warp bin
-bcdl::GdcLetterbox lbg(binPath, inW, inH, outW, outH, /*pad=*/114);
-lbg.run(srcNv12, dstNv12);
+// letterbox: same geometry as computeLetterbox()
+bcdl::GdcLetterbox lbg(inW, inH, outW, outH, /*pad=*/114, bcdl::YuvRange::kAsIs);
+bcdl::LetterboxInfo lb = lbg.run(srcNv12, dstNv12);
 
 // arbitrary fixed dense remap (cv2.remap semantics), LUT generated at runtime
 bcdl::GdcRemap remap(mapX, mapY, inW, inH, outW, outH, /*gridStep=*/16);
 remap.run(srcNv12, dstNv12);   // 2448x2048: ~6.3 ms wall, ~1 ms CPU
 ```
+
+| member | description |
+|---|---|
+| `GdcLetterbox(in_w, in_h, out_w, out_h, pad=114, range=kAsIs)` | Open the GDC for one fixed letterbox. `range` must match what the model was calibrated on (see `YuvRange`); `pad` is a full-range luma value written after the conversion, so 114 stays 114. Throws on any hobot/GDC failure. |
+| `GdcLetterbox::run(src, dst)` | NV12 `in_w×in_h` → NV12 `out_w×out_h`, `dst` (re)allocated if needed; returns the `LetterboxInfo` for un-letterboxing. |
+| `info()` | The instance's fixed `LetterboxInfo`. |
+| `GdcRemap(map_x, map_y, in_w, in_h, out_w, out_h, grid_step=16)` | Dense row-major `(out_h, out_w)` float32 maps, cv2 convention: `out(x, y) = in(map_x[y,x], map_y[y,x])`. Sampled every `grid_step` px into a CUSTOM grid, so `out_w` and `out_h` must both be multiples of it (16 divides 2448 and 2048). Coordinates outside the input are clamped. |
+| `GdcRemap::run(src, dst)` | NV12 `in_w×in_h` → NV12 `out_w×out_h` on the GDC, `dst` (re)allocated if needed. |
+| `inputWidth()` · `inputHeight()` · `outputWidth()` · `outputHeight()` | On both classes. |
+
+`GdcRemap` is built for stereo rectification: the maps from
+`cv2.initUndistortRectifyMap` are smooth, so sampling them on a grid and letting
+the GDC interpolate between the nodes is enough. On real rectify maps it matches
+`cv2.remap` to mean 0.25 / p99 2 grey levels, at 6.3 ms against 14.7 ms for
+`cv2.remap` on all six cores. `GdcLetterbox` (1920×1080 → 640×640: 0.97 ms,
+~0.3 ms of it CPU) has the CPU letterbox's geometry exactly but is not
+bit-identical to it — the two resamplers alias differently on high-frequency
+detail, a difference measured below the model's noise floor end to end.
 
 ## VpImage
 
@@ -307,6 +390,53 @@ auto d = bcdl::decodeYoloLtrb(cls, box, grid_hw, cfg, lb);
 `reg_max > 0` selects the DFL head (`4*reg_max` box channels, softmax-reduced);
 `YoloLtrbDetector` auto-detects it from the box channel count.
 
+## Panoptic driving perception (YOLOP)
+
+`bcdl/tasks/panoptic_drive.h` — the library's one ANCHOR-BASED detection decode
+(the YOLOv5 formulation; everything else here is anchor-free LTRB/DFL). YOLOP
+feeds it from the same inference that yields its drivable-area and lane-line
+masks, which go through the ordinary `Segmenter`.
+
+```cpp
+struct Anchor { float w, h; };                               // model-input pixels
+struct AnchorDetectConfig { int num_classes=1; float conf_thresh=0.35f, iou_thresh=0.45f;
+                            int max_dets=300; std::vector<int> strides={8,16,32};
+                            std::vector<std::vector<Anchor>> anchors; };  // per scale, 3 each
+
+bcdl::Engine engine("models/yolop_cut_nashm_640x640_nv12.hbm");   // 5 outputs
+// centred letterbox to 640x640 NV12, feedNv12Input(engine, nv12), engine.infer()
+bcdl::AnchorDetector det(engine, bcdl::AnchorDetectConfig{}, /*output_base=*/0);
+std::vector<bcdl::Detection> cars = det.postprocess(lb);    // outputs 0-2
+
+bcdl::SegConfig sc; sc.num_classes = 2; sc.channels_first = true;
+bcdl::SegMask drivable = bcdl::Segmenter(engine, sc, /*output_index=*/3).postprocess();
+bcdl::SegMask lanes    = bcdl::Segmenter(engine, sc, /*output_index=*/4).postprocess();
+// pure: decodeYoloV5Anchor(raw, grid_hw, cfg, lb)
+```
+
+| member | description |
+|---|---|
+| `AnchorDetector(engine, cfg={}, output_base=0)` | Bind `strides.size()` consecutive raw head outputs; throws if they run past the model's outputs. |
+| `postprocess(lb)` | Dequantize and de-stride each head, take each scale's `(H, W)` from its own tensor, check its channel count is `na * (5 + num_classes)` — a wrong class count fails loudly instead of misreading columns — then decode and run one per-class NMS. |
+
+**Take the `_cut` build.** The published export decodes in-graph and emits a
+ready-made `[1, 25200, 6]` tensor, but that decode is assembled from `ScatterND`
+and does not survive BPU compilation: the compile succeeds, and the compiled
+tensor's objectness and class columns are simply never written, so a detector
+finds zero objects at any threshold. The shipped build is cut before the decode
+and emits the three raw head convolutions (`[1, na*(5+nc), H, W]`, unactivated),
+and the arithmetic runs here on the CPU. That is also 10× faster: the in-graph
+decode cost 28.33 ms on the device, against 2.80 ms (358 FPS) for the cut model's
+whole inference, all three heads. On real frames the CPU decode matches the
+export's own to 1.8e-4 over all 25200 candidates.
+
+The decode is the reference's: sigmoid on every attribute (xy and wh included),
+centre `(2·s − 0.5 + cell) · stride`, size `(2·s)² · anchor`, score = objectness ×
+best class. Anchor sizes are in pixels, not stride units, and every scale must
+carry the same number of them. The two masks come back on the model's
+640×640 letterboxed grid; `Segmenter` takes no `LetterboxInfo`, so crop the
+padding and resize them onto the frame yourself.
+
 ## Classification
 
 `bcdl/tasks/classification.h`
@@ -319,6 +449,124 @@ bcdl::Classifier clf(engine, cfg, /*output_index=*/0);
 std::vector<bcdl::ClsResult> top = clf.postprocess();   // after infer()
 // pure: decodeClassification(logits, num_classes, cfg)
 ```
+
+## Image embeddings
+
+`bcdl/tasks/embedding.h` — an image to a fixed-length unit vector, and a table to
+search such vectors in. One operation does two jobs: **zero-shot
+classification** dots the image vector against a table of class-name vectors,
+**retrieval** against a table built from gallery images.
+
+```cpp
+struct EmbedConfig { bool l2_normalize = true; };
+struct EmbedMatch { int index; float score; std::string label; };   // cosine, best first
+
+// a .hbm is a package: bind the POOLED submodel by name, not the package default
+std::vector<std::string> names = bcdl::Engine::modelNames(path);
+bcdl::Engine engine(path, pooled_name);
+bcdl::ImageEmbedder emb(engine);              // check emb.dim() once at startup
+
+// squashing resize to the input size (NOT a letterbox), RGB, x / 127.5 - 1, NCHW
+engine.setInput(0, x.data(), x.size() * sizeof(float));
+engine.infer();
+std::vector<float> v = emb.postprocess();     // L2-normalized
+
+bcdl::EmbeddingBank bank;                     // the first add() fixes dim()
+bank.add(gallery_vec, "img_0001.jpg");        // or a class name's text vector
+std::vector<bcdl::EmbedMatch> top = bank.search(v, /*k=*/5);
+// pure: decodeEmbedding(data, dim, cfg)
+```
+
+| member | description |
+|---|---|
+| `ImageEmbedder(engine, cfg={}, output_index=0)` | Bind one output; throws if the index is out of range. |
+| `ImageEmbedder::postprocess()` | Flatten the output to `dim()` floats (dequantized if needed) and normalize per `cfg`. |
+| `ImageEmbedder::dim()` | Product of the bound output's dims. |
+| `EmbeddingBank::add(vec, label="")` | Append one vector, normalized into the bank (the caller's copy is untouched). A length different from the first entry's throws `Error(-1)`. |
+| `EmbeddingBank::search(query, k=5)` | The `k` best entries by cosine, descending; `query` may be unnormalized. `k <= 0` or beyond `size()` returns every entry; an empty bank returns none; a wrong length throws. |
+| `size()` · `dim()` · `label(i)` | |
+
+**Bind the pooled submodel.** An embedding `.hbm` usually packs a pooled
+whole-image vector *and* a per-patch feature grid, and the constructor's default
+is whichever comes first. A pooled head is `[1, D]` and gives the tower's width;
+a patch head is `[1, N, D]` and flattens to `N*D`, which `ImageEmbedder` cannot
+tell from a very wide embedding — compare `dim()` with the tower's documented
+width. [`examples/embed_demo.cc`](../examples/embed_demo.cc) lists the names with
+`Engine::modelNames()` and binds the pooled one.
+
+**Squash, don't letterbox.** These towers were trained on a direct resize to a
+square; letterbox bars are pixels they never saw, and they move the vector
+enough to cost retrieval accuracy. An embedding carries no coordinates, so there
+is nothing to invert afterwards. `x / 127.5 - 1` on RGB is what the demo feeds
+SigLIP; check the model card before assuming it for another tower.
+
+Only the image tower runs on the board. A dual encoder's text tower runs once,
+offline, on a host, and its vectors for a fixed prompt set ship as a table to
+`add()`. `search()` is a linear scan, the right choice at board-sized tables
+(thousands of entries). SigLIP base/16 takes 19.3 ms per image; against the float
+model the per-image cosine is 0.9977–0.9995, and recall@1/@5 on a 200-image
+gallery is identical to float (0.9250 / 1.0000).
+
+## Face detection & alignment
+
+`bcdl/tasks/face.h` — SCRFD detection with five landmarks, and the alignment
+step recognition depends on. Recognition itself is an ordinary
+[image embedding](#image-embeddings): detect → align to 112×112 → embed → compare.
+
+```cpp
+struct FaceDetection { float x1, y1, x2, y2, score;
+                       std::vector<std::pair<float, float>> landmarks; };  // 5, original px
+struct FaceDetectConfig { float conf_thresh=0.5f, iou_thresh=0.4f; int max_faces=100;
+                          std::vector<int> strides={8,16,32}; int num_anchors=2; };
+
+bcdl::Engine det_engine("models/scrfd_10g_nashm_640x640_nv12.hbm");   // 9 outputs
+// SCRFD pads BOTTOM-RIGHT: the image sits at the top-left, so the letterbox has no pad
+bcdl::LetterboxInfo lb = bcdl::computeLetterbox(w, h, 640, 640, /*centerPad=*/false);
+// resize by lb.scale into the top-left of a zeroed 640x640 canvas, bgrToNv12Cpu,
+// feedNv12Input(det_engine, nv12), det_engine.infer()
+bcdl::FaceDetector det(det_engine, bcdl::FaceDetectConfig{}, /*output_base=*/0);
+std::vector<bcdl::FaceDetection> faces = det.postprocess(lb);
+
+std::vector<uint8_t> crop = bcdl::alignFace(bgr, w, h, /*src_stride=*/0,
+                                            faces[0].landmarks, /*size=*/112);
+bcdl::Engine rec_engine("models/arcface_r50_aligned_nashm_112x112.hbm");
+// crop -> RGB, (x - 127.5) / 127.5, NCHW float32 -> rec_engine.setInput(), infer()
+bcdl::ImageEmbedder rec(rec_engine);          // dim() == 512
+bcdl::EmbeddingBank people;
+people.add(rec.postprocess(), "alice");
+// pure: decodeScrfd(score, bbox, kps, counts, cfg, lb) · similarityTransform(src, dst) · arcFaceTemplate()
+```
+
+| member | description |
+|---|---|
+| `FaceDetector(engine, cfg={}, output_base=0)` | Bind `3 * strides.size()` outputs as three groups — every score, then every bbox, then every kps, the order the reference export emits them in; throws if the model has fewer. |
+| `FaceDetector::postprocess(lb)` | Decode every scale, threshold, run one NMS; boxes and landmarks in original-image pixels, boxes clamped to the image. Throws if a bbox or kps head is smaller than its score head implies. |
+| `alignFace(bgr, src_w, src_h, src_stride, landmarks, size=112)` | Warp the face onto `arcFaceTemplate()` scaled to `size` with the similarity transform; bilinear, edge-clamped; returns a packed `size*size*3` BGR crop. `src_stride` 0 means tightly packed; anything but five landmarks throws. |
+
+Landmarks come in the template's order: left eye, right eye, nose, left mouth
+corner, right mouth corner — "left" being the viewer's left.
+
+**This detector pads bottom-right.** Its reference preprocessing scales the
+image to fit and leaves it at the top-left corner, so its `LetterboxInfo` has
+`padX = padY = 0`; a centred letterbox shifts every box and landmark by the pad.
+The head is anchor-free distance regression with `num_anchors` predictions per
+cell, ordered (row, column, anchor); the cell centre sits ON the grid point, with
+no half-cell offset, and distances are in stride units. `num_anchors` must
+divide each tensor evenly, else `Error(-1)`.
+
+**Alignment is a correctness requirement, not a refinement.** The recognition
+model only ever saw faces warped so that eyes, nose and mouth corners land on
+the template; a plain crop of the box degrades its embeddings badly while
+erroring nowhere. `similarityTransform()` is the closed-form Umeyama solution
+(rotation + uniform scale + translation), deterministic, and unable to shear or
+stretch the face.
+
+Against the float reference on the same frames: landmarks 0.35 px mean / 0.89 px
+max, box corners 0.52 px mean; 60.2 ms detection (SCRFD-10G), 0.29 ms alignment.
+Recognition is 0.975 mean cosine against float (0.966 min). ArcFace's input rows
+are padded on the device (448 → 512 bytes); `setInput()` scatters a packed array
+into that layout, and before it did, the padding alone left the embeddings at
+0.015 cosine.
 
 ## Pose
 
@@ -373,10 +621,12 @@ by overlapping tiles and cross-fading.
 ```cpp
 struct SuperResConfig { int overlap; };          // input pixels
 struct SrImage { int width, height; std::vector<uint8_t> data; };  // BGR
+struct TilePlacement { int x, y; };              // one tile's origin, input pixels
 
 bcdl::SuperResolver sr(engine, cfg);
 auto big = sr.upscale(bgr, w, h, stride);        // sr.scale() times larger
-// pure: planTiles(w, h, tile_w, tile_h, overlap), tileWeight(i, len, ramp)
+int tiles = sr.lastTileCount();                  // tiles the last call ran; cost is linear in it
+// pure: planTiles(w, h, tile_w, tile_h, overlap) -> std::vector<TilePlacement>, tileWeight(i, len, ramp)
 ```
 
 `scale()` and `tile()` are read from the model's shapes, never configured. The
@@ -384,6 +634,12 @@ blend accumulates `w * pixel` and `w` and divides, so image borders need no
 special case. Note that the compiled `.hbm` scales with tile AREA — the same
 network is 148 MB at a 256 tile and 37 MB at 128, for identical per-pixel
 throughput.
+
+`planTiles` pushes the last tile on each axis flush against the far edge
+instead of letting it hang over, so the final overlap can be larger than asked
+but never smaller, and no tile reads outside the image. A side shorter than one
+tile gets a single origin at 0: `upscale()` edge-pads such an image up to the
+tile itself, a direct `planTiles` caller has to.
 
 ## Sparse local features (XFeat)
 
@@ -420,7 +676,8 @@ struct InstanceMask { float x1,y1,x2,y2,score; int class_id;
                       int mask_w, mask_h; std::vector<uint8_t> mask; }; // 0/1
 struct InstanceSegConfig { float conf_thresh, iou_thresh; int max_dets;
                            std::vector<int> strides; int proto_index=9;
-                           bool compute_masks=true; };
+                           bool compute_masks=true;
+                           int reg_max=0; };   // 0 = plain LTRB; set by the segmenter from the box head
 
 bcdl::InstanceSegmenter seg(engine, cfg, /*output_base=*/0);
 auto masks = seg.postprocess(lb, orig_w, orig_h);
@@ -429,6 +686,95 @@ auto masks = seg.postprocess(lb, orig_w, orig_h);
 ```
 
 Set `compute_masks=false` to get boxes/scores only and skip mask assembly.
+
+## Open-vocabulary detection (YOLOE)
+
+`bcdl/tasks/open_vocab.h` — a prompt-free YOLOE export has its vocabulary FIXED
+at export time: the CLIP text embeddings are folded into the classification
+convolution, so at runtime it is a plain anchor-free head and decodes through
+the existing classes unchanged — `YoloLtrbDetector` for a detection build,
+`InstanceSegmenter` for a segmentation build (both detect the DFL box head from
+its channel count). The only new state is the class-id → prompt-name table.
+
+```cpp
+struct LabelMap { std::vector<std::string> names; };   // + the members below
+
+bcdl::LabelMap labels = bcdl::LabelMap::fromFile("models/yoloe26m_indoor99_labels.txt");
+bcdl::InstanceSegConfig cfg; cfg.compute_masks = false;   // boxes only
+bcdl::InstanceSegmenter seg(engine, cfg);
+for (const auto& m : seg.postprocess(lb, orig_w, orig_h))
+  std::printf("%s %.2f\n", labels.name(m.class_id).c_str(), m.score);
+
+// a detection build: YoloLtrbConfig::num_classes must equal labels.size()
+```
+
+| member | description |
+|---|---|
+| `LabelMap::fromFile(path)` | One label per line, in class-id order; whitespace trimmed, blank lines dropped. Throws `std::runtime_error` if the file cannot be opened. |
+| `LabelMap::fromList(names)` | From an in-memory list. |
+| `size()` · `name(id)` | `name()` returns `"?"` for an id out of range instead of throwing. |
+
+Keep the `.hbm` and its labels file side by side: the file is the only record of
+what each class id means, and **a new vocabulary means a new export** —
+`fromList()` names the classes of a model, it does not change what the model
+detects. The shipped builds are YOLOE-11s with the COCO-80 classes (detection and
+segmentation) and YOLOE-26m with a fixed 99-class indoor vocabulary
+(segmentation; names in `yoloe26m_indoor99_labels.txt`).
+
+The indoor build is zero-shot — nothing was trained. On held-out Open Images
+indoor images it scores 0.484 mAP50 over the 25 classes with at least 20 boxes
+(float 0.478): on par with a supervised detector overall, not class by class.
+Monitors are a blind spot, and the navigation classes (stairs, elevators,
+escalators) score low enough to need a threshold below 0.25. Keep
+`compute_masks` off when boxes are enough — assembling the masks costs far more
+CPU time than the network costs on the BPU. Details:
+[MODELS.md](MODELS.md#the-indoor-yoloe-build-is-zero-shot).
+
+## Promptable segmentation (EdgeSAM)
+
+`bcdl/tasks/promptable_seg.h` — the tail of a SAM-family mask decoder (EdgeSAM,
+MobileSAM, SAM): pick the best candidate mask and binarize it. The session
+around it is two models — an image encoder run once per image, and a light
+prompt decoder run per click against the cached embedding.
+
+```cpp
+struct SamConfig { float mask_threshold = 0.0f; bool multimask = true; };
+struct SamMask { int index; float iou; int mask_w, mask_h;
+                 std::vector<uint8_t> mask; };           // Hm*Wm, 0/1, low resolution
+
+bcdl::Engine enc("models/edge_sam_encoder_nashm.hbm");
+bcdl::Engine dec("models/edge_sam_decoder_sp1_nashm.hbm");   // one point; _bp2 = a box
+// enc: longest side to 1024, pad bottom-right, RGB, raw 0-255 -> infer once per image
+// dec: the cached embedding, prompt coords in that 1024 canvas, SAM labels -> infer
+bcdl::SamMaskDecoder tail(dec, bcdl::SamConfig{}, /*masks_index=*/0, /*iou_index=*/1);
+bcdl::SamMask m = tail.postprocess();
+// pure: decodeSamMasks(low_res_logits, num_masks, mask_h, mask_w, iou_pred, cfg)
+```
+
+| member | description |
+|---|---|
+| `SamMaskDecoder(engine, cfg={}, masks_index=0, iou_index=1)` | Bind the decoder's mask-logit output (`[1,N,Hm,Wm]` or `[N,Hm,Wm]`) and its IoU output (`[1,N]` or `[N]`). Pass your build's indices; the masks output is the 4-D one. |
+| `SamMaskDecoder::postprocess()` | `decodeSamMasks()` on the current outputs; throws on an index out of range or a mask tensor of another rank. |
+
+`decodeSamMasks` takes the argmax-IoU candidate when `multimask` is set (else
+candidate 0, as also when `iou_pred` is null) and keeps `logit > mask_threshold`
+— SAM's 0.0 on raw logits is sigmoid > 0.5. The mask stays at the decoder's low
+resolution (256×256 for SAM); undoing the pad and resizing to the original image
+is the caller's job.
+
+**Only this tail is C++.** The two-stage session is the Python `SamSession`, and
+it is the reference for feeding the models: the encoder takes the image with its
+longest side resized to 1024 and padded bottom-right, BGR→RGB, as raw pixels
+(the ImageNet normalization is compiled into the encoder); the decoder takes the
+embedding, the prompt coordinates scaled into that canvas, and SAM labels (1 for
+a foreground point, 2 / 3 for a box's two corners), as inputs 0, 1 and 2. Each
+decoder build has a fixed prompt size: `_sp1` one point, `_bp2` a two-corner box.
+
+**The shipped decoders' IoU head is int8-degraded**, so `SamSession` picks the
+largest-area candidate rather than trust it. `SamMaskDecoder` has no area rule —
+with `multimask = true` it trusts the IoU head, with `multimask = false` it takes
+candidate 0 — so to select by area, read the logits with `outputAsFloat()` and
+pick yourself.
 
 ## Oriented boxes (OBB)
 
@@ -466,6 +812,53 @@ std::vector<uint8_t> bgr = bcdl::segColorize(m);   // (H*W*3) BGR palette
 
 `num_classes=0` infers C from the tensor; `argmaxed=true` if the model already
 emits ids.
+
+## Monocular 3-D detection (SMOKE)
+
+`bcdl/tasks/mono3d.h` — one camera image to KITTI-style 3-D boxes (Car, Cyclist,
+Pedestrian). CenterNet-style: a class heatmap locates each object's projected
+3-D centre, and an 8-channel regression map at that pixel, with the camera
+intrinsics, lifts it to a full box.
+
+```cpp
+struct CameraIntrinsics { float fx, fy, cx, cy; };   // the ORIGINAL image's, zero skew
+struct Mono3dBox { int class_id; float score; float x, y, z, h, w, l, yaw, alpha;
+                   std::array<float, 4> box2d; };    // camera frame, metres; box2d original px
+struct Mono3dConfig { int num_classes=3; float conf_thresh=0.25f; int max_dets=50;
+                      int nms_kernel=3; bool pred_2d=true;
+                      std::array<float, 2> depth_ref;               // {28.01, 16.32}
+                      std::vector<std::array<float, 3>> dim_ref; }; // per-class size priors
+
+// input: [1,3,384,1280] F32 RGB, /255 + ImageNet mean/std (not fused into the .hbm),
+// warped with the same scale-to-width map the decode uses
+bcdl::Mono3dDetector det(engine, bcdl::Mono3dConfig{}, /*output_base=*/0);  // cls, then reg
+bcdl::CameraIntrinsics K{fx, fy, cx, cy};            // from your calibration
+std::vector<bcdl::Mono3dBox> boxes = det.postprocess(orig_w, orig_h, K);
+// pure: computeMono3dFeatureXform(origW, origH, featW, featH) · decodeMono3d(cls, reg, H, W, cfg, featXform, K)
+```
+
+Boxes are in KITTI camera coordinates — +x right, +y down, +z forward, metres —
+and `(x, y, z)` is the box's BOTTOM centre; `yaw` is rotation_y about the camera
+Y axis, `alpha` the observation angle, and `box2d` the 3-D box projected with `K`
+and clamped to the image (`pred_2d`). The `Mono3dConfig` defaults are the
+reference SMOKE configuration.
+
+**The geometry is not a letterbox.** SMOKE scales to the image WIDTH and
+centres the height, cropping or padding vertically: `scale = featW / origW`,
+`padX = 0`, `padY = featH/2 − scale·origH/2`, which may be negative.
+`computeMono3dFeatureXform()` builds that map at feature resolution, and the
+384×1280 input warp is the same transform at 4× the scale. Preprocessing and
+decode must agree, and `K` stays the original image's intrinsics — the resize
+lives entirely in the transform, never folded into `K`.
+
+Both outputs are **raw logits, channel-first** (`[1, nc, 96, 320]` and
+`[1, 8, 96, 320]`, stride 4): the predictor's activations were stripped from the
+compiled graph, and the decode re-applies them — a clamped sigmoid on the
+heatmap, `sigmoid − 0.5` on the three dimension channels, L2 normalization of
+`(sin, cos)` — before the CenterNet max-pool NMS and top-`max_dets`, matching the
+SMOKE post-processor. `num_classes` comes from the cls tensor, never from `cfg`;
+`dim_ref` must cover it, and a reg head with fewer than 8 channels or on another
+grid throws `Error(-1)` instead of decoding garbage.
 
 ## Lidar 3-D detection
 
@@ -906,6 +1299,16 @@ reorder streams). Two ways to drive it:
   uses): `feed(data, size)` queues one AU; `receive(out, timeout_ms)` drains a
   frame in display order (`timeout_ms=0` non-blocking); `feedEndOfStream()` then
   `flush(out)` drain the reorder tail.
+
+The **encoder** has the same two forms: `encode(frame)` feeds one NV12 frame and
+waits briefly for a packet (the bytes produced by *this* call — possibly none);
+for a stream, `feed(frame, pts_us = 0) -> bool` queues a frame without waiting,
+`receive(out, timeout_ms = 0) -> bool` drains one packet, and after the last
+frame `flush(out)` — call until it returns `false` — signals end of stream and
+drains the rest (`feedEndOfStream()` queues the marker alone, idempotent).
+Drain after every `feed()`, and when it returns `false` because the input queue
+is full, drain and retry rather than treat it as fatal: generating a 1080p frame
+is far cheaper than encoding one, so a producer outruns the encoder easily.
 
 > **Feed one access unit, not arbitrary bytes.** The decoder runs in
 > `MC_FEEDING_MODE_FRAME_SIZE`: every `feed()`/`decode()` call must carry exactly

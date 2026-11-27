@@ -1,5 +1,7 @@
 # GDC — the VPS hardware warp engine (`/dev/gdc`)
 
+**English** | [简体中文](GDC.zh.md)
+
 The S100P's VPS block includes ARM's **GDC** (Geometric Distortion Correction)
 engine: a hardware warper that consumes NV12 and a pre-compiled "warp LUT"
 config, and produces the warped NV12 with the CPU idle. BCDL wraps it twice:
@@ -42,10 +44,11 @@ with. `BCDL_NO_GDC=1` switches the pipeline to the CPU path for A/B.
 **Detection-preproc geometry (1920×1080 NV12 → 640×640 letterbox), S100P:**
 `copy-in 0.23 + gdc-op 0.69 (CPU idle) + copy-out 0.05 = 0.97 ms/frame`, of which
 only 0.28 ms is CPU — against **4.71 ms/frame of pure CPU** for the equivalent
-`nv12ToBgrCpu` + `letterboxCpu` + `bgrToNv12Cpu` chain the video pipeline uses
-today; `AsyncVideoDetectionPipeline` uses the GDC path. (Measured via `GdcRemap`
-with an affine-equivalent dense map, since `GdcLetterbox` still needs an offline
-`.bin`; the hardware op is the same.)
+`nv12ToBgrCpu` + `letterboxCpu` + `bgrToNv12Cpu` chain the video pipeline used
+before its preprocessing went NV12-native. `AsyncVideoDetectionPipeline` now uses
+the GDC path, and its CPU fallback is `letterboxNv12Cpu`. (Measured via
+`GdcRemap` with an affine-equivalent dense map, from before `GdcLetterbox`
+generated its own LUT; the hardware op is the same.)
 
 ## GdcRemap
 

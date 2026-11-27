@@ -360,9 +360,10 @@ takes float32 NumPy arrays — **no Engine, no board, no model needed**.
     recogniser build (on the S100P it roughly halves the character error of the
     compiler's default mixed-precision int8 build *and* is ~2× faster); PP-OCRv5
     is kept as a fallback.
-  - **Open-vocabulary detection / segmentation** — **YOLOE** (prompt-free, ships a
-    COCO-80 label table `LabelMap`, reuses the LTRB / DFL decode — name classes
-    without retraining).
+  - **Open-vocabulary detection / segmentation** — **YOLOE** (prompt-free: the
+    vocabulary is folded into the head at export, so it reuses the LTRB / DFL
+    decode and a `LabelMap` names the classes — a new vocabulary is a re-export,
+    not a retrain).
   - **Promptable segmentation** — **EdgeSAM** interactive segmentation (point / box
     prompts; RepViT image encoder → cached embedding → prompt decoder two-stage,
     `SamSession`).
@@ -577,11 +578,11 @@ PYTHONPATH=build:python python scripts/board_bench.py --retry-until-clean 3
 |----------|----------------|
 | [`docs/API.md`](docs/API.md) | **Python API reference** — every class, config, and `decode_*` function, with a usage snippet per task. ([简体中文](docs/API.zh.md)) |
 | [`docs/CPP_API.md`](docs/CPP_API.md) | **C++ API reference** — the same surface in `namespace bcdl`, keyed to the headers. ([简体中文](docs/CPP_API.zh.md)) |
-| [`docs/MODELS.md`](docs/MODELS.md) | **Model catalogue** — every `.hbm` the examples and benchmarks use: origin, which build to take, and licence. |
-| [`docs/GDC.md`](docs/GDC.md) | **GDC hardware geometry** — hardware letterbox and dense remap: usage and limits. |
+| [`docs/MODELS.md`](docs/MODELS.md) | **Model catalogue** — every `.hbm` the examples and benchmarks use: origin, which build to take, and licence. ([简体中文](docs/MODELS.zh.md)) |
+| [`docs/GDC.md`](docs/GDC.md) | **GDC hardware geometry** — hardware letterbox and dense remap: usage and limits. ([简体中文](docs/GDC.zh.md)) |
 | [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) | Full on-board benchmark numbers + the annotated check images in the [Gallery](#gallery). |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to set up, build (on the board), test, and submit changes. |
-| [`CHANGELOG.md`](CHANGELOG.md) | Release notes (Keep a Changelog / SemVer). |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to set up, build (on the board), test, and submit changes. ([简体中文](CONTRIBUTING.zh.md)) |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release notes (Keep a Changelog / SemVer). ([简体中文](CHANGELOG.zh.md)) |
 
 Public headers live in [`include/bcdl/`](include/bcdl/); runnable programs in
 [`examples/`](examples/).
@@ -692,7 +693,8 @@ Contributions are welcome — issues and pull requests alike. See
 - **Commits** — keep them focused; follow the existing
   [Conventional Commits](https://www.conventionalcommits.org/) style in the log.
 - **Changelog** — note user-visible changes under `[Unreleased]` in
-  [`CHANGELOG.md`](CHANGELOG.md).
+  [`CHANGELOG.md`](CHANGELOG.md), and the same entry in the Chinese
+  [`CHANGELOG.zh.md`](CHANGELOG.zh.md) in the same commit.
 
 ## Acknowledgments
 

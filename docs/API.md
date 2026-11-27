@@ -11,22 +11,40 @@ under [`include/bcdl/`](../include/bcdl/) are the source of truth); the names ma
   [Conventions](#conventions)
 - Engine: [Engine](#engine)
 - Preprocessing: [Letterbox & geometry](#letterbox--geometry) ·
-  [NV12 helpers](#nv12-helpers)
+  [NV12 helpers](#nv12-helpers) ·
+  [GDC hardware ops](#gdc-hardware-ops-board-only)
 - Tasks: [Detection](#detection) · [Classification](#classification) ·
-  [Pose](#pose) · [Instance segmentation](#instance-segmentation) ·
+  [Image embeddings](#image-embeddings) ·
+  [Face](#face-detection-and-recognition) · [Pose](#pose) ·
+  [Whole-body pose](#whole-body-pose-133-keypoints) ·
+  [Super-resolution](#super-resolution-tiled) ·
+  [Sparse features (XFeat)](#sparse-local-features-xfeat) ·
+  [Instance segmentation](#instance-segmentation) ·
+  [Open-vocabulary (YOLOE)](#open-vocabulary-detection-yoloe) ·
+  [Promptable segmentation (EdgeSAM)](#promptable-segmentation-edgesam) ·
   [Oriented boxes (OBB)](#oriented-boxes-obb) ·
-  [Semantic segmentation](#semantic-segmentation) · [Depth](#depth) ·
+  [Semantic segmentation](#semantic-segmentation) ·
+  [Panoptic driving (YOLOP)](#panoptic-driving-yolop) ·
+  [Monocular 3-D (SMOKE)](#monocular-3-d-detection-smoke) ·
+  [Lidar 3-D](#lidar-3-d-detection) ·
+  [Anomaly detection](#anomaly-detection-one-class) ·
+  [Optical flow](#optical-flow) ·
+  [End-to-end driving](#end-to-end-driving-camera--lidar--trajectory) ·
+  [Depth](#depth) · [Depth refinement](#depth-refinement-rgb-d) ·
   [Stereo](#stereo) · [OCR](#ocr)
 - Speech: [Voice pipeline (start here)](#voice-pipeline) ·
   [Wake words](#keyword-spotting-wake-word) ·
   [VAD](#voice-activity-detection-silero-vad) ·
   [Recognition](#speech-recognition-paraformer) ·
   [Commands](#voice-commands-closed-set) ·
+  [Vocoder](#speech-synthesis-back-end-vocos) ·
   [Synthesis](#speech-synthesis-matcha-tts--vocos)
 - Streaming & tracking: [Tracking (ByteTrack)](#tracking-bytetrack) ·
   [TrackingPipeline](#trackingpipeline) ·
-  [AsyncDetectionPipeline](#asyncdetectionpipeline)
+  [AsyncDetectionPipeline](#asyncdetectionpipeline) ·
+  [AsyncVideoDetectionPipeline](#asyncvideodetectionpipeline)
 - Media: [Images & codecs](#images--codecs)
+- [C++ API](#c-api)
 
 > Naming: snake_case functions and `lower_case` config fields are the Python
 > spelling of the C++ camelCase members — without exception. Nine decoders used
@@ -107,7 +125,8 @@ outs = engine.infer([x])                     # outs[i] reshaped to output_shape(
 
 | member | description |
 |--------|-------------|
-| `Engine(hbm_path, model_name="")` | Load a model. `model_name` selects one packaged model if the `.hbm` holds several. |
+| `Engine(hbm_path, model_name="")` | Load a model. `model_name` selects one packaged model if the `.hbm` holds several; the default takes the first. |
+| `Engine.model_names(hbm_path) -> list[str]` | Static: every model packed into an `.hbm`, without loading it. |
 | `model_name -> str` | The active model's name. |
 | `num_inputs / num_outputs -> int` | Tensor counts. |
 | `input_name(i) / output_name(i) -> str` | Tensor name as compiled (the ONNX name). |
@@ -117,6 +136,7 @@ outs = engine.infer([x])                     # outs[i] reshaped to output_shape(
 | `input_stride(i) -> list[int]` | Resolved byte strides of input `i`, innermost last. |
 | `output_stride(i) -> list[int]` | Resolved byte strides of output `i`. Outputs pad too — reshaping the raw buffer flat shears the tensor. |
 | `output_packed_bytes(i) -> int` | Size of output `i` as a contiguous row-major array. Smaller than the device buffer when the model pads a dimension. |
+| `output_packed(i) -> bytes` | Output `i` gathered into a contiguous row-major array of its declared shape and dtype: padding removed, quantization left alone. `infer()` already returns this; it is for callers who drive the engine themselves. |
 | `input_dtype(i) / output_dtype(i) -> str` | NumPy dtype string (e.g. `"float32"`, `"float16"`, `"int8"`). |
 | `infer(inputs, timeout_ms=0) -> list[np.ndarray]` | Copy inputs into device buffers, run, return one array per output. `timeout_ms=0` blocks. |
 
@@ -143,6 +163,9 @@ ox, oy = lb.inv_x(x), lb.inv_y(y)   # model -> original pixel
 
 # One-shot CPU letterbox of a uint8 image (needs OpenCV):
 canvas, lb = bcdl.letterbox_numpy(img, dst_w, dst_h, pad=114)
+
+# The same letterbox into the NCHW float input of a float-input (QAT) model:
+x, lb = bcdl.letterbox_chw_float(img, 640, 640)    # (1, 3, 640, 640) float32
 ```
 
 - **`compute_letterbox(src_w, src_h, dst_w, dst_h, center_pad=True) -> LetterboxInfo`**
@@ -152,6 +175,13 @@ canvas, lb = bcdl.letterbox_numpy(img, dst_w, dst_h, pad=114)
   come back in original pixels.
 - **`letterbox_numpy(img, dst_w, dst_h, pad=114) -> (canvas, LetterboxInfo)`** —
   geometry matches the C++ VP letterbox; requires OpenCV.
+- **`letterbox_chw_float(img, dst_w, dst_h, pad=114, to_rgb=True, scale=1/255, mean=None, std=None) -> (nchw, LetterboxInfo)`**
+  — for a model whose input is `[1,3,H,W]` float32 rather than NV12 planes (a
+  QAT export). The same geometry as `letterbox_numpy`, then optional BGR→RGB,
+  `* scale`, optional per-channel `(x - mean) / std`, into a contiguous
+  `(1,C,H,W)` float32 array; the returned `lb` maps boxes back exactly as on the
+  NV12 path. Requires OpenCV. See [Detection](#detection) for the one-call
+  `detect_float`.
 
 ## NV12 helpers
 
@@ -211,7 +241,16 @@ for d in dets:
 # Anchor-free LTRB, high-level (NV12 two-input):
 det = bcdl.YoloLtrbDetector(engine, bcdl.YoloLtrbConfig())
 dets = det.detect([y_plane, uv_plane], lb)
+
+# The same head exported by QAT, with a [1,3,H,W] float32 input:
+dets = det.detect_float(bgr)            # letterbox_chw_float + detect([nchw], lb)
 ```
+
+**PTQ and QAT exports decode the same way.** The `hb_compile` (PTQ) export takes
+the NV12 `[Y, UV]` planes; a QAT export (horizon_plugin_pytorch / hbdk4) takes
+one `[1,3,H,W]` float32 tensor. Only the preprocessing differs — the LTRB head
+decode, sigmoid and NMS are identical — so `detect_float()` letterboxes and
+normalizes the original frame and decodes in one call.
 
 **`DetectConfig`** — `input_w`, `input_h`, `num_classes`, `conf_thresh`,
 `iou_thresh`, `max_dets`, `layout` (`DecodeLayout`), `channels_first`,
@@ -231,8 +270,8 @@ Functions / classes:
 | `decode` | `decode(output: f32 ndarray, config: DetectConfig, letterbox: LetterboxInfo) -> list[Detection]` |
 | `nms` | `nms(dets, iou_thresh, max_dets=300) -> list[int]` (indices to keep) |
 | `iou` | `iou(a: Detection, b: Detection) -> float` |
-| `Detector` | `Detector(engine, config, output_index=0)`; `.detect(model_input, lb, timeout_ms=0)`, `.config` |
-| `YoloLtrbDetector` | `YoloLtrbDetector(engine, config=None, output_base=0)`; `.detect([inputs], lb, timeout_ms=0)`, `.postprocess(lb)`, `.config` |
+| `Detector` | `Detector(engine, config, output_index=0)`; `.detect(model_input, lb, timeout_ms=0)`, `.postprocess(lb)` (decode the current output — for a multi-head model where one inference feeds several decoders), `.config` |
+| `YoloLtrbDetector` | `YoloLtrbDetector(engine, config=None, output_base=0)`; `.detect([inputs], lb, timeout_ms=0)`, `.detect_float(img_bgr, dst_w=640, dst_h=640, pad=114, to_rgb=True, scale=1/255, mean=None, std=None, timeout_ms=0)`, `.postprocess(lb)`, `.config` |
 
 ---
 
@@ -254,6 +293,137 @@ top = bcdl.decode_classification(logits.astype(np.float32), cfg)
   vector top-k.
 - **`Classifier(engine, config=None, output_index=0)`** — `.classify(inputs, timeout_ms=0)`,
   `.postprocess()`, `.config`.
+
+## Image embeddings
+
+An image in, one L2-normalized vector out, so that similarity becomes a dot
+product. Retrieval and zero-shot classification are the same operation against
+different tables: gallery-image vectors for one, text vectors for the other.
+Only the image tower of a dual encoder (SigLIP) runs on the board; the text
+tower runs once, offline on a host, and its outputs for your class prompts are a
+small table that ships beside the model.
+
+```python
+path = "models/bpu-siglip-base-patch16-224.hbm"
+print(bcdl.Engine.model_names(path))           # the .hbm packs several submodels
+emb = bcdl.ImageEmbedder(bcdl.Engine(path, "pooler_output"))   # bind the POOLED one
+v = emb.embed_image(bgr)                       # list[float], unit length, len == emb.dim
+
+bank = bcdl.EmbeddingBank()
+for label, img in gallery:                     # or text vectors computed on a host
+    bank.add(emb.embed_image(img), label)
+for m in bank.search(emb.embed_image(query), k=5):   # most similar first
+    print(m.index, m.label, m.score)           # score = cosine in [-1, 1]
+
+# numpy path:
+v = bcdl.decode_embedding(out.astype(np.float32))
+```
+
+Two traps this API is shaped around:
+
+- **Bind the pooled submodel.** An embedding `.hbm` is a package: SigLIP ships a
+  pooled whole-image vector and a per-patch feature grid in one file, and
+  `Engine(path)` takes the first. `ImageEmbedder` flattens its output, so the
+  patch grid comes back as a `num_patches * width` "embedding" — meaningless,
+  and nothing raises. Check `.dim` against the tower's documented width once at
+  startup.
+- **Preprocessing is a squashing resize, not a letterbox.** These towers were
+  trained on a direct resize to a square; letterbox bars are pixels they never
+  saw, and they move the vector enough to cost retrieval accuracy. Nothing needs
+  inverting afterwards — an embedding has no coordinates.
+
+Measured against the model author's float implementation on identical input
+tensors: per-image cosine 0.9977–0.9995, and recall@1 / @5 over a 200-image
+gallery identical to float (0.9250 / 1.0000).
+
+- **`EmbedConfig`** — `l2_normalize` (`True`; every similarity here assumes unit
+  vectors — turn it off only to read the raw pooled activations).
+- **`decode_embedding(data, config=EmbedConfig()) -> list[float]`** — a flat
+  float array read as one embedding. A zero vector comes back unchanged rather
+  than as NaNs.
+- **`embed_preprocess(img, size=224, to_rgb=True, scale=1/127.5, shift=-1.0) -> np.ndarray`**
+  — BGR image → `(1,3,size,size)` float32: squashing resize, then
+  `x * scale + shift` (the usual `x/127.5 - 1`) on RGB. Check the model card
+  before assuming another tower uses the same convention. Requires OpenCV.
+- **`ImageEmbedder(engine, config=None, output_index=0)`** —
+  `.embed(model_input, timeout_ms=0)`, `.embed_image(img_bgr, size=224, timeout_ms=0)`
+  (`embed_preprocess` then `embed`), `.postprocess()`, `.dim` (product of the
+  bound output's shape), `.config`.
+- **`EmbeddingBank()`** — `.add(vec, label="")`, `.search(query, k=5) -> list[EmbedMatch]`,
+  `.label(index)`, `.dim`, `len()`. Both sides are normalized for you, so raw
+  vectors are fine. The first `add()` fixes `dim`; a vector of another length
+  raises on `add()` and on `search()`. `k <= 0` or beyond the entry count returns
+  every entry, sorted; an empty bank returns `[]`. A linear scan — the right
+  choice at the thousands of entries that fit on a board.
+- **`EmbedMatch`** — `index`, `score` (cosine), `label` (empty when added without
+  one); `__repr__`.
+
+For a single pair of vectors, `cosine_similarity(a, b)` gives the same score
+without a bank — see [Appearance (ReID)](#appearance-reid).
+
+## Face detection and recognition
+
+Detect → align → embed → compare. Detection is SCRFD — a box plus five
+landmarks; recognition needs no task of its own: the aligned crop goes through
+`ImageEmbedder` and matching is `EmbeddingBank`. The step in between is the one
+that decides whether recognition works. The recognition model only ever saw
+faces warped so the eyes, nose and mouth corners sit on a fixed 112×112
+template, and a plain crop of the box degrades its embeddings badly while
+erroring nowhere.
+
+```python
+det = bcdl.FaceDetector(bcdl.Engine("models/scrfd_10g_nashm_640x640_nv12.hbm"))
+canvas, lb = bcdl.face_letterbox(bgr, 640)     # pads BOTTOM-RIGHT, not centred
+nv12 = bcdl.bgr_to_nv12(canvas)
+faces = det.detect([nv12[:640], nv12[640:]], lb)   # NV12 [Y, UV]
+for f in faces:
+    print(f.score, f.x1, f.y1, f.x2, f.y2, f.landmarks)   # 5 (x, y), original px
+
+rec = bcdl.ImageEmbedder(bcdl.Engine("models/arcface_r50_aligned_nashm_112x112.hbm"))
+crop = bcdl.align_face(bgr, faces[0].landmarks)   # (112, 112, 3) BGR on the template
+v = rec.embed_image(crop, 112)                 # 512-d unit vector
+```
+
+**The padding convention is the detector's own.** SCRFD's reference
+preprocessing puts the image at the top-left and pads bottom-right, so
+`face_letterbox` returns a `LetterboxInfo` with `pad_x = pad_y = 0`. A centred
+letterbox (`letterbox_numpy`) shifts every box and landmark by the pad.
+`embed_image`'s default normalization (RGB, `x/127.5 - 1`) is the one the
+ArcFace build takes.
+
+Against the float reference on the same frames: landmarks 0.35 px mean /
+0.89 px max, box corners 0.52 px mean; 60.2 ms detection, 0.29 ms alignment.
+Recognition end to end on the board: 0.975 mean cosine against the float model
+(0.966 min).
+
+- **`FaceDetectConfig`** — `conf_thresh` (0.5), `iou_thresh` (0.4), `max_faces`
+  (100), `strides` (`[8,16,32]`), `num_anchors` (predictions per cell; 2 for the
+  standard export).
+- **`FaceDetection`** — `x1, y1, x2, y2`, `score`, `landmarks` (five `(x, y)` in
+  original pixels: left eye, right eye, nose, left mouth corner, right mouth
+  corner — "left" is the viewer's left); `__repr__`.
+- **`FaceDetector(engine, config=None, output_base=0)`** —
+  `.detect([inputs], lb, timeout_ms=0)`, `.postprocess(lb)`, `.config`. Reads
+  `3 * len(strides)` outputs as three groups — every score, then every box, then
+  every landmark tensor — the order the reference export emits them in.
+- **`decode_scrfd(score, bbox, kps, config, letterbox) -> list[FaceDetection]`** —
+  numpy path; per-stride lists of `[N,1]` (already sigmoid) / `[N,4]` / `[N,10]`
+  with `N = H*W*num_anchors`, ordered (row, column, anchor), anchors fastest. Box
+  distances and landmark offsets are in stride units from the grid point (no
+  half-cell offset). The grid must be square: a count that is not
+  `num_anchors` times a perfect square raises.
+- **`face_letterbox(img, size=640) -> (canvas, LetterboxInfo)`** — scale to fit,
+  pad bottom-right with black. Requires OpenCV.
+- **`arcface_template() -> list[(x, y)]`** — the canonical five points in a
+  112×112 crop, in `landmarks` order.
+- **`similarity_transform(src, dst) -> list[float]`** — `[a, b, tx, c, d, ty]`
+  for `x' = a*x + b*y + tx`, `y' = c*x + d*y + ty`. Closed-form Umeyama:
+  rotation, uniform scale and translation only, so it cannot shear or stretch a
+  face, and deterministic, so the same face aligns identically every time.
+- **`align_face(bgr, landmarks, size=112) -> np.ndarray`** — `(size, size, 3)`
+  uint8 BGR, warped so the five `landmarks` land on the template scaled to
+  `size`. Bilinear; reads outside the image clamp to the edge. Any other
+  landmark count raises.
 
 ## Pose
 
@@ -319,9 +489,11 @@ print(sr.last_tile_count, "tiles")
 - **`SuperResConfig`** — `overlap` (input pixels; also the cross-fade width).
 - **`SuperResolver(engine, config=None, input_index=0, output_index=0)`** —
   `.upscale(bgr, timeout_ms=0)`, `.scale`, `.tile`, `.last_tile_count`.
-- **`plan_tiles(width, height, tile_w, tile_h, overlap)`** → tile origins. The
-  last tile on each axis is flush with the far edge, so the real overlap there
-  can exceed the requested one.
+- **`plan_tiles(width, height, tile_w, tile_h, overlap) -> list[TilePlacement]`**
+  — tile origins. The last tile on each axis is flush with the far edge, so the
+  real overlap there can exceed the requested one.
+- **`TilePlacement`** — `x`, `y` (read-only): one tile's top-left corner in input
+  pixels.
 - **`tile_weight(i, len, ramp)`** — the cross-fade weight, always > 0 so the
   normalized blend needs no border special-casing.
 
@@ -369,7 +541,9 @@ for m in seg.detect([y_plane, uv_plane], lb, orig_w, orig_h):
 ```
 
 - **`InstanceSegConfig`** — `conf_thresh`, `iou_thresh`, `max_dets`, `strides`,
-  `proto_index`, `compute_masks` (set `False` to skip mask assembly for speed).
+  `proto_index`, `compute_masks` (set `False` to skip mask assembly for speed),
+  `reg_max` (DFL bins of the box head, `0` = plain LTRB; read by the numpy
+  `decode_*` path — `InstanceSegmenter` derives it from the box head's channel count).
 - **`InstanceMask`** — `x1, y1, x2, y2, score, class_id`, `mask_w, mask_h`,
   `mask` (`(H,W)` uint8 0/1; empty when `compute_masks=False`).
 - **`InstanceSegmenter(engine, config=None, output_base=0)`** —
@@ -378,6 +552,91 @@ for m in seg.detect([y_plane, uv_plane], lb, orig_w, orig_h):
 - **`decode_instance_seg(cls, box, mc, proto, config, letterbox, orig_w, orig_h) -> list[InstanceMask]`**
   — numpy path; `cls/box/mc` per-stride `[H,W,nc]`/`[H,W,4]`/`[H,W,np]`, `proto`
   `[mH,mW,np]`.
+
+## Open-vocabulary detection (YOLOE)
+
+A prompt-free YOLOE export has its vocabulary folded into the classification
+head when it is exported, so on the board it is an ordinary anchor-free head:
+boxes decode through `YoloLtrbDetector`, boxes plus masks through
+`InstanceSegmenter`, both unchanged. The only new state is the class-id → prompt
+table, `LabelMap`.
+
+```python
+names = bcdl.LabelMap.from_file("models/yoloe26m_indoor99_labels.txt")   # one prompt per line
+cfg = bcdl.InstanceSegConfig(); cfg.compute_masks = False      # boxes only
+seg = bcdl.InstanceSegmenter(
+    bcdl.Engine("models/yoloe26m_indoor99_seg_nashm_640x640_nv12.hbm"), cfg)
+for m in seg.detect([y_plane, uv_plane], lb, orig_w, orig_h):
+    print(names.name(m.class_id), m.score)
+
+# a detection build: num_classes must equal the table's length
+names = bcdl.LabelMap.from_list(coco80)        # your own list of 80 names
+cfg = bcdl.YoloLtrbConfig(); cfg.num_classes = len(names)
+det = bcdl.YoloLtrbDetector(
+    bcdl.Engine("models/yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm"), cfg)
+```
+
+Keep the `.hbm` and its label file side by side: the class order is the file's
+line order. The library ships no label table — `LabelMap()` is empty — so a
+COCO-80 build needs the 80 names from you. Leave `compute_masks` off when only
+boxes are needed: assembling the masks costs far more CPU time than the BPU
+spends on the network. Measured speed of the two YOLOE-11s builds is in
+[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) (`yoloe_det`, `yoloe_seg`). What the zero-shot indoor build is good and bad at —
+screens are a blind spot, navigation classes score low — is in
+[MODELS.md](MODELS.md#the-indoor-yoloe-build-is-zero-shot).
+
+- **`LabelMap()`** (empty) · **`LabelMap.from_file(path)`** (one label per line;
+  surrounding whitespace trimmed, blank lines dropped; a missing file raises) ·
+  **`LabelMap.from_list(names)`**.
+- `.names` (read/write list), `len()`, `.name(class_id)` — `"?"` for an id
+  outside the table, never an exception.
+
+## Promptable segmentation (EdgeSAM)
+
+Click a point or drag a box, get that object's mask. EdgeSAM is two models: an
+image encoder that runs once per image, and a small prompt decoder that runs per
+prompt against the cached embedding — so repeated clicks on one image are cheap.
+
+```python
+sam = bcdl.SamSession(bcdl.Engine("models/edge_sam_encoder_nashm.hbm"),
+                      bcdl.Engine("models/edge_sam_decoder_sp1_nashm.hbm"),
+                      box_decoder=bcdl.Engine("models/edge_sam_decoder_bp2_nashm.hbm"))
+sam.set_image(bgr)                             # the encoder, once; embedding cached
+mask, idx = sam.predict(420, 310)              # one foreground click, original px
+mask, idx = sam.predict_box(100, 80, 500, 400) # needs box_decoder
+# mask: (H, W) uint8 0/1 at the ORIGINAL image size
+
+# numpy path — the decoder tail only:
+sm = bcdl.decode_sam_masks(low_res_logits, iou_pred, bcdl.SamConfig())   # [Nmask,Hm,Wm], [Nmask]
+```
+
+**Each deployed decoder takes a fixed number of points** — its shapes were frozen
+at conversion: `sp1` takes one click, `bp2` the two corners of a box, and
+`predict_box` without a `box_decoder` raises. **The mask is chosen by area, not
+by predicted IoU**: the IoU head is degraded by int8 quantization, so
+`select="area"` takes the largest of the multimask candidates; pass an integer to
+force one. `set_image` resizes the longest side to `input_size`, pads
+bottom-right and flips to RGB; the ImageNet normalization is compiled into the
+encoder, so raw pixels go in.
+
+- **`SamSession(encoder, decoder, box_decoder=None, input_size=1024)`** —
+  `.set_image(bgr)` (returns the session), `.predict(x, y, label=1, select="area") -> (mask, index)`,
+  `.predict_box(x1, y1, x2, y2, select="area") -> (mask, index)`. Coordinates
+  are original-image pixels; `label` is SAM's point label (1 = foreground). The
+  engines' outputs are read as packed float, and a quantized-integer output is
+  refused. Requires OpenCV.
+- **`SamConfig`** — `mask_threshold` (0.0, applied to the raw logits, as SAM
+  does), `multimask` (`True`: argmax predicted IoU; `False`: candidate 0).
+- **`SamMask`** — `index`, `iou`, `mask_w`, `mask_h`, `mask` (`(Hm,Wm)` uint8 0/1
+  at the decoder's **low resolution** — mapping it back to the image is the
+  caller's job).
+- **`SamMaskDecoder(engine, config=None, masks_index=0, iou_index=1)`** —
+  `.postprocess() -> SamMask`, `.config`: the tail alone, over a decoder engine
+  you drive yourself.
+- **`decode_sam_masks(low_res_logits, iou_pred, config) -> SamMask`** — numpy
+  path; `[Nmask,Hm,Wm]` logits and `[Nmask]` IoU. An `iou_pred` of another length
+  is ignored and candidate 0 is used. Both this and `SamMaskDecoder` select by
+  predicted IoU, which on the shipped int8 decoder is the unreliable choice.
 
 ## Oriented boxes (OBB)
 
@@ -424,6 +683,126 @@ mask = bcdl.decode_seg(logits.astype(np.float32), cfg)
 - **`seg_colorize(mask) -> np.ndarray`** — `(H,W,3)` uint8 fixed palette.
 - **`Segmenter(engine, config=None, output_index=0)`** — `.segment(model_input, timeout_ms=0)`,
   `.postprocess()`, `.config`.
+
+## Panoptic driving (YOLOP)
+
+One inference, three heads: vehicle boxes from an anchor-based detector, plus
+drivable-area and lane-line masks through the ordinary `Segmenter`. The detector
+is the library's only anchor-BASED decode — a cell predicts an offset from its
+centre and a multiplier on a prior box, rather than distances to the box edges —
+and it runs on the CPU.
+
+```python
+engine = bcdl.Engine("models/yolop_cut_nashm_640x640_nv12.hbm")  # 3 det heads, drivable, lane
+det = bcdl.AnchorDetector(engine, bcdl.AnchorDetectConfig(), output_base=0)
+scfg = bcdl.SegConfig(); scfg.num_classes = 2; scfg.channels_first = True
+drivable = bcdl.Segmenter(engine, scfg, output_index=3)
+lane = bcdl.Segmenter(engine, scfg, output_index=4)
+
+canvas, lb = bcdl.letterbox_numpy(bgr, 640, 640)
+nv12 = bcdl.bgr_to_nv12(canvas)
+cars = det.detect([nv12[:640], nv12[640:]], lb)   # infers once; boxes in original px
+road = drivable.postprocess()                  # the same inference, the other heads:
+lines = lane.postprocess()                     # SegMask over the 640x640 letterboxed canvas
+```
+
+The boxes come back in original pixels; the two masks stay on the model's
+letterboxed canvas.
+
+**Use the `_cut` build.** The published export bakes the anchor decode into the
+graph with ScatterND, and that compiles without an error into a model whose
+objectness and class columns are never written — only two of every eight floats
+carry data, all of them coordinates — so a detector finds zero objects at any
+threshold. The graph is cut before the decode, exporting the three raw head
+convolutions, and `decode_yolov5_anchor` does the arithmetic; it matches the
+in-graph decode to 1.8e-4 over all 25200 candidates. It is also 10× faster: one
+inference feeds all three heads at 2.80 ms / 358 FPS (plus 2.64 ms of CPU
+post-processing), where the in-graph decode cost 28.33 ms.
+
+- **`Anchor(w, h)`** — one prior box in **model-input pixels** (not normalized,
+  not stride units); `w`, `h` read/write. `Anchor()` constructs one to fill in.
+- **`AnchorDetectConfig`** — `num_classes` (1), `conf_thresh` (0.35),
+  `iou_thresh` (0.45), `max_dets` (300), `strides` (`[8,16,32]`, in output
+  order), `anchors` (one list of `Anchor` per stride, the same count on every
+  stride; the defaults are the priors the YOLOP build uses).
+- **`AnchorDetector(engine, config=None, output_base=0)`** —
+  `.detect([inputs], lb, timeout_ms=0)`, `.postprocess(lb)`, `.config`. Reads
+  `len(strides)` consecutive outputs from `output_base`, and checks each one's
+  channel count against `na * (5 + num_classes)`, so a wrong class count fails
+  loudly instead of misreading columns. `.postprocess(lb)` is the entry point for
+  a multi-head model: infer once, then decode each head.
+- **`decode_yolov5_anchor(raw, config, letterbox) -> list[Detection]`** — numpy
+  path; one **unactivated** `[na*(5+nc),H,W]` (or `[1,na*(5+nc),H,W]`) head per
+  stride. Every attribute goes through a sigmoid `s`; then
+  `xy = (2s - 0.5 + grid) * stride`, `wh = (2s)^2 * anchor`,
+  `score = objectness * max(class)`. Candidates from every stride are pooled into
+  one per-class NMS, and boxes are clamped to the source image. Lengths of `raw`,
+  `strides` and `anchors` that disagree raise.
+
+## Monocular 3-D detection (SMOKE)
+
+One camera image in, 3-D boxes out — position, size and heading in camera
+coordinates, metres — for KITTI's car, cyclist and pedestrian. SMOKE is
+CenterNet-style: a class heatmap locates each object's projected 3-D centre, and
+eight regression channels at that pixel lift it to a box given the camera
+intrinsics.
+
+```python
+K = bcdl.CameraIntrinsics(fx, fy, cx, cy)      # of the ORIGINAL image
+h, w = bgr.shape[:2]
+xf = bcdl.compute_mono3d_feature_xform(w, h, 1280, 384)   # fit the width, centre the height
+m = np.float32([[xf.scale, 0, xf.pad_x], [0, xf.scale, xf.pad_y]])
+rgb = cv2.warpAffine(bgr, m, (1280, 384))[..., ::-1] / 255.0
+x = ((rgb - (0.485, 0.456, 0.406)) / (0.229, 0.224, 0.225)).transpose(2, 0, 1)[None]
+
+det = bcdl.Mono3dDetector(engine)              # input [1,3,384,1280] float32 RGB
+for b in det.detect(x.astype(np.float32), w, h, K):
+    print(b.class_id, b.score, (b.x, b.y, b.z), (b.h, b.w, b.l), b.yaw)
+
+# numpy path (raw cls/reg logits on the 320x96 feature grid):
+boxes = bcdl.decode_mono3d(cls, reg, bcdl.Mono3dConfig(),
+                           bcdl.compute_mono3d_feature_xform(w, h, 320, 96), K)
+```
+
+**The geometry is not a letterbox.** SMOKE scales the image to the input
+**width** and centres the height, cropping or padding vertically rather than
+fitting both sides. The input warp and the decode's feature-map transform must
+be the same map (the feature grid is the input at 1/4 scale), and
+`compute_mono3d_feature_xform` builds it at either size; `pad_y` goes negative
+when the height is cropped. **`K` stays the original image's**: the resize is
+carried entirely by that transform, never folded into the intrinsics. The
+normalization is not compiled into the model — feed `/255`, then the ImageNet
+mean and std.
+
+The head's activations were stripped from the compiled graph, so both outputs
+are raw logits and the decoder re-applies them (sigmoid on the heatmap,
+`sigmoid - 0.5` on the size channels, L2 on the orientation pair). On the same
+raw logits it reproduces upstream SMOKE's own post-processor box for box.
+
+- **`CameraIntrinsics(fx, fy, cx, cy)`** (or `CameraIntrinsics()` and set the
+  fields) — pinhole, zero skew, of the original image. A different class from
+  depth refinement's `Intrinsics`.
+- **`Mono3dConfig`** — `num_classes` (taken from the cls tensor), `conf_thresh`
+  (0.25), `max_dets` (50 — the top-K peaks taken before the threshold),
+  `nms_kernel` (3, the heatmap max-pool window), `pred_2d` (`True`: also project
+  each box to `box2d`), `depth_ref` (`[28.01, 16.32]`:
+  `z = offset * ref[1] + ref[0]`), `dim_ref` (per-class size priors, one
+  `(l, h, w)` row per class, KITTI car / cyclist / pedestrian by default). The
+  defaults are the reference SMOKE config's.
+- **`Mono3dBox`** — `class_id` (0 car, 1 cyclist, 2 pedestrian), `score`,
+  `x, y, z` (the box's **bottom** centre; KITTI camera axes, +x right, +y down,
+  +z forward), `h, w, l` (metres), `yaw` (rotation about the camera's y axis,
+  radians), `alpha` (observation angle), `box2d` (`[x1, y1, x2, y2]` of the
+  projected box in original pixels, when `pred_2d`); `__repr__`.
+- **`compute_mono3d_feature_xform(orig_w, orig_h, feat_w, feat_h) -> LetterboxInfo`**
+  — `scale = feat_w / orig_w`, `pad_x = 0`, `pad_y = feat_h/2 - scale*orig_h/2`.
+  Not `compute_letterbox`, which fits both sides.
+- **`decode_mono3d(cls, reg, config, feat_xform, K) -> list[Mono3dBox]`** — numpy
+  path; channel-first `[nc,H,W]` and `[8,H,W]` raw logits (a leading 1 is
+  accepted); `config.num_classes` is taken from `cls`. Sorted by score.
+- **`Mono3dDetector(engine, config=None, output_base=0)`** —
+  `.detect(image, orig_w, orig_h, K, timeout_ms=0)`, `.postprocess(orig_w, orig_h, K)`,
+  `.config`. Reads cls at `output_base` and reg at `output_base + 1`.
 
 ## Lidar 3-D detection
 
@@ -1235,6 +1614,11 @@ for frame in stream:
   **squashing** resize (not a letterbox: these models are trained on squashed
   crops), BGR→RGB, ImageNet normalization, NCHW float32.
 - **`ReidConfig`** — `mean`, `std`.
+- **`normalize_embedding(embedding) -> list[float]`** — L2-normalize a 1-D
+  float32 vector (a zero vector stays zero).
+- **`cosine_similarity(a, b) -> float`** — in `[-1, 1]`. It normalizes
+  internally, so the inputs need not be unit vectors; a length mismatch or a
+  zero vector gives 0 rather than an error.
 
 The model runs **once per crop**, so on a crowded frame it, not the detector,
 sets the frame time. Note that **int8 PTQ is not adequate for OSNet** — see the
@@ -1392,6 +1776,7 @@ so they only run on the board.
 jpg = bcdl.jpeg_encode(bgr, quality=80)       # bytes
 img = bcdl.jpeg_decode(jpg)                    # VpImage (NV12)
 planes = img.to_numpy()                        # see VpImage.to_numpy below
+n = bcdl.jpeg_save(bgr, "out.jpg")             # JPU encode + write; bytes written
 
 # Reuse a decoder for a stream (re-creating one per call adds ~5 ms JPU setup):
 dec = bcdl.JpegDecoder()
@@ -1407,9 +1792,9 @@ chunk = enc.encode(vp_image)                   # bytes (may be empty if buffered
 dc = bcdl.VideoDecConfig(); dc.type = bcdl.VideoType.H265   # or .H264
 dec = bcdl.VideoDecoder(dc)
 frame = dec.decode(nal_bytes)                  # VpImage or None while buffering
-# Decoupled feed/drain (handles H.265 reorder): feed arbitrary bytes, drain in
-# display order, flush the reorder tail at end-of-stream.
-dec.feed(chunk_bytes)                           # queue bytes (no AU split needed)
+# Decoupled feed/drain (handles H.265 reorder): feed one access unit per call,
+# drain in display order, flush the reorder tail at end-of-stream.
+dec.feed(au_bytes)                              # ONE access unit (start-code-prefixed NALs)
 while (f := dec.receive(0)) is not None: ...    # non-blocking drain (0 = no wait)
 while (f := dec.flush()) is not None: ...        # after last feed: reorder tail
 ```
@@ -1429,16 +1814,34 @@ while (f := dec.flush()) is not None: ...        # after last feed: reorder tail
   (width must align to 16, height to 8).
 - **`JpegDecoder(out_format=NV12)`** — `.decode(bytes) -> VpImage`. **Reuse one
   instance** across a stream; constructing per call costs ~5 ms.
-- **`jpeg_encode(bgr, quality=50) -> bytes`** · **`jpeg_decode(data) -> VpImage`**
-  — one-shot convenience wrappers (need OpenCV + even dims).
+- **`jpeg_encode(image, quality=50) -> bytes`** · **`jpeg_decode(data) -> VpImage`**
+  — one-shot convenience wrappers. `image` is an `(H,W,3)` uint8 BGR array or an
+  NV12 `VpImage` (straight from `jpeg_decode` or `GdcLetterbox`, no BGR round
+  trip). A BGR image off the JPU's 16×8 alignment is padded with a black
+  bottom/right border, and the padded size is what gets encoded; a misaligned
+  NV12 `VpImage` is refused. The BGR path needs OpenCV.
+- **`jpeg_save(image, path, quality=90) -> int`** — `jpeg_encode` then write to
+  `path`; returns the bytes written. The JPU counterpart of `cv2.imwrite`. Note
+  its default quality is 90, not `jpeg_encode`'s 50.
 - **`VideoType`** enum — `H264`, `H265`.
 - **`VideoEncConfig`** — `type`, `width`, `height`, `bitrate_kbps`, `framerate`,
   `intra_period`, `format`.
 - **`VideoEncoder(config)`** — `.encode(frame: VpImage) -> bytes` (empty when the
-  encoder buffered the frame); `.type/.width/.height/.format`.
+  encoder buffered the frame); `.type/.width/.height/.format`. Decoupled, for a
+  stream: `.feed(frame, pts_us=0) -> bool` queues one NV12 frame without waiting
+  (`False` = the input queue is full: drain with `receive()` and retry — feeding
+  1080p faster than the encoder runs gets there quickly), `.receive(timeout_ms=0)
+  -> bytes | None` drains one packet (`0` = no wait), `.flush() -> bytes | None`
+  signals end of stream and drains the rest — call until `None` —, and
+  `.feed_end_of_stream()` queues the marker without draining (idempotent).
 - **`VideoDecConfig`** — `type`, `format`, `in_buf_size`.
 - **`VideoDecoder(config)`** — `.decode(data) -> VpImage | None` (`None` while
-  buffering reference frames); `.type/.format`.
+  buffering reference frames); `.type/.format`. Decoupled, as in the snippet
+  above: `.feed(data) -> bool` (**exactly one access unit per call** — the codec
+  runs in frame-size feeding mode; to push arbitrary Annex-B chunks, use
+  `AsyncVideoDetectionPipeline.submit()`, which splits them), `.receive(timeout_ms=0) ->
+  VpImage | None` (display order), `.flush() -> VpImage | None` (the reorder tail
+  after the last feed — call until `None`).
 
 ---
 

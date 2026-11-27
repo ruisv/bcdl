@@ -4,7 +4,7 @@
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](CMakeLists.txt)
 [![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-3776AB.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-RDK%20S100%20%2F%20S100P%20%2F%20S600%20(aarch64)-0A7BBB.svg)](#运行环境要求)
-[![Version](https://img.shields.io/badge/version-0.9.0-informational.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.0-informational.svg)](CHANGELOG.zh.md)
 
 [English](README.en.md) | **简体中文**
 
@@ -65,7 +65,7 @@ conda install -c https://mirrors.ruis.ai/conda -c conda-forge bcdl
 | <img src="benchmarks/figures/flow.jpg" width="250"> | <img src="benchmarks/figures/anomaly.jpg" width="250"> | <img src="benchmarks/figures/drive.jpg" width="250"> |
 
 **激光雷达 3-D 检测（PointPillars）** —— 模型自己的 3-D 框投影回相机图，
-并与标注对分。[怎么读这张图](docs/MODELS.md#reading-the-lidar-check-figure)。
+并与标注对分。[怎么读这张图](docs/MODELS.zh.md#怎么读激光雷达校验图)。
 
 <img src="benchmarks/figures/lidar3d.jpg" width="780">
 
@@ -223,7 +223,7 @@ BCDL 是通用运行时，能加载任意 `.hbm`。最快的四条路：
   [`ruisv/bcdl-*`](https://huggingface.co/ruisv)。**不用导 ONNX、不用校准、
   不用 `hb_compile`、不用 x86 转换机**；`scripts/fetch_models.sh` 会自动去取。
   只有**权重本身可再分发**的模型在那里，清单与许可证见
-  [`docs/MODELS.md`](docs/MODELS.md#prebuilt-models-on-hugging-face)。
+  [`docs/MODELS.zh.md`](docs/MODELS.zh.md#hugging-face-上的预编译模型)。
 - 板上系统镜像自带的（`/opt/hobot/model/s100/basic`，如 YOLOv8 检测、DeepLabV3+）；
 - D-Robotics **`rdk_model_zoo`** 里预编译好的；
 - 自己转：完整配方（导出、校准、`hb_compile` 配置、精度/延迟实测）在配套仓库
@@ -231,7 +231,7 @@ BCDL 是通用运行时，能加载任意 `.hbm`。最快的四条路：
 
 把 `.hbm` 放到 [`models/`](models/) 下即可（本仓的示例与测试只按
 `models/<name>.hbm` 这个相对路径引用模型）。每个模型是什么、从哪来、该取哪个
-build、许可证如何，见 [`docs/MODELS.md`](docs/MODELS.md)。
+build、许可证如何，见 [`docs/MODELS.zh.md`](docs/MODELS.zh.md)。
 
 ### 3. 跑（一分钟）
 
@@ -323,8 +323,8 @@ Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`]
   - **OCR** —— 完整三段式流水线：DBNet 检测 → PP-LCNet 方向分类（0°/180°）→
     CRNN/CTC 识别。**默认 PP-OCRv6**（识别侧走全 int16 构建：在 S100P 上比编译器
     默认的混合精度 int8 构建字错率约减半、且快约 2 倍），PP-OCRv5 保留为回退。
-  - **开放词汇检测 / 分割** —— **YOLOE**（prompt-free，自带 COCO-80 标签表
-    `LabelMap`，复用 LTRB / DFL 解码，无需重训即可命名类别）。
+  - **开放词汇检测 / 分割** —— **YOLOE**（prompt-free：词表在导出时折进检测头，所以
+    复用 LTRB / DFL 解码，类名由 `LabelMap` 提供 —— 换词表只需重新导出，无需重训）。
   - **可提示分割** —— **EdgeSAM** 交互式分割（点 / 框提示；RepViT 图像编码器 →
     缓存 embedding → 提示解码器两段式，`SamSession`）。
   - **全景驾驶感知** —— YOLOP 一次推理出三个头：车辆检测（anchor-based
@@ -414,7 +414,7 @@ Python 侧的最小用法（每个任务一段代码）都在 [`docs/API.zh.md`]
 march；S600 为其自身编译）—— BCDL 运行时本身在整个 S 系列上一致。
 
 **每个模型是什么、从哪来、该取哪个 build、以及各自的许可证，见
-[`docs/MODELS.md`](docs/MODELS.md)。** 示例/基准用到的模型都是第三方的，**权重及其
+[`docs/MODELS.zh.md`](docs/MODELS.zh.md)。** 示例/基准用到的模型都是第三方的，**权重及其
 编译产物遵循各自的原始许可证** —— 其中 Ultralytics YOLO 权重为 **AGPL-3.0**（著佐权，
 商用需其 Enterprise 授权），insightface 的人脸预训练权重为**学术非商用**；重新分发或
 商用前请逐一核对。BCDL 自身的代码（本仓库，Apache-2.0）与这些无关 —— 它是一个能加载
@@ -491,11 +491,11 @@ PYTHONPATH=build:python python scripts/board_bench.py --retry-until-clean 3
 |----------|----------------|
 | [`docs/API.zh.md`](docs/API.zh.md) | **Python API 参考** —— 每个类、配置和 `decode_*` 函数，附每个任务的用法片段。（[English](docs/API.md)） |
 | [`docs/CPP_API.zh.md`](docs/CPP_API.zh.md) | **C++ API 参考** —— `namespace bcdl` 下的同一接口面，对应到各头文件。（[English](docs/CPP_API.md)） |
-| [`docs/MODELS.md`](docs/MODELS.md) | **模型清单** —— 示例与基准用到的每个 `.hbm`：来源、该取哪个 build、许可证。 |
-| [`docs/GDC.md`](docs/GDC.md) | **GDC 硬件几何变换** —— 硬件 letterbox 与密集重映射的用法与限制。 |
+| [`docs/MODELS.zh.md`](docs/MODELS.zh.md) | **模型清单** —— 示例与基准用到的每个 `.hbm`：来源、该取哪个 build、许可证。（[English](docs/MODELS.md)） |
+| [`docs/GDC.zh.md`](docs/GDC.zh.md) | **GDC 硬件几何变换** —— 硬件 letterbox 与密集重映射的用法与限制。（[English](docs/GDC.md)） |
 | [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) | 完整板端基准数据 + [效果展示](#效果展示)中的标注校验图。 |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 如何搭建、构建（在板上）、测试并提交改动。 |
-| [`CHANGELOG.md`](CHANGELOG.md) | 发布说明（Keep a Changelog / SemVer）。 |
+| [`CONTRIBUTING.zh.md`](CONTRIBUTING.zh.md) | 如何搭建、构建（在板上）、测试并提交改动。（[English](CONTRIBUTING.md)） |
+| [`CHANGELOG.zh.md`](CHANGELOG.zh.md) | 更新日志（Keep a Changelog / SemVer）。（[English](CHANGELOG.md)） |
 
 公共头文件在 [`include/bcdl/`](include/bcdl/)；可运行程序在
 [`examples/`](examples/)。
@@ -586,7 +586,7 @@ PYTHONPATH=build:python pytest tests/
 ## 参与贡献
 
 欢迎贡献 —— issue 与 pull request 皆可。完整指南见
-[`CONTRIBUTING.md`](CONTRIBUTING.md)；要点如下：
+[`CONTRIBUTING.zh.md`](CONTRIBUTING.zh.md)；要点如下：
 
 - **在任意机器开发，在板上构建与运行。** hobot SDK 只存在于 RDK 硬件上，所以
   C++ 库和板端测试套件必须在 S100 / S100P / S600 板上构建并执行。无需 Engine 的
@@ -599,7 +599,7 @@ PYTHONPATH=build:python pytest tests/
 - **提交** —— 保持聚焦；遵循日志中已有的
   [Conventional Commits](https://www.conventionalcommits.org/) 风格。
 - **Changelog** —— 在 [`CHANGELOG.md`](CHANGELOG.md) 的 `[Unreleased]` 下记录
-  对用户可见的变更。
+  对用户可见的变更，并在同一提交里同步中文版 [`CHANGELOG.zh.md`](CHANGELOG.zh.md)。
 
 ## 致谢
 

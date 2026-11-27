@@ -1,5 +1,7 @@
 # Changelog
 
+**English** | [简体中文](CHANGELOG.zh.md)
+
 All notable changes to BCDL are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -11,6 +13,35 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
      roadmap/design notes, not here. -->
 
 ## [Unreleased]
+
+### Added
+- **Chinese documentation beyond the API references.** `CHANGELOG.zh.md`,
+  `docs/MODELS.zh.md`, `docs/GDC.zh.md` and `CONTRIBUTING.zh.md` translate their
+  English counterparts in full, and the Chinese README links to them. The
+  Chinese changelog is kept version for version with this one;
+  `tests/test_changelog_zh.py` fails when a version or an entry is missing
+  from either.
+- **The API references cover every task the library exports.** Six task
+  families had shipped without a word in `docs/API.md` or `docs/CPP_API.md`:
+  face detection and alignment (SCRFD, `align_face`), image embeddings
+  (`ImageEmbedder`, `EmbeddingBank`), monocular 3-D detection (SMOKE),
+  promptable segmentation (EdgeSAM), open-vocabulary detection (YOLOE's
+  `LabelMap`) and panoptic driving (YOLOP's `AnchorDetector`). Each now has a
+  section in both languages and both references, as do `TilePlacement`,
+  `jpeg_save`, `letterbox_chw_float`, the output reader and input writer, the
+  GDC hardware warp, and the streaming `VideoEncoder` calls (`feed`, `receive`,
+  `flush`).
+
+### Fixed
+- **`VideoDecoder.feed()` takes one access unit per call.** The Python
+  reference said arbitrary byte chunks were fine; the decoder runs in
+  frame-size feeding mode and needs exactly one picture's NALs per call.
+  `AsyncVideoDetectionPipeline.submit()` is the call that accepts arbitrary
+  Annex-B chunks.
+- The C++ reference's `GdcLetterbox` example still passed the `binPath`
+  argument that 0.3.0 removed.
+- The version links at the foot of this file pointed at a placeholder domain;
+  they now compare the real tags.
 
 ## [0.9.0] — 2026-11
 
@@ -1009,8 +1040,8 @@ pipeline is 1.8x faster and no longer detours through BGR.
   matches cv2.remap to mean 0.25 / p99 2 grey-levels over the valid map region.
   Correctness/bench suite: `tests/test_gdc_remap.py`. `GdcRemap.run` releases
   the GIL, so two instances (stereo top/bottom) overlap one camera's CPU
-  conversions with the other's hardware op from Python threads (adam_fast
-  measured 24.3 → 18.6 ms for both cams).
+  conversions with the other's hardware op from Python threads (a two-camera
+  stereo application measured 24.3 → 18.6 ms for both cams).
 - **Open-vocabulary detection / segmentation (YOLOE)** — prompt-free YOLOE reuses
   the existing LTRB / DFL decode with a `bcdl::LabelMap` (COCO-80 by default,
   `from_file` / `from_list`); no new post-process math. Board bench + figures:
@@ -1093,5 +1124,20 @@ First tagged release. On-board validated on RDK S100P (79 passed, 1 skipped).
   (`scripts/board_bench.py`), repo-local model dir (`scripts/fetch_models.sh`),
   two-tier test suite (Engine-free NumPy + on-board real-model).
 
-[Unreleased]: https://example.com/compare/v0.1.0...HEAD
-[0.1.0]: https://example.com/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ruisv/bcdl/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ruisv/bcdl/compare/v0.8.1...v0.9.0
+[0.8.1]: https://github.com/ruisv/bcdl/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/ruisv/bcdl/compare/v0.7.5...v0.8.0
+[0.7.5]: https://github.com/ruisv/bcdl/compare/v0.7.4...v0.7.5
+[0.7.4]: https://github.com/ruisv/bcdl/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/ruisv/bcdl/compare/v0.7.2...v0.7.3
+[0.7.2]: https://github.com/ruisv/bcdl/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/ruisv/bcdl/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/ruisv/bcdl/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/ruisv/bcdl/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/ruisv/bcdl/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/ruisv/bcdl/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/ruisv/bcdl/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/ruisv/bcdl/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/ruisv/bcdl/compare/v0.1.1...v0.2.0
+[0.1.0]: https://github.com/ruisv/bcdl/tree/v0.1.1

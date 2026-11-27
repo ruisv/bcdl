@@ -11,18 +11,29 @@
 - 预处理：[Letterbox 与几何](#letterbox-与几何) · [NV12 辅助](#nv12-辅助) ·
   [GDC 硬件算子](#gdc-硬件算子-仅板端)
 - 任务：[检测 Detection](#检测-detection) · [分类 Classification](#分类-classification) ·
+  [图像嵌入](#图像嵌入-image-embeddings) · [人脸](#人脸检测与识别-face) ·
   [姿态 Pose](#姿态-pose) · [全身姿态 WholeBody](#全身姿态-wholebody) ·
   [超分 SuperRes](#超分-superres) · [稀疏特征点 XFeat](#稀疏特征点-xfeat) ·
-  [实例分割 InstanceSeg](#实例分割-instanceseg) · [旋转框 OBB](#旋转框-obb) ·
-  [语义分割 Segmentation](#语义分割-segmentation) · [深度 Depth](#深度-depth) ·
+  [实例分割 InstanceSeg](#实例分割-instanceseg) ·
+  [开放词表检测 YOLOE](#开放词表检测-yoloe) ·
+  [可提示分割 EdgeSAM](#可提示分割-edgesam) · [旋转框 OBB](#旋转框-obb) ·
+  [语义分割 Segmentation](#语义分割-segmentation) ·
+  [全景驾驶感知 YOLOP](#全景驾驶感知-yolop) ·
+  [单目 3D 检测 SMOKE](#单目-3d-检测-smoke) ·
+  [激光雷达 3D 检测](#激光雷达-3d-检测-lidar-3-d-detection) ·
+  [异常检测](#异常检测-anomaly-detection单类) · [光流](#光流-optical-flow) ·
+  [端到端驾驶](#端到端驾驶-end-to-end-driving相机--激光雷达--轨迹) ·
+  [深度 Depth](#深度-depth) · [深度精修](#深度精修-depth-refinementrgb-d) ·
   [双目 Stereo](#双目-stereo) · [OCR](#ocr)
 - 语音：[语音链总览（从这里开始）](#语音链总览) · [唤醒词](#唤醒词检测) ·
   [端点检测](#语音端点检测silero-vad) · [识别](#语音识别paraformer) ·
-  [指令匹配](#语音指令固定指令集) · [合成](#语音合成matcha-tts--vocos)
+  [指令匹配](#语音指令固定指令集) · [声码器](#语音合成后端vocos-声码器) ·
+  [合成](#语音合成matcha-tts--vocos)
 - 流式与跟踪：[跟踪 ByteTrack](#跟踪-bytetrack) · [TrackingPipeline](#trackingpipeline) ·
   [AsyncDetectionPipeline](#asyncdetectionpipeline) ·
   [AsyncVideoDetectionPipeline](#asyncvideodetectionpipeline)
 - 多媒体：[图像与编解码](#图像与编解码)
+- [C++ API](#c-api)
 
 > 命名：snake_case 的函数名与 `lower_case` 的配置字段，是 C++ camelCase 成员的
 > Python 写法，无一例外。曾有九个解码器另带 camelCase 别名；这些名字已废弃，
@@ -96,7 +107,8 @@ outs = engine.infer([x])                     # outs[i] 已 reshape 成 output_sh
 
 | 成员 | 说明 |
 |--------|-------------|
-| `Engine(hbm_path, model_name="")` | 加载模型。`.hbm` 里打包了多个模型时，用 `model_name` 选其中一个。 |
+| `Engine(hbm_path, model_name="")` | 加载模型。`.hbm` 里打包了多个模型时，用 `model_name` 选其中一个；默认取第一个。 |
+| `Engine.model_names(hbm_path) -> list[str]` | 静态方法：列出 `.hbm` 里打包的全部模型名，不加载模型。 |
 | `model_name -> str` | 当前模型名。 |
 | `num_inputs / num_outputs -> int` | 张量个数。 |
 | `input_name(i) / output_name(i) -> str` | 编译进模型的张量名（即 ONNX 里的名字）。 |
@@ -106,6 +118,7 @@ outs = engine.infer([x])                     # outs[i] 已 reshape 成 output_sh
 | `input_stride(i) -> list[int]` | 输入 `i` 解析后的字节 stride，最内层在最后。 |
 | `output_stride(i) -> list[int]` | 输出 `i` 的字节 stride。**输出同样会补齐** —— 把原始缓冲直接摊平 reshape 会把张量剪切错位。 |
 | `output_packed_bytes(i) -> int` | 输出 `i` 作为连续行主序数组的大小。模型对某一维做了补齐时会小于设备缓冲。 |
+| `output_packed(i) -> bytes` | 把输出 `i` 收拢成符合其声明形状与 dtype 的连续行主序数组：去掉补齐，量化值原样保留。`infer()` 返回的已经是它；这个接口留给自己驱动 Engine 的调用方。 |
 | `input_dtype(i) / output_dtype(i) -> str` | NumPy dtype 字符串（如 `"float32"`、`"float16"`、`"int8"`）。 |
 | `infer(inputs, timeout_ms=0) -> list[np.ndarray]` | 把输入拷进设备缓冲、执行、每个输出返回一个数组。`timeout_ms=0` 表示阻塞。 |
 
@@ -130,6 +143,9 @@ ox, oy = lb.inv_x(x), lb.inv_y(y)   # 模型 -> 原图像素
 
 # 对 uint8 图像一次性做 CPU letterbox（需要 OpenCV）：
 canvas, lb = bcdl.letterbox_numpy(img, dst_w, dst_h, pad=114)
+
+# 同样的 letterbox，直接产出浮点输入（QAT）模型要的 NCHW 浮点张量：
+x, lb = bcdl.letterbox_chw_float(img, 640, 640)    # (1, 3, 640, 640) float32
 ```
 
 - **`compute_letterbox(src_w, src_h, dst_w, dst_h, center_pad=True) -> LetterboxInfo`**
@@ -138,6 +154,12 @@ canvas, lb = bcdl.letterbox_numpy(img, dst_w, dst_h, pad=114)
   把它传给检测家族的每个 `postprocess(...)`，框才会回到原图像素坐标。
 - **`letterbox_numpy(img, dst_w, dst_h, pad=114) -> (canvas, LetterboxInfo)`** ——
   几何与 C++ VP letterbox 一致；需要 OpenCV。
+- **`letterbox_chw_float(img, dst_w, dst_h, pad=114, to_rgb=True, scale=1/255, mean=None, std=None) -> (nchw, LetterboxInfo)`**
+  —— 用于输入是 `[1,3,H,W]` float32 而不是 NV12 平面的模型（QAT 导出）。几何与
+  `letterbox_numpy` 相同，之后可选 BGR→RGB、乘 `scale`、可选逐通道
+  `(x - mean) / std`，输出连续的 `(1,C,H,W)` float32 数组；返回的 `lb` 与 NV12
+  路径一样能把框准确映射回原图。需要 OpenCV。一次调用完成的 `detect_float` 见
+  [检测](#检测-detection)。
 
 ## NV12 辅助
 
@@ -152,7 +174,7 @@ nv12 = bcdl.bgr_to_nv12(bgr)         # (H*3//2, W) uint8；尺寸需为偶数；
 
 VPS GDC 引擎上的固定几何变换 —— NV12 进 / NV12 出，算子执行期间 CPU 空闲。
 不在板上、或不支持 GDC 时为 `None`。完整语义与逆向出来的 CUSTOM 网格笔记见
-[docs/GDC.md](GDC.md)。
+[docs/GDC.zh.md](GDC.zh.md)。
 
 ```python
 # 硬件 letterbox（warp LUT 在构造时生成）
@@ -172,7 +194,7 @@ dst = g.run(src_vpimage)
 - **`GdcLetterbox(in_w, in_h, out_w, out_h, pad=114)`** —— GDC 上的 letterbox；
   warp LUT 在构造时生成（不需要离线 `.bin`）。`.info` 返回对应的 `LetterboxInfo`。
   1920×1080 → 640×640：墙钟 0.97 ms，其中约 0.3 ms 占 CPU。几何与 CPU letterbox
-  完全一致；两者的重采样器在高频细节上的走样方式不同 —— 见 [docs/GDC.md](GDC.md)。
+  完全一致；两者的重采样器在高频细节上的走样方式不同 —— 见 [docs/GDC.zh.md](GDC.zh.md)。
 
 ---
 
@@ -180,9 +202,9 @@ dst = g.run(src_vpimage)
 
 两个解码器家族：
 
-- **单张量**（`DecodeLayout.YoloV8` / `YoloV5`）—— 一个浮点输出张量。
+- **单张量**（`DecodeLayout.YoloV8` / `YoloV5`） —— 一个浮点输出张量。
   用 `DetectConfig` + `decode(...)` / `Detector`。
-- **anchor-free LTRB 多尺度**（YOLO26 / 标准 RDK NV12 导出）—— 每个 stride 一对
+- **anchor-free LTRB 多尺度**（YOLO26 / 标准 RDK NV12 导出） —— 每个 stride 一对
   `(cls, box)` 输出。用 `YoloLtrbConfig` + `YoloLtrbDetector`。
 
 ```python
@@ -196,7 +218,15 @@ for d in dets:
 # anchor-free LTRB，高层用法（NV12 双输入）：
 det = bcdl.YoloLtrbDetector(engine, bcdl.YoloLtrbConfig())
 dets = det.detect([y_plane, uv_plane], lb)
+
+# 同一个头的 QAT 导出版，输入是 [1,3,H,W] float32：
+dets = det.detect_float(bgr)            # letterbox_chw_float + detect([nchw], lb)
 ```
+
+**PTQ 与 QAT 导出的解码方式相同。** `hb_compile`（PTQ）导出吃 NV12 `[Y, UV]` 两个
+平面；QAT 导出（horizon_plugin_pytorch / hbdk4）吃一个 `[1,3,H,W]` float32 张量。
+区别只在预处理 —— LTRB 头的解码、sigmoid 和 NMS 完全一样 —— 所以 `detect_float()`
+一次调用就把原始帧 letterbox、归一化并解码。
 
 **`DetectConfig`** —— `input_w`、`input_h`、`num_classes`、`conf_thresh`、
 `iou_thresh`、`max_dets`、`layout`（`DecodeLayout`）、`channels_first`、
@@ -216,8 +246,8 @@ dets = det.detect([y_plane, uv_plane], lb)
 | `decode` | `decode(output: f32 ndarray, config: DetectConfig, letterbox: LetterboxInfo) -> list[Detection]` |
 | `nms` | `nms(dets, iou_thresh, max_dets=300) -> list[int]`（保留下来的下标） |
 | `iou` | `iou(a: Detection, b: Detection) -> float` |
-| `Detector` | `Detector(engine, config, output_index=0)`；`.detect(model_input, lb, timeout_ms=0)`、`.config` |
-| `YoloLtrbDetector` | `YoloLtrbDetector(engine, config=None, output_base=0)`；`.detect([inputs], lb, timeout_ms=0)`、`.postprocess(lb)`、`.config` |
+| `Detector` | `Detector(engine, config, output_index=0)`；`.detect(model_input, lb, timeout_ms=0)`、`.postprocess(lb)`（解码当前输出 —— 用于一次推理喂多个解码器的多头模型）、`.config` |
+| `YoloLtrbDetector` | `YoloLtrbDetector(engine, config=None, output_base=0)`；`.detect([inputs], lb, timeout_ms=0)`、`.detect_float(img_bgr, dst_w=640, dst_h=640, pad=114, to_rgb=True, scale=1/255, mean=None, std=None, timeout_ms=0)`、`.postprocess(lb)`、`.config` |
 
 ---
 
@@ -239,6 +269,117 @@ top = bcdl.decode_classification(logits.astype(np.float32), cfg)
   向量取 top-k。
 - **`Classifier(engine, config=None, output_index=0)`** —— `.classify(inputs, timeout_ms=0)`、
   `.postprocess()`、`.config`。
+
+## 图像嵌入 Image embeddings
+
+一张图进，一个 L2 归一化的向量出，相似度于是就成了点积。检索和零样本分类是同一个
+操作，只是比对的表不同：前者是图库图像的向量，后者是文本向量。双塔模型（SigLIP）
+只有图像塔跑在板上；文本塔在主机上离线跑一次，它对你那组类别提示词的输出是一张
+小表，跟模型放在一起分发。
+
+```python
+path = "models/bpu-siglip-base-patch16-224.hbm"
+print(bcdl.Engine.model_names(path))           # 这个 .hbm 里打包了多个子模型
+emb = bcdl.ImageEmbedder(bcdl.Engine(path, "pooler_output"))   # 绑定池化的那个
+v = emb.embed_image(bgr)                       # list[float]，单位长度，len == emb.dim
+
+bank = bcdl.EmbeddingBank()
+for label, img in gallery:                     # 也可以是在主机上算好的文本向量
+    bank.add(emb.embed_image(img), label)
+for m in bank.search(emb.embed_image(query), k=5):   # 最相似的在前
+    print(m.index, m.label, m.score)           # score = 余弦，范围 [-1, 1]
+
+# numpy 路径：
+v = bcdl.decode_embedding(out.astype(np.float32))
+```
+
+这套 API 是围绕两个坑设计的：
+
+- **要绑定池化子模型。** 嵌入 `.hbm` 是一个包：SigLIP 在一个文件里同时带了池化后的
+  整图向量和逐 patch 的特征网格，`Engine(path)` 默认取第一个。`ImageEmbedder` 会把
+  输出摊平，所以绑成 patch 网格时拿到的是一个 `num_patches * width` 长的"嵌入" ——
+  毫无意义，而且不报错。启动时拿 `.dim` 和该塔文档写明的宽度核对一次。
+- **预处理是挤压式 resize，不是 letterbox。** 这些塔是在直接缩放成正方形的图上训练的；
+  letterbox 的灰边是它们从没见过的像素，会把向量推偏到损失检索精度的程度。输出端也
+  没有什么要反变换的 —— 嵌入没有坐标。
+
+与模型作者的浮点实现在相同输入张量上对比：逐图余弦 0.9977–0.9995；在 200 张图的
+图库上，recall@1 / @5 与浮点完全相同（0.9250 / 1.0000）。
+
+- **`EmbedConfig`** —— `l2_normalize`（`True`；这里所有相似度都假定单位向量 ——
+  只有想读原始池化激活时才关掉）。
+- **`decode_embedding(data, config=EmbedConfig()) -> list[float]`** —— 把一维浮点
+  数组读成一个嵌入。零向量原样返回，不会变成 NaN。
+- **`embed_preprocess(img, size=224, to_rgb=True, scale=1/127.5, shift=-1.0) -> np.ndarray`**
+  —— BGR 图 → `(1,3,size,size)` float32：挤压式 resize，再在 RGB 上做
+  `x * scale + shift`（即常见的 `x/127.5 - 1`）。换别的塔之前先查模型卡，别默认它
+  用同一套约定。需要 OpenCV。
+- **`ImageEmbedder(engine, config=None, output_index=0)`** ——
+  `.embed(model_input, timeout_ms=0)`、`.embed_image(img_bgr, size=224, timeout_ms=0)`
+  （先 `embed_preprocess` 再 `embed`）、`.postprocess()`、`.dim`（所绑输出形状各维
+  之积）、`.config`。
+- **`EmbeddingBank()`** —— `.add(vec, label="")`、`.search(query, k=5) -> list[EmbedMatch]`、
+  `.label(index)`、`.dim`、`len()`。两边都会替你归一化，直接传原始向量即可。第一次
+  `add()` 定下 `dim`；之后长度不同的向量在 `add()` 和 `search()` 时都会报错。
+  `k <= 0` 或超过条目数时返回全部条目（已排序）；空库返回 `[]`。线性扫描 —— 对板上
+  放得下的几千条规模，这正是合适的选择。
+- **`EmbedMatch`** —— `index`、`score`（余弦）、`label`（添加时没给就为空）；
+  带 `__repr__`。
+
+只比较一对向量时，`cosine_similarity(a, b)` 不用建库就能给出同样的分数 —— 见
+[外观（ReID）](#外观reid)。
+
+## 人脸检测与识别 Face
+
+检测 → 对齐 → 嵌入 → 比对。检测用 SCRFD —— 一个框加五个关键点；识别不需要单独的
+任务：对齐后的裁剪图交给 `ImageEmbedder`，比对用 `EmbeddingBank`。真正决定识别
+成败的是中间那一步：识别模型只见过把双眼、鼻尖、两个嘴角扭到固定 112×112 模板
+位置上的人脸；直接拿框裁出来的图喂它，嵌入会严重变差，却哪儿都不报错。
+
+```python
+det = bcdl.FaceDetector(bcdl.Engine("models/scrfd_10g_nashm_640x640_nv12.hbm"))
+canvas, lb = bcdl.face_letterbox(bgr, 640)     # 补在右下角，不是居中
+nv12 = bcdl.bgr_to_nv12(canvas)
+faces = det.detect([nv12[:640], nv12[640:]], lb)   # NV12 [Y, UV]
+for f in faces:
+    print(f.score, f.x1, f.y1, f.x2, f.y2, f.landmarks)   # 5 个 (x, y)，原图像素
+
+rec = bcdl.ImageEmbedder(bcdl.Engine("models/arcface_r50_aligned_nashm_112x112.hbm"))
+crop = bcdl.align_face(bgr, faces[0].landmarks)   # (112, 112, 3) BGR，已对齐到模板
+v = rec.embed_image(crop, 112)                 # 512 维单位向量
+```
+
+**补边约定是这个检测器自己的。** SCRFD 的参考预处理把图放在左上角、在右下角补边，
+所以 `face_letterbox` 返回的 `LetterboxInfo` 是 `pad_x = pad_y = 0`。用居中的
+letterbox（`letterbox_numpy`）会让每个框和关键点都偏移一个补边量。`embed_image`
+默认的归一化（RGB、`x/127.5 - 1`）正是 ArcFace 这版模型要的。
+
+与浮点参考在相同帧上对比：关键点平均 0.35 px / 最大 0.89 px，框角点平均 0.52 px；
+检测 60.2 ms，对齐 0.29 ms。板上端到端识别：与浮点模型的平均余弦 0.975（最低 0.966）。
+
+- **`FaceDetectConfig`** —— `conf_thresh`（0.5）、`iou_thresh`（0.4）、`max_faces`
+  （100）、`strides`（`[8,16,32]`）、`num_anchors`（每个格点的预测数；标准导出为 2）。
+- **`FaceDetection`** —— `x1, y1, x2, y2`、`score`、`landmarks`（原图像素下的五个
+  `(x, y)`：左眼、右眼、鼻尖、左嘴角、右嘴角 —— "左"指观看者的左边）；带 `__repr__`。
+- **`FaceDetector(engine, config=None, output_base=0)`** ——
+  `.detect([inputs], lb, timeout_ms=0)`、`.postprocess(lb)`、`.config`。按三组读取
+  `3 * len(strides)` 个输出 —— 先是全部 score，再是全部框，最后是全部关键点张量 ——
+  这正是参考导出的输出顺序。
+- **`decode_scrfd(score, bbox, kps, config, letterbox) -> list[FaceDetection]`** ——
+  numpy 路径；逐 stride 的 `[N,1]`（已过 sigmoid）/ `[N,4]` / `[N,10]` 列表，
+  `N = H*W*num_anchors`，按（行、列、anchor）排列，anchor 变化最快。框距离和关键点
+  偏移都以 stride 为单位、从格点算起（没有半格偏移）。网格必须是正方形：个数不是
+  `num_anchors` 乘一个完全平方数时会报错。
+- **`face_letterbox(img, size=640) -> (canvas, LetterboxInfo)`** —— 等比缩放到能放下，
+  在右下角补黑边。需要 OpenCV。
+- **`arcface_template() -> list[(x, y)]`** —— 112×112 裁剪图里的五个标准点，顺序
+  与 `landmarks` 相同。
+- **`similarity_transform(src, dst) -> list[float]`** —— 返回 `[a, b, tx, c, d, ty]`，
+  对应 `x' = a*x + b*y + tx`、`y' = c*x + d*y + ty`。闭式 Umeyama 解：只有旋转、
+  等比缩放和平移，所以不会把脸剪切或拉伸；结果确定，同一张脸每次对齐都完全一样。
+- **`align_face(bgr, landmarks, size=112) -> np.ndarray`** —— `(size, size, 3)`
+  uint8 BGR，扭到让五个 `landmarks` 落在按 `size` 缩放后的模板上。双线性采样；
+  越界读取按边缘截断。关键点个数不是五个时报错。
 
 ## 姿态 Pose
 
@@ -302,8 +443,10 @@ print(sr.last_tile_count, "块")
 - **`SuperResConfig`** —— `overlap`（输入像素数；同时也是交叉淡化的宽度）。
 - **`SuperResolver(engine, config=None, input_index=0, output_index=0)`** ——
   `.upscale(bgr, timeout_ms=0)`、`.scale`、`.tile`、`.last_tile_count`。
-- **`plan_tiles(width, height, tile_w, tile_h, overlap)`** → 各 tile 的原点。
-  每个轴上最后一块会与远端边缘对齐，所以那里的实际重叠可能超过请求值。
+- **`plan_tiles(width, height, tile_w, tile_h, overlap) -> list[TilePlacement]`**
+  —— 各 tile 的原点。每个轴上最后一块会与远端边缘对齐，所以那里的实际重叠可能
+  超过请求值。
+- **`TilePlacement`** —— `x`、`y`（只读）：一块 tile 左上角在输入图中的像素坐标。
 - **`tile_weight(i, len, ramp)`** —— 交叉淡化权重，恒 > 0，所以归一化混合不需要
   对边界做特判。
 
@@ -349,7 +492,9 @@ for m in seg.detect([y_plane, uv_plane], lb, orig_w, orig_h):
 ```
 
 - **`InstanceSegConfig`** —— `conf_thresh`、`iou_thresh`、`max_dets`、`strides`、
-  `proto_index`、`compute_masks`（设 `False` 可跳过掩膜组装以提速）。
+  `proto_index`、`compute_masks`（设 `False` 可跳过掩膜组装以提速）、
+  `reg_max`（框回归头的 DFL bin 数，`0` 表示普通 LTRB；只有 numpy 的 `decode_*` 路径
+  读它 —— `InstanceSegmenter` 会按框头的通道数自己推出来）。
 - **`InstanceMask`** —— `x1, y1, x2, y2, score, class_id`、`mask_w, mask_h`、
   `mask`（`(H,W)` uint8 0/1；`compute_masks=False` 时为空）。
 - **`InstanceSegmenter(engine, config=None, output_base=0)`** ——
@@ -358,6 +503,80 @@ for m in seg.detect([y_plane, uv_plane], lb, orig_w, orig_h):
 - **`decode_instance_seg(cls, box, mc, proto, config, letterbox, orig_w, orig_h) -> list[InstanceMask]`**
   —— numpy 路径；`cls/box/mc` 为逐 stride 的 `[H,W,nc]`/`[H,W,4]`/`[H,W,np]`，
   `proto` 为 `[mH,mW,np]`。
+
+## 开放词表检测 YOLOE
+
+免提示词（prompt-free）的 YOLOE 在导出时就把词表折进了分类头，所以到了板上它就是
+一个普通的 anchor-free 头：框走 `YoloLtrbDetector`，框加掩膜走 `InstanceSegmenter`，
+解码都不用改。唯一新增的状态是类别 id → 提示词的对照表 `LabelMap`。
+
+```python
+names = bcdl.LabelMap.from_file("models/yoloe26m_indoor99_labels.txt")   # 每行一个提示词
+cfg = bcdl.InstanceSegConfig(); cfg.compute_masks = False      # 只要框
+seg = bcdl.InstanceSegmenter(
+    bcdl.Engine("models/yoloe26m_indoor99_seg_nashm_640x640_nv12.hbm"), cfg)
+for m in seg.detect([y_plane, uv_plane], lb, orig_w, orig_h):
+    print(names.name(m.class_id), m.score)
+
+# 检测版：num_classes 必须等于表的长度
+names = bcdl.LabelMap.from_list(coco80)        # 你自己提供的 80 个类名
+cfg = bcdl.YoloLtrbConfig(); cfg.num_classes = len(names)
+det = bcdl.YoloLtrbDetector(
+    bcdl.Engine("models/yoloe_11s_coco80_det_bpu_nashm_640x640_nv12.hbm"), cfg)
+```
+
+`.hbm` 和它的标签文件要放在一起：类别顺序就是文件的行序。库里不带任何标签表 ——
+`LabelMap()` 是空的 —— 所以 COCO-80 那版需要你自己提供 80 个类名。只要框时把
+`compute_masks` 关掉：组装掩膜花的 CPU 时间远多于 BPU 跑网络的时间。两个 YOLOE-11s
+模型的实测速度见 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)（`yoloe_det`、`yoloe_seg`）。零样本的室内版
+擅长什么、不擅长什么 —— 屏幕是盲区，导航类分数偏低 —— 见
+[MODELS.zh.md](MODELS.zh.md#室内-yoloe-build-是零样本的)。
+
+- **`LabelMap()`**（空表）· **`LabelMap.from_file(path)`**（每行一个标签；去掉首尾
+  空白，跳过空行；文件不存在时报错）· **`LabelMap.from_list(names)`**。
+- `.names`（可读写的列表）、`len()`、`.name(class_id)` —— id 超出表的范围时返回
+  `"?"`，不会抛异常。
+
+## 可提示分割 EdgeSAM
+
+点一下或拖一个框，得到那个物体的掩膜。EdgeSAM 由两个模型组成：图像编码器每张图跑
+一次，小的提示解码器每个提示跑一次，对着缓存的嵌入计算 —— 所以在同一张图上反复点击
+很便宜。
+
+```python
+sam = bcdl.SamSession(bcdl.Engine("models/edge_sam_encoder_nashm.hbm"),
+                      bcdl.Engine("models/edge_sam_decoder_sp1_nashm.hbm"),
+                      box_decoder=bcdl.Engine("models/edge_sam_decoder_bp2_nashm.hbm"))
+sam.set_image(bgr)                             # 编码器只跑一次，嵌入缓存起来
+mask, idx = sam.predict(420, 310)              # 一个前景点，原图像素
+mask, idx = sam.predict_box(100, 80, 500, 400) # 需要 box_decoder
+# mask：(H, W) uint8 0/1，原图尺寸
+
+# numpy 路径 —— 只做解码器尾部：
+sm = bcdl.decode_sam_masks(low_res_logits, iou_pred, bcdl.SamConfig())   # [Nmask,Hm,Wm]、[Nmask]
+```
+
+**部署的每个解码器只接受固定个数的点** —— 形状在转换时就定死了：`sp1` 吃一个点击，
+`bp2` 吃框的两个角点；没给 `box_decoder` 就调 `predict_box` 会报错。**掩膜按面积选，
+而不是按预测 IoU**：IoU 头被 int8 量化弄坏了，所以 `select="area"` 在多个候选掩膜里
+取最大的那个；传一个整数可以强制指定。`set_image` 把长边缩放到 `input_size`、在右下
+角补边并转成 RGB；ImageNet 归一化已经编译进编码器，所以直接喂原始像素。
+
+- **`SamSession(encoder, decoder, box_decoder=None, input_size=1024)`** ——
+  `.set_image(bgr)`（返回 session 本身）、`.predict(x, y, label=1, select="area") -> (mask, index)`、
+  `.predict_box(x1, y1, x2, y2, select="area") -> (mask, index)`。坐标是原图像素；
+  `label` 是 SAM 的点标签（1 = 前景）。引擎输出按连续浮点读取，量化整数输出会被
+  拒绝。需要 OpenCV。
+- **`SamConfig`** —— `mask_threshold`（0.0，作用于原始 logit，与 SAM 一致）、
+  `multimask`（`True`：取预测 IoU 最大的；`False`：取第 0 个候选）。
+- **`SamMask`** —— `index`、`iou`、`mask_w`、`mask_h`、`mask`（`(Hm,Wm)` uint8 0/1，
+  是解码器的**低分辨率**输出 —— 映射回原图由调用方负责）。
+- **`SamMaskDecoder(engine, config=None, masks_index=0, iou_index=1)`** ——
+  `.postprocess() -> SamMask`、`.config`：只做尾部，解码器引擎由你自己驱动。
+- **`decode_sam_masks(low_res_logits, iou_pred, config) -> SamMask`** —— numpy 路径；
+  `[Nmask,Hm,Wm]` 的 logit 和 `[Nmask]` 的 IoU。`iou_pred` 长度不符时被忽略，取第
+  0 个候选。它和 `SamMaskDecoder` 都按预测 IoU 选，而在随附的 int8 解码器上，这恰恰
+  是不可靠的选法。
 
 ## 旋转框 OBB
 
@@ -403,6 +622,108 @@ mask = bcdl.decode_seg(logits.astype(np.float32), cfg)
 - **`seg_colorize(mask) -> np.ndarray`** —— `(H,W,3)` uint8 固定调色板。
 - **`Segmenter(engine, config=None, output_index=0)`** —— `.segment(model_input, timeout_ms=0)`、
   `.postprocess()`、`.config`。
+
+## 全景驾驶感知 YOLOP
+
+一次推理、三个头：anchor-based 检测器出车辆框，另外两个头经普通的 `Segmenter`
+出可行驶区域和车道线掩膜。这个检测器是库里唯一的 anchor-**based** 解码 —— 每个格点
+预测的是相对格点中心的偏移和先验框尺寸上的倍数，而不是到框四边的距离 —— 在 CPU
+上做。
+
+```python
+engine = bcdl.Engine("models/yolop_cut_nashm_640x640_nv12.hbm")  # 3 个检测头、可行驶区域、车道线
+det = bcdl.AnchorDetector(engine, bcdl.AnchorDetectConfig(), output_base=0)
+scfg = bcdl.SegConfig(); scfg.num_classes = 2; scfg.channels_first = True
+drivable = bcdl.Segmenter(engine, scfg, output_index=3)
+lane = bcdl.Segmenter(engine, scfg, output_index=4)
+
+canvas, lb = bcdl.letterbox_numpy(bgr, 640, 640)
+nv12 = bcdl.bgr_to_nv12(canvas)
+cars = det.detect([nv12[:640], nv12[640:]], lb)   # 只推理一次；框为原图像素
+road = drivable.postprocess()                  # 同一次推理，读另外两个头：
+lines = lane.postprocess()                     # SegMask，覆盖 640x640 的 letterbox 画布
+```
+
+框会回到原图像素；两张掩膜则留在模型的 letterbox 画布上。
+
+**要用 `_cut` 版。** 上游发布的导出用 ScatterND 把 anchor 解码烘进了图里，编译不报
+任何错，得到的模型却从不写 objectness 和类别列 —— 每 8 个浮点只有 2 个有数据，而且
+全是坐标 —— 于是检测器在任何阈值下都检出 0 个目标。所以在解码之前把图切开，导出三个
+原始的检测头卷积，再由 `decode_yolov5_anchor` 做这段运算；它与图内解码在全部 25200
+个候选上的最大差异是 1.8e-4。速度也快了 10 倍：一次推理喂三个头只要 2.80 ms /
+358 FPS（另加 2.64 ms 的 CPU 后处理），而图内解码要 28.33 ms。
+
+- **`Anchor(w, h)`** —— 一个先验框，单位是**模型输入像素**（不是归一化值，也不是
+  stride 单位）；`w`、`h` 可读写。`Anchor()` 先构造一个空的再填值。
+- **`AnchorDetectConfig`** —— `num_classes`（1）、`conf_thresh`（0.35）、`iou_thresh`
+  （0.45）、`max_dets`（300）、`strides`（`[8,16,32]`，按输出顺序）、`anchors`（每个
+  stride 一组 `Anchor`，各 stride 个数相同；默认值就是 YOLOP 这版用的先验框）。
+- **`AnchorDetector(engine, config=None, output_base=0)`** ——
+  `.detect([inputs], lb, timeout_ms=0)`、`.postprocess(lb)`、`.config`。从
+  `output_base` 起连续读 `len(strides)` 个输出，并逐个核对通道数是否等于
+  `na * (5 + num_classes)`，类别数写错会直接报错，而不是悄悄读错列。`.postprocess(lb)`
+  是多头模型的入口：推理一次，再逐个头解码。
+- **`decode_yolov5_anchor(raw, config, letterbox) -> list[Detection]`** —— numpy
+  路径；每个 stride 一个**未过激活**的 `[na*(5+nc),H,W]`（或 `[1,na*(5+nc),H,W]`）头。
+  所有属性先过 sigmoid 得到 `s`，再算 `xy = (2s - 0.5 + grid) * stride`、
+  `wh = (2s)^2 * anchor`、`score = objectness * max(class)`。所有 stride 的候选汇总后
+  做一次按类别的 NMS，框截断到原图范围内。`raw`、`strides`、`anchors` 长度不一致时
+  报错。
+
+## 单目 3D 检测 SMOKE
+
+一张相机图进，3D 框出 —— 相机坐标系下的位置、尺寸和朝向，单位米 —— 类别是 KITTI 的
+汽车、骑车人、行人。SMOKE 是 CenterNet 风格：类别热图定位每个物体投影后的 3D 中心，
+该像素上的八个回归通道再借助相机内参把它抬升成一个框。
+
+```python
+K = bcdl.CameraIntrinsics(fx, fy, cx, cy)      # 原图的内参
+h, w = bgr.shape[:2]
+xf = bcdl.compute_mono3d_feature_xform(w, h, 1280, 384)   # 宽度对齐，高度居中
+m = np.float32([[xf.scale, 0, xf.pad_x], [0, xf.scale, xf.pad_y]])
+rgb = cv2.warpAffine(bgr, m, (1280, 384))[..., ::-1] / 255.0
+x = ((rgb - (0.485, 0.456, 0.406)) / (0.229, 0.224, 0.225)).transpose(2, 0, 1)[None]
+
+det = bcdl.Mono3dDetector(engine)              # 输入 [1,3,384,1280] float32 RGB
+for b in det.detect(x.astype(np.float32), w, h, K):
+    print(b.class_id, b.score, (b.x, b.y, b.z), (b.h, b.w, b.l), b.yaw)
+
+# numpy 路径（320x96 特征网格上的原始 cls/reg logit）：
+boxes = bcdl.decode_mono3d(cls, reg, bcdl.Mono3dConfig(),
+                           bcdl.compute_mono3d_feature_xform(w, h, 320, 96), K)
+```
+
+**几何不是 letterbox。** SMOKE 把图缩放到输入的**宽度**、高度居中，竖直方向是裁掉或
+补边，而不是两边都放下。输入的 warp 和解码时的特征图变换必须是同一个映射（特征网格是
+输入的 1/4），`compute_mono3d_feature_xform` 两种尺寸都能构造；高度被裁时 `pad_y`
+为负。**`K` 始终用原图的**：缩放完全由这个变换承担，绝不并进内参。归一化没有编译进
+模型 —— 先 `/255`，再按 ImageNet 的 mean 和 std。
+
+检测头的激活从编译图里剥掉了，所以两个输出都是原始 logit，由解码器重新施加（热图上
+sigmoid，尺寸通道 `sigmoid - 0.5`，朝向那一对做 L2 归一化）。在同样的原始 logit 上，
+它逐框复现上游 SMOKE 自己的后处理结果。
+
+- **`CameraIntrinsics(fx, fy, cx, cy)`**（或 `CameraIntrinsics()` 后逐个字段赋值） ——
+  针孔模型、无倾斜，用原图的内参。与深度精修里的 `Intrinsics` 是不同的类。
+- **`Mono3dConfig`** —— `num_classes`（从 cls 张量读取）、`conf_thresh`（0.25）、
+  `max_dets`（50 —— 过阈值之前先取的 top-K 峰值数）、`nms_kernel`（3，热图最大池化
+  窗口）、`pred_2d`（`True`：同时把每个框投影成 `box2d`）、`depth_ref`
+  （`[28.01, 16.32]`：`z = offset * ref[1] + ref[0]`）、`dim_ref`（逐类尺寸先验，
+  每类一行 `(l, h, w)`，默认是 KITTI 的汽车 / 骑车人 / 行人）。默认值取自参考 SMOKE
+  配置。
+- **`Mono3dBox`** —— `class_id`（0 汽车，1 骑车人，2 行人）、`score`、`x, y, z`
+  （框的**底面**中心；KITTI 相机坐标轴，+x 向右、+y 向下、+z 向前）、`h, w, l`（米）、
+  `yaw`（绕相机 y 轴的旋转，弧度）、`alpha`（观测角）、`box2d`（投影框在原图像素下的
+  `[x1, y1, x2, y2]`，`pred_2d` 时才有）；带 `__repr__`。
+- **`compute_mono3d_feature_xform(orig_w, orig_h, feat_w, feat_h) -> LetterboxInfo`**
+  —— `scale = feat_w / orig_w`、`pad_x = 0`、`pad_y = feat_h/2 - scale*orig_h/2`。
+  不是两边都放下的 `compute_letterbox`。
+- **`decode_mono3d(cls, reg, config, feat_xform, K) -> list[Mono3dBox]`** —— numpy
+  路径；通道优先的 `[nc,H,W]` 与 `[8,H,W]` 原始 logit（也接受前面多一维 1）；
+  `config.num_classes` 从 `cls` 读取。按分数排序。
+- **`Mono3dDetector(engine, config=None, output_base=0)`** ——
+  `.detect(image, orig_w, orig_h, K, timeout_ms=0)`、`.postprocess(orig_w, orig_h, K)`、
+  `.config`。cls 读 `output_base`，reg 读 `output_base + 1`。
 
 ## 激光雷达 3D 检测 Lidar 3-D detection
 
@@ -456,7 +777,7 @@ boxes = bcdl.LidarDetector3d(head_engine).postprocess()
 
 ## 异常检测 Anomaly detection（单类）
 
-回答的是「这个零件像不像那批好的」。没有类别表,也没有缺陷训练集——模型只见过某一个产品的
+回答的是「这个零件像不像那批好的」。没有类别表,也没有缺陷训练集 —— 模型只见过某一个产品的
 **正常**样本,输出的是每个 patch「有多不像」。
 
 两条 API 藏不住的后果:模型是**按产品**的,所以随库的 `.hbm` 是**示例而不是通用检测器**
@@ -474,7 +795,7 @@ m = bcdl.decode_anomaly(grid.astype(np.float32), cfg)
 ```
 
 图像分数取**最大值**而不是均值:一个零件有多坏,取决于它最坏的那一块;**取均值会让一大片
-干净区域把小缺陷盖掉**——而那恰恰是这套方法存在的理由。
+干净区域把小缺陷盖掉** —— 而那恰恰是这套方法存在的理由。
 
 - **`AnomalyConfig`** —— `out_width`/`out_height`(0 ⇒ 保持原始网格;检测类默认设成模型输入尺寸)、
   `blur_kernel`(奇数,0 关闭)、`blur_sigma`、`threshold`。上采样**和**高斯平滑都是参考实现
@@ -503,7 +824,7 @@ flow = bcdl.decode_flow(out.astype(np.float32), cfg)
 epe = bcdl.flow_endpoint_error(flow_a, flow_b)
 ```
 
-预处理特意放在类里面:参考实现喂的是 **BGR、0-255**,除以 255 在**图内部**做——
+预处理特意放在类里面:参考实现喂的是 **BGR、0-255**,除以 255 在**图内部**做 ——
 给它 RGB 或者先归一化过的像素,**不会报错,只会给你一个看着挺合理的错场**。
 
 - **`FlowConfig`** —— `scale_x`、`scale_y`(模型像素 → 源图像素,`estimate()` 会按传入尺寸自动设)、
@@ -520,7 +841,7 @@ epe = bcdl.flow_endpoint_error(flow_a, flow_b)
 ## 端到端驾驶 End-to-end driving（相机 + 激光雷达 → 轨迹）
 
 本库唯一一个输出「决策」而不是「观测」的头：三路前视相机 + 一帧激光雷达进去，
-一条规划好的自车轨迹出来，外加与它联合训练的感知头。多模态扩散解码器在编译图内部——
+一条规划好的自车轨迹出来，外加与它联合训练的感知头。多模态扩散解码器在编译图内部 ——
 喂进聚类轨迹锚点，出来的已经是选好的那一条。
 
 所有位姿都是自车系、米、x 向前 / y 向左、heading 弧度逆时针，且是**未来**的固定间隔采样
@@ -565,7 +886,7 @@ bgr = bcdl.seg_colorize(r.bev)                  # BEV 语义图（SegMask）
   `heading`、`length`、`width`、`score`）、`bev`（就是 `SegMask`，可直接 `seg_colorize`）。
   **BEV 图的轴不是屏幕轴**：行号随**前方距离**增大（row 0 是自车端），列号随**向左**增大，
   所以要按「上=前方」画必须 `bev.labels[::-1, ::-1]`。上游两个约定都没写，而直路在旋转 180°
-  下近似对称——**画反了看着完全合理**。
+  下近似对称 —— **画反了看着完全合理**。
 - **`DriveConfig`** —— `agent_score_thresh`、`bev`（一个 `SegConfig`）。
 - **`DriveIoConfig`** —— 哪个张量是哪个，默认值对齐现货导出；把某个输出下标设成 `-1` 即跳过该头。
 - **`decode_drive(trajectory=None, agent_states=None, agent_labels=None, bev=None, config=DriveConfig()) -> DriveResult`**
@@ -599,7 +920,7 @@ dm = bcdl.decode_depth(out.astype(np.float32), cfg)
 
 ## 深度精修 Depth refinement（RGB-D）
 
-输入是你**已经有的**深度图——双目或 ToF 的读数，带噪、有空洞——加上对齐的 RGB
+输入是你**已经有的**深度图 —— 双目或 ToF 的读数，带噪、有空洞 —— 加上对齐的 RGB
 帧，输出干净的米制深度和逐像素可信掩膜。这是 LingBot-Depth 头；它不像
 `DepthEstimator`（单目）或 `StereoPipeline` 那样从零估计深度。
 
@@ -631,7 +952,7 @@ r = bcdl.decode_refined_depth(depth_out, mask_logit_out)
 - **`DepthRefiner(engine, config=None, image_input=0, depth_input=1, depth_output=0, mask_output=1)`**
   —— `.run(bgr, depth_m)`、`.postprocess()`、`.config`。
 
-> 深度是以 **log 深度、0 表示"没有读数"** 的形式进图的，这是上游自己的约定——
+> 深度是以 **log 深度、0 表示"没有读数"** 的形式进图的，这是上游自己的约定 ——
 > 真实的 1 m 读数和缺失像素落在同一个值上，靠 RGB token 去区分。部署图还保留了
 > 全部深度 token，而上游会把"整块 patch 都没有有效读数"的 token 丢掉（变长序列
 > 编不出静态图）。在参考场景上这一改动的代价是 0.06% 的绝对相对误差；但那些场景
@@ -752,7 +1073,7 @@ python examples/voice_assistant.py my.wav     # 你自己的 16 kHz 单声道录
 ```
 
 **获取模型。** `scripts/fetch_models.sh` 会下载语音识别模型（D-Robotics 官方预编译的
-Paraformer）。另外四个——唤醒词、VAD、Matcha、Vocos——是从上游模型自己转换的，每个在
+Paraformer）。另外四个 —— 唤醒词、VAD、Matcha、Vocos —— 是从上游模型自己转换的，每个在
 [bcdl-model-zoo](https://github.com/ruisv/bcdl-model-zoo) 里都有转换配方（`models/kws_zipformer`、
 `silero_vad`、`matcha_tts`、`vocos`）：在装有 OpenExplorer 工具链的 x86 机器上导出、校准、
 `hb_compile`。转换好后，让获取脚本指向产物所在目录，它会按 BCDL 需要的文件名复制到 `models/`：
@@ -1053,7 +1374,7 @@ for ids in fe.encode(text):                  # 每句一个 id 列表
   list[list[int]]`、`.sentences(text)`、`MatchaFrontend.read_numbers(text)`、`.vocab_size`、
   `.lexicon_size`。与 sherpa-onnx 针对该模型的词典前端逐个 id 一致（标点折叠、切句与合并、
   词典最长匹配、句尾标点 token）。数字先读成汉字（`90` → 九十、`12.6` → 十二点六、
-  `35%` → 百分之三十五、`2026年` → 二零二六年）。英文单词会被丢弃——词典里没有英文。
+  `35%` → 百分之三十五、`2026年` → 二零二六年）。英文单词会被丢弃 —— 词典里没有英文。
 - **`MatchaFrontendConfig`**：`min_words`（5）、`max_words`（20）。
 - **`MatchaConfig`**：`noise_scale`（1.0；设为 0 时输出确定）、`length_scale`（> 1 更慢）、`seed`。
 - **`MatchaAcoustic(encoder, decoder, embedding, config=None)`**：`.synthesize(ids) ->
@@ -1115,6 +1436,10 @@ for frame in stream:
   **挤压式** resize（不是 letterbox：这类模型就是在挤压过的裁剪上训练的）、
   BGR→RGB、ImageNet 归一化、NCHW float32。
 - **`ReidConfig`** —— `mean`、`std`。
+- **`normalize_embedding(embedding) -> list[float]`** —— 对一维 float32 向量做 L2
+  归一化（零向量保持为零）。
+- **`cosine_similarity(a, b) -> float`** —— 范围 `[-1, 1]`。内部会先归一化，所以输入
+  不必是单位向量；长度不一致或有零向量时返回 0，而不是报错。
 
 模型是**每个裁剪跑一次**，所以人多的帧里决定帧耗时的是它而不是检测器。注意
 **int8 PTQ 对 OSNet 是不够的** —— 见 `CHANGELOG.md` 里 0.4.0 的条目。
@@ -1261,6 +1586,7 @@ python examples/video_det_demo.py det.hbm in.h264 out.mp4 300 4   # [max_frames]
 jpg = bcdl.jpeg_encode(bgr, quality=80)       # bytes
 img = bcdl.jpeg_decode(jpg)                    # VpImage（NV12）
 planes = img.to_numpy()                        # 见下面 VpImage.to_numpy
+n = bcdl.jpeg_save(bgr, "out.jpg")             # JPU 编码并写文件；返回写入的字节数
 
 # 处理一条流时请复用解码器（每次调用都新建会多约 5 ms 的 JPU 初始化）：
 dec = bcdl.JpegDecoder()
@@ -1276,16 +1602,16 @@ chunk = enc.encode(vp_image)                   # bytes（被缓冲时可能为�
 dc = bcdl.VideoDecConfig(); dc.type = bcdl.VideoType.H265   # 或 .H264
 dec = bcdl.VideoDecoder(dc)
 frame = dec.decode(nal_bytes)                  # VpImage；仍在缓冲时为 None
-# 解耦的喂入/取出（正确处理 H.265 重排序）：喂任意字节，按显示顺序取，
+# 解耦的喂入/取出（正确处理 H.265 重排序）：每次喂一个 access unit，按显示顺序取，
 # 流结束时把重排序尾巴 flush 出来。
-dec.feed(chunk_bytes)                           # 入队字节（不需要自己切 AU）
+dec.feed(au_bytes)                              # 一个 access unit（带起始码的 NAL）
 while (f := dec.receive(0)) is not None: ...    # 非阻塞取（0 = 不等待）
 while (f := dec.flush()) is not None: ...        # 最后一次 feed 之后：重排序尾巴
 ```
 
 > **H.265 说明：** 解码器走的是正确处理重排序的 `media_codec` API，所以 H.265
 > 可用（早期那种"逐 AU"的模型在它上面会超时）。**分层 GOP** 的 HEVC 流
-> （海康 SVC / "H.265+"/smart-codec）只会解出**基础时域层**（约 1/4 的帧）——
+> （海康 SVC / "H.265+"/smart-codec）只会解出**基础时域层**（约 1/4 的帧） ——
 > 这是 SoC SDK 的限制；要满帧率请关掉相机的 SVC 模式。H.264 与非分层 HEVC
 > 都能完整解出。
 
@@ -1298,16 +1624,31 @@ while (f := dec.flush()) is not None: ...        # 最后一次 feed 之后：�
   （宽需 16 对齐，高需 8 对齐）。
 - **`JpegDecoder(out_format=NV12)`** —— `.decode(bytes) -> VpImage`。一条流上请
   **复用同一个实例**；每次调用都新建要花约 5 ms。
-- **`jpeg_encode(bgr, quality=50) -> bytes`** · **`jpeg_decode(data) -> VpImage`**
-  —— 一次性的便捷包装（需要 OpenCV，且尺寸为偶数）。
+- **`jpeg_encode(image, quality=50) -> bytes`** · **`jpeg_decode(data) -> VpImage`**
+  —— 一次性的便捷包装。`image` 可以是 `(H,W,3)` uint8 BGR 数组，也可以是 NV12
+  `VpImage`（直接来自 `jpeg_decode` 或 `GdcLetterbox`，不用绕道 BGR）。不满足 JPU
+  16×8 对齐的 BGR 图会在右下补黑边，编码的是补齐后的尺寸；不对齐的 NV12 `VpImage`
+  会被拒绝。BGR 路径需要 OpenCV。
+- **`jpeg_save(image, path, quality=90) -> int`** —— 先 `jpeg_encode` 再写入 `path`；
+  返回写入的字节数。相当于 JPU 版的 `cv2.imwrite`。注意它的默认质量是 90，不是
+  `jpeg_encode` 的 50。
 - **`VideoType`** 枚举 —— `H264`、`H265`。
 - **`VideoEncConfig`** —— `type`、`width`、`height`、`bitrate_kbps`、`framerate`、
   `intra_period`、`format`。
 - **`VideoEncoder(config)`** —— `.encode(frame: VpImage) -> bytes`（编码器把这帧
-  缓冲起来时返回空）；`.type/.width/.height/.format`。
+  缓冲起来时返回空）；`.type/.width/.height/.format`。处理一条流时用解耦接口：
+  `.feed(frame, pts_us=0) -> bool` 把一帧 NV12 排进队列、不等输出（返回 `False` 表示
+  输入队列满了：先用 `receive()` 取出再重试 —— 1080p 下喂帧比编码快得多，很容易碰到）；
+  `.receive(timeout_ms=0) -> bytes | None` 取一个码流包（`0` 表示不等待）；
+  `.flush() -> bytes | None` 发出流结束信号并取出剩余的包，反复调用直到返回 `None`；
+  `.feed_end_of_stream()` 只排入结束标记、不取包（可重复调用）。
 - **`VideoDecConfig`** —— `type`、`format`、`in_buf_size`。
 - **`VideoDecoder(config)`** —— `.decode(data) -> VpImage | None`（还在缓冲参考帧
-  时为 `None`）；`.type/.format`。
+  时为 `None`）；`.type/.format`。解耦接口见上面的代码片段：`.feed(data) -> bool`
+  （**每次恰好一个 access unit** —— 编解码器跑在按帧喂入模式；要喂任意切分的 Annex-B
+  字节，用会自己切分的 `AsyncVideoDetectionPipeline.submit()`）、
+  `.receive(timeout_ms=0) -> VpImage | None`（按显示顺序取）、
+  `.flush() -> VpImage | None`（最后一次 feed 之后取出重排序尾巴，反复调用直到返回 `None`）。
 
 ---
 

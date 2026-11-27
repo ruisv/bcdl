@@ -1,5 +1,7 @@
 # Contributing to BCDL
 
+**English** | [简体中文](CONTRIBUTING.zh.md)
+
 Thanks for your interest in BCDL — contributions are welcome, whether that's a
 bug report, a fix, a new task decoder, a benchmark, or a docs improvement. This
 guide covers how to set up, build, test, and submit changes.
